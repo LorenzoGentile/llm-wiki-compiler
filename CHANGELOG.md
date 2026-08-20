@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A kept page's body still cites the removed source, which `llmwiki lint` reports as a `broken-citation` error. `rm` warns whenever it keeps a page so the lint failure is not a surprise; it does not edit the citations.
 
   `rm` is now a reserved core CLI verb, alongside llmwiki's other top-level commands. A profile that declares a workflow keyed `rm` now fails validation at load instead of installing; rename the workflow to use that profile.
+- **Optional `## Sources` section** — `LLMWIKI_SOURCES_SECTION=off`, or `--no-sources-section` on `llmwiki compile`, stops page generation from asking the model for a trailing `## Sources` section. Unset preserves the prompt byte-for-byte.
+
+  This is for projects that render source attribution themselves. A page already carries its provenance twice — the `sources:` frontmatter, which the compiler builds from the source files it actually read rather than from anything the model writes, and the inline `^[file.md:1-5]` citation markers — so a consumer that displays either one shows the same list a third time in the prose. Nothing downstream reads the section: it is a prompt instruction only, and no linter, exporter, or citation rule parses it.
+
+  Suppressing the request is the only reliable way to not have the section, because it is not a stable string to strip. Under `--lang` the model localizes that heading along with the rest of the page, so a downstream matcher keyed on `## Sources` silently stops matching the moment a project sets an output language.
+
+  `PROMPT_VERSION` is unchanged. The constant was introduced with the optional language directive already in the page prompt, so `v1` already denotes a contract with user-selected prompt modifiers in it, and the default path here is byte-identical. Say the word if you would rather it move.
 
 ### Fixed
 
