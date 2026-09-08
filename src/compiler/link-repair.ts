@@ -10,9 +10,8 @@
  *
  * This pass runs once every page is written and rewrites only the link TARGET,
  * never the text around it: the example above becomes
- * `[[argo-cd-image-update-ownership-model|Argo CD]]`. Rendered output is
- * therefore identical, and the worst a mistake here can do is point a link at
- * the wrong page — it can never alter prose.
+ * `[[argo-cd-image-update-ownership-model|Argo CD]]`. The visible label is
+ * retained, while code examples and frontmatter remain untouched.
  *
  * Only an unambiguous prefix match is repaired. A slug that prefixes two pages
  * is left alone rather than guessed at, and so is one that prefixes none: a link
@@ -21,12 +20,14 @@
  */
 
 import path from "path";
-import { parseFrontmatter } from "../utils/markdown.js";
-import { collectAllPages } from "../linter/rules-shared.js";
+import { readdir } from "node:fs/promises";
+import { parseFrontmatter, slugify } from "../utils/markdown.js";
+import { readConfinedWikiPage, warnDroppedWikiReadIfPresent } from "./confined-wiki-read.js";
+import { isLiteralMarkdown } from "./link-repair-code.js";
 import { listLinkResolvablePendingSlugs } from "./candidate-read.js";
 import { applyCompilePageWritesLocked } from "./compile-write.js";
 import type { CompilePageNamespace, CompilePageWrite } from "./compile-write.js";
-import { QUERIES_DIR } from "../utils/constants.js";
+import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
 import * as output from "../utils/output.js";
 
 /** `[[target]]` and `[[target|alias]]`, capturing everything between brackets. */
@@ -41,20 +42,6 @@ const SLUG_SEPARATOR = "-";
  * check cannot tell that apart from a real abbreviation.
  */
 const MIN_REPAIRABLE_SLUG_LENGTH = 3;
-
-/**
- * Slugify a wikilink target the same way page filenames are slugified, so a
- * link and the page it names compare on equal terms.
- */
-function slugifyTarget(target: string): string {
-  return target
-    .toLowerCase()
-    .replace(/['’]/g, "")
-    .replace(/[^\p{L}\p{N}\s-]/gu, "")
-    .replace(/\s+/g, SLUG_SEPARATOR)
-    .replace(/-+/g, SLUG_SEPARATOR)
-    .replace(/^-|-$/g, "");
-}
 
 /**
  * Resolve a broken link slug to the single page it prefixes, or null when it
@@ -86,14 +73,37 @@ function repairBody(
   resolve: (targetSlug: string) => string | null,
 ): { body: string; repaired: number } {
   let repaired = 0;
-  const next = body.replace(WIKILINK_PATTERN, (match, inner: string) => {
+  const literal = isLiteralMarkdown(body);
+  const next = body.replace(WIKILINK_PATTERN, (match, inner: string, offset: number) => {
+    if (literal(offset)) return match;
     const { target, alias } = splitWikilink(inner);
-    const resolved = resolve(slugifyTarget(target));
+    const resolved = resolve(slugify(target));
     if (!resolved) return match;
     repaired += 1;
     return `[[${resolved}|${alias}]]`;
   });
   return { body: next, repaired };
+}
+
+/** Read only pages whose opened bytes remain within their expected directory. */
+async function collectRepairPages(root: string): Promise<Array<{ filePath: string; content: string }>> {
+  const pages: Array<{ filePath: string; content: string }> = [];
+  for (const dir of [CONCEPTS_DIR, QUERIES_DIR]) {
+    const files = await readdir(path.join(root, dir)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const file of files.filter(file => file.endsWith(".md"))) {
+      const filePath = path.join(root, dir, file);
+      const result = await readConfinedWikiPage(root, dir, file.slice(0, -3));
+      if ("dropped" in result) {
+        await warnDroppedWikiReadIfPresent(filePath, path.join(dir, file), result.dropped);
+        continue;
+      }
+      pages.push({ filePath, content: result.content });
+    }
+  }
+  return pages;
 }
 
 /** Derive the compile namespace from a page's absolute file path. */
@@ -113,19 +123,21 @@ function namespaceForPage(filePath: string): CompilePageNamespace {
  * @returns One write per page whose body actually changed.
  */
 export async function repairLinks(root: string): Promise<CompilePageWrite[]> {
-  const pages = await collectAllPages(root);
+  const pages = await collectRepairPages(root);
   if (pages.length === 0) return [];
 
   const slugs = pages.map((page) => path.basename(page.filePath, ".md").toLowerCase());
   const existing = new Set(slugs);
   const pending = await listLinkResolvablePendingSlugs(root);
+  const possible = [...slugs, ...[...pending].filter(slug => !existing.has(slug))];
   // A pending target resolves on its own when the candidate is approved, so
   // repointing it now would silently redirect the link away from the page the
   // author is about to publish.
-  const resolve = (targetSlug: string): string | null =>
-    existing.has(targetSlug) || pending.has(targetSlug)
-      ? null
-      : resolveUniquePrefix(targetSlug, slugs);
+  const resolve = (targetSlug: string): string | null => {
+    if (existing.has(targetSlug) || pending.has(targetSlug)) return null;
+    const match = resolveUniquePrefix(targetSlug, possible);
+    return match && existing.has(match) ? match : null;
+  };
 
   const writes: CompilePageWrite[] = [];
   let repairedLinks = 0;
@@ -137,7 +149,7 @@ export async function repairLinks(root: string): Promise<CompilePageWrite[]> {
     writes.push({
       namespace: namespaceForPage(page.filePath),
       slug: path.basename(page.filePath, ".md"),
-      body: page.content.replace(body, result.body),
+      body: page.content.replace(body, () => result.body),
     });
   }
 

@@ -7,12 +7,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, mkdir, readFile, rm } from "fs/promises";
+import { mkdtemp, writeFile, mkdir, readFile, rm, symlink } from "fs/promises";
 import path from "path";
 import os from "os";
+import { execFileSync } from "node:child_process";
 import { repairLinks } from "../src/compiler/link-repair.js";
 import { applyCompilePageWritesLocked } from "../src/compiler/compile-write.js";
 import { buildFrontmatter } from "../src/utils/markdown.js";
+import { writeCandidate } from "../src/compiler/candidates.js";
 
 describe("repairLinks", () => {
   let tmpDir: string;
@@ -51,6 +53,58 @@ describe("repairLinks", () => {
       "[[argo-cd-image-update-ownership-model|Argo CD]]",
     );
   });
+
+  it("preserves literal replacement sequences in page prose", async () => {
+    await writePage("argo-cd-guide", "Details.");
+    const prose = "Literal $$ $& $` $' then [[Argo CD]].";
+    await writePage("deployment", prose);
+    await repairAndApply();
+    expect(await readPage("deployment")).toContain(prose.replace("[[Argo CD]]", "[[argo-cd-guide|Argo CD]]"));
+  });
+
+  it.each([
+    "```md\n[[Argo CD]]\n```", "~~~md\n[[Argo CD]]\n~~~",
+    "`[[Argo CD]]`", "``code ` [[Argo CD]]``", "    [[Argo CD]]",
+    "> ```\n> [[Argo CD]]\n> ```", "\\` prose `[[Argo CD]]`",
+  ])("preserves code examples: %s", async (example) => {
+    await writePage("argo-cd-guide", "Details.");
+    await writePage("deployment", `${example}\n\nProse [[Argo CD]].`);
+    await repairAndApply();
+    expect(await readPage("deployment")).toContain(`${example}\n\nProse [[argo-cd-guide|Argo CD]].`);
+  });
+
+  it("counts pending prefixes when refusing ambiguity", async () => {
+    await writePage("argo-cd-guide", "Details.");
+    await writePage("deployment", "See [[Argo CD]].");
+    await writeCandidate(tmpDir, {
+      slug: "argo-cd-ownership", title: "Ownership", summary: "Pending", sources: [], body: "Pending body.",
+    });
+    expect(await repairLinks(tmpDir)).toEqual([]);
+  });
+
+  it("does not collapse two live namespaces into one prefix candidate", async () => {
+    await writePage("argo-cd-guide", "Details.");
+    await writePage("deployment", "See [[Argo CD]].");
+    const queries = path.join(tmpDir, "wiki/queries");
+    await mkdir(queries);
+    await writeFile(path.join(queries, "argo-cd-guide.md"), "Query details.");
+    expect(await repairLinks(tmpDir)).toEqual([]);
+  });
+
+  it("drops escaping pages before their bytes enter a write", async () => {
+    await writePage("argo-cd-guide", "Details.");
+    const outside = path.join(tmpDir, "outside.md");
+    await writeFile(outside, "Secret [[Argo CD]].");
+    await symlink(outside, path.join(conceptsDir, "escape.md"));
+    expect(await repairLinks(tmpDir)).toEqual([]);
+    expect(await readFile(outside, "utf8")).toBe("Secret [[Argo CD]].");
+  });
+
+  it.skipIf(process.platform === "win32")("drops a named pipe without blocking the repair pass", async () => {
+    await writePage("argo-cd-guide", "Details.");
+    execFileSync("mkfifo", [path.join(conceptsDir, "pipe.md")]);
+    expect(await repairLinks(tmpDir)).toEqual([]);
+  }, 2_000);
 
   it("keeps the displayed text byte-identical", async () => {
     await writePage("alembic-database-migration-conventions", "Details.");
