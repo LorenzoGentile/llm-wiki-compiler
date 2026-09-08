@@ -37,9 +37,17 @@ function captureRequest(provider: OpenAIProvider): Record<string, unknown>[] {
   };
   client.chat.completions.create = async (body: Record<string, unknown>) => {
     bodies.push(body);
+    if (body.stream) return streamChunks();
     return { choices: [{ message: { content: "ok" } }] };
   };
   return bodies;
+}
+
+/** Representative text chunks returned by the SDK streaming interface. */
+async function* streamChunks() {
+  yield { choices: [{ delta: { content: "hello" } }] };
+  yield { choices: [{ delta: {} }] };
+  yield { choices: [{ delta: { content: " world" } }] };
 }
 
 describe("tokenLimitParams", () => {
@@ -77,11 +85,16 @@ describe("reasoningParams", () => {
     expect(reasoningParams("gpt-4o-mini")).toEqual({});
   });
 
-  it.each(["gpt-5", "gpt-5.6-luna", "GPT-5-mini"])(
+  it.each(["gpt-5.6", "gpt-5.6-luna", "GPT-5.6-sol"])(
     "defaults %s to none, because it rejects tools without an effort",
     model => {
       expect(reasoningParams(model)).toEqual({ reasoning_effort: "none" });
     },
+  );
+
+  it.each(["gpt-5", "gpt-5-mini", "gpt-5-pro", "gpt-5.1", "gpt-5.60", "gpt-5.6custom"])(
+    "does not impose GPT-5.6 effort semantics on %s",
+    model => { expect(reasoningParams(model)).toEqual({}); },
   );
 
   it("leaves the o-series alone rather than guessing a value it may reject", () => {
@@ -113,6 +126,18 @@ describe("reasoningParams", () => {
 });
 
 describe("OpenAIProvider request bodies", () => {
+  it.each(["gpt-4o", "gpt-5.6"])("preserves request adaptation and chunks while streaming %s", async (model) => {
+    const provider = new OpenAIProvider(model, { apiKey: "test" });
+    const bodies = captureRequest(provider);
+    const tokens: string[] = [];
+    expect(await provider.stream("system", [], 512, token => tokens.push(token))).toBe("hello world");
+    expect(tokens).toEqual(["hello", " world"]);
+    expect(bodies[0]).toMatchObject(model === "gpt-4o"
+      ? { stream: true, max_tokens: 512 }
+      : { stream: true, max_completion_tokens: 512, reasoning_effort: "none" });
+    expect(bodies[0]).not.toHaveProperty(model === "gpt-4o" ? "max_completion_tokens" : "max_tokens");
+  });
+
   it("sends max_tokens for a classic model", async () => {
     const provider = new OpenAIProvider("gpt-4o", { apiKey: "test" });
     const bodies = captureRequest(provider);

@@ -44,10 +44,14 @@ const MAX_COMPLETION_TOKEN_PREFIXES = ["o1", "o3", "o4", "gpt-5"];
  * Duplicated as a runtime set because the SDK exports it as a type only, and
  * an unchecked env value would surface as an opaque 400 from the API.
  */
-const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+const REASONING_EFFORTS = {
+  none: true, minimal: true, low: true, medium: true, high: true, xhigh: true,
+} satisfies Record<Exclude<OpenAI.ReasoningEffort, null>, true>;
 
 /** Raised when an env override carries a value the API would reject. */
 export class OpenAIRequestConfigError extends Error {
+  readonly nonRetryable = true;
+
   constructor(message: string) {
     super(message);
     this.name = "OpenAIRequestConfigError";
@@ -78,9 +82,9 @@ export function reasoningParams(
 ): Pick<OpenAI.ChatCompletionCreateParams, "reasoning_effort"> | object {
   const raw = process.env[REASONING_EFFORT_ENV]?.trim().toLowerCase();
   if (!raw) return defaultReasoningParams(model);
-  if (!(REASONING_EFFORTS as readonly string[]).includes(raw)) {
+  if (!Object.hasOwn(REASONING_EFFORTS, raw)) {
     throw new OpenAIRequestConfigError(
-      `${REASONING_EFFORT_ENV} must be one of ${REASONING_EFFORTS.join(", ")} (got "${raw}")`,
+      `${REASONING_EFFORT_ENV} must be one of ${Object.keys(REASONING_EFFORTS).join(", ")} (got "${raw}")`,
     );
   }
   return { reasoning_effort: raw as OpenAI.ReasoningEffort };
@@ -89,25 +93,19 @@ export function reasoningParams(
 /**
  * The effort a model needs when nobody configured one.
  *
- * Deliberately narrower than MAX_COMPLETION_TOKEN_PREFIXES. The GPT-5 family
- * rejects a request carrying function tools unless `reasoning_effort` is
- * present, and llmwiki's extraction pass always sends tools — so without this
- * the very first call fails. The o-series accepts a request with the field
- * absent, and does not accept every value listed in REASONING_EFFORTS, so
- * guessing on its behalf would trade a working default for a 400.
- *
- * `none` rather than a thinking budget because extraction and page generation
- * are structured tool calls, where reasoning tokens cost latency without
- * improving the result. Override with REASONING_EFFORT_ENV to buy thinking back.
+ * Only the GPT-5.6 family gets the compatibility default needed for function
+ * tools on Chat Completions. Older families retain their server defaults:
+ * notably, GPT-5 and GPT-5 mini reject `none`. Model-name boundaries avoid
+ * applying this contract to an unrelated gateway id such as `gpt-5.60`.
+ * The environment override remains available for other gateway contracts.
  */
-const DEFAULT_REASONING_EFFORT_PREFIXES = ["gpt-5"];
+const DEFAULT_REASONING_EFFORT_MODEL = /^gpt-5\.6(?:$|-)/i;
 
 /** The default effort for a model id, or nothing when it needs no opinion. */
 function defaultReasoningParams(
   model: string,
 ): Pick<OpenAI.ChatCompletionCreateParams, "reasoning_effort"> | object {
-  const id = model.toLowerCase();
-  return DEFAULT_REASONING_EFFORT_PREFIXES.some(prefix => id.startsWith(prefix))
+  return DEFAULT_REASONING_EFFORT_MODEL.test(model)
     ? { reasoning_effort: "none" as OpenAI.ReasoningEffort }
     : {};
 }
