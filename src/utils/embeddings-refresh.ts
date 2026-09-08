@@ -29,6 +29,7 @@
 
 import { updateEmbeddingsLockedCore } from "./embeddings.js";
 import { handleSafeEmbeddingFailure } from "./embeddings-batch.js";
+import { ENV_EMBEDDINGS } from "./constants.js";
 import { verbose } from "./output.js";
 import type { PageId } from "./page-id.js";
 import {
@@ -39,6 +40,8 @@ import {
   settleAfterFailure,
   warnQuarantined,
 } from "./pending-embeddings.js";
+
+const EMBEDDINGS_DISABLED_VALUE = "off";
 
 /**
  * Refresh embeddings for `changedPageIds` while DRAINING the durable pending
@@ -69,6 +72,10 @@ export async function refreshEmbeddingsDrainingPending(
   root: string,
   changedPageIds: PageId[],
 ): Promise<void> {
+  if (process.env[ENV_EMBEDDINGS]?.trim().toLowerCase() === EMBEDDINGS_DISABLED_VALUE) {
+    verbose(`embeddings: skipped because ${ENV_EMBEDDINGS}=${EMBEDDINGS_DISABLED_VALUE}`);
+    return;
+  }
   const merged = mergeFreshAttempts(await loadPendingEmbeddings(root), changedPageIds);
   const toRefresh = merged.map((entry) => entry.pageId);
   verbose(`embeddings: refreshing ${toRefresh.length} page-id(s)`);
