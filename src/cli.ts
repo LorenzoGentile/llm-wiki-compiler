@@ -125,7 +125,7 @@ addProviderOption(program.command("compile").description("Compile sources/ into 
   )
   .option(
     "--no-sources-section",
-    "Omit the trailing ## Sources section from generated pages. Source attribution stays in the sources: frontmatter and the inline ^[...] citation markers. Equivalent to setting LLMWIKI_SOURCES_SECTION=off.",
+    "Stop requesting a trailing ## Sources section; changing this preference recompiles affected pages. Equivalent to LLMWIKI_SOURCES_SECTION=off; unset it and omit this flag to restore the default.",
   )
   .option(
     "--concurrency <n>",

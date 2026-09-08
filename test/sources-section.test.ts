@@ -14,6 +14,7 @@ import {
   sourcesSectionEnabled,
 } from "../src/utils/sources-section.js";
 import { buildPagePrompt } from "../src/compiler/prompts.js";
+import { activePromptModifiers, promptModifiersDigest } from "../src/compiler/prompt-modifiers.js";
 
 const ENV_KEY = "LLMWIKI_SOURCES_SECTION";
 const SECTION_REQUEST = "Include a ## Sources section";
@@ -23,6 +24,14 @@ afterEach(() => {
 });
 
 describe("sourcesSectionEnabled", () => {
+  it("records opt-out for invalidation and page provenance, then clears it", () => {
+    expect(promptModifiersDigest()).toBe("");
+    process.env[ENV_KEY] = "off";
+    expect(activePromptModifiers()).toEqual({ sourcesSection: "off" });
+    expect(promptModifiersDigest()).toMatch(/^[0-9a-f]{64}$/);
+    delete process.env[ENV_KEY];
+    expect(promptModifiersDigest()).toBe("");
+  });
   it("defaults to enabled when the env var is unset", () => {
     expect(sourcesSectionEnabled()).toBe(true);
   });

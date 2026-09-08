@@ -46,7 +46,7 @@ function sourcesSectionLines(): string[] {
  * downstream auditor can distinguish pages produced under different prompt
  * generations even when the model id is identical. Format is `vMAJOR`.
  */
-export const PROMPT_VERSION = "v2";
+export const PROMPT_VERSION = "v3";
 
 /**
  * The caller's system policy as prompt lines, or nothing when none is set.

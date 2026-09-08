@@ -11,7 +11,7 @@
  * Stripping the section downstream is awkward because it is not a stable
  * string: under `--lang` the model localizes that heading along with the rest
  * of the page, so a consumer has no fixed text to match on. Suppressing the
- * instruction is the only reliable way to not have it.
+ * instruction avoids requesting it, without post-processing model output.
  *
  * Opting out is a rendering choice, not a provenance one — the frontmatter and
  * the citation markers are untouched. Unset preserves the historical prompt
