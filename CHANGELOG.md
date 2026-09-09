@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A kept page's body still cites the removed source, which `llmwiki lint` reports as a `broken-citation` error. `rm` warns whenever it keeps a page so the lint failure is not a surprise; it does not edit the citations.
 
   `rm` is now a reserved core CLI verb, alongside llmwiki's other top-level commands. A profile that declares a workflow keyed `rm` now fails validation at load instead of installing; rename the workflow to use that profile.
+- **Optional `## Sources` section** — `LLMWIKI_SOURCES_SECTION=off`, or `--no-sources-section` on `llmwiki compile`, stops page generation from asking the model for a trailing `## Sources` section. Unset preserves the prompt byte-for-byte.
+
+  This is for projects that render source attribution themselves. A page already carries its provenance twice — the `sources:` frontmatter, which the compiler builds from the source files it actually read rather than from anything the model writes, and the inline `^[file.md:1-5]` citation markers — so a consumer that displays either one shows the same list a third time in the prose. Nothing downstream reads the section: it is a prompt instruction only, and no linter, exporter, or citation rule parses it.
+
+  Suppressing the request avoids matching a localized heading downstream: under `--lang` the model may translate `## Sources` along with the page. This changes the prompt instruction; it does not enforce the absence of a heading in model output.
+
+  Setting or clearing this preference regenerates affected pages through the existing prompt-modifier fingerprint. Page provenance records `sourcesSection=off` when disabled. `PROMPT_VERSION` advances to `v3` to identify the implementation with a conditional Sources instruction; the default prompt text is unchanged.
 
 ### Fixed
 
@@ -79,6 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Only the link target is rewritten; visible labels, code examples, frontmatter, and literal dollar sequences are preserved. A slug prefixing two live or pending pages is left alone, as is one prefixing none. Pending-only matches wait for approval, which retries repairs. Reads use compile's confined reader, dropping escaping paths and special files before their bytes can enter a write.
 
   Measured across five compiles of a mixed corpus (two PDFs plus five prose documents), this repaired 21.3% of broken wikilinks on a GPT-5-class model and 16.7% on `gpt-4o-mini`, with no page's prose changed.
+
+- **Reasoning models could not be used at all** — the OpenAI provider hard-coded `max_tokens` on all three completion paths, and the o-series and GPT-5 families reject it: `Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.` The failure came back on the first extraction request, before any page was written, so those models were unusable rather than degraded. The field is now selected from the model id, with `LLMWIKI_OPENAI_TOKEN_PARAM` to force it for gateways that serve a reasoning model under a private id. The SDK has carried `max_tokens` as deprecated in favour of `max_completion_tokens` since 6.x.
+
+  GPT-5.6 models default to `reasoning_effort: none` for Chat Completions tool compatibility. Older families keep their server default because they do not all accept `none`. `LLMWIKI_OPENAI_REASONING_EFFORT` overrides the effort with any of `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`; the chosen model must support that value. These options apply to the shared OpenAI-compatible request paths, including completion, streaming, and tool calls.
+
+  The default is deliberately not applied to the o-series: it accepts a tool-carrying request with the field absent, and rejects some of the values above, so guessing on its behalf would turn a working request into a 400. Set the variable to opt it in.
+
+  An unrecognised value for either variable fails on the first request attempt with the accepted values named, before network access and without retry backoff. Models outside the detected reasoning families retain their previous request shape.
 
 - **Windows: profile path validation rejected every declared directory** — on win32, `llmwiki template init` failed for every template with `entity directory must be under 'wiki/'`, any profile declaring a workflow `projectionFile` failed to load, and an entity directory declared as `wiki/` was wrongly accepted despite containing every reserved subtree — on win32 it was the only entity directory that loaded at all. Declared directories canonicalize to `/`-joined repo-relative paths, but the containment check built its prefix with the platform separator (`\` on Windows), so no nested path ever matched. The lexical profile-path checks now compare POSIX paths directly; native path confinement is unchanged. Reported and diagnosed by @squ1ddy (#163).
 
