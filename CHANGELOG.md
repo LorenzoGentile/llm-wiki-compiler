@@ -40,8 +40,9 @@ Credit includes original proposals, reports and diagnoses, including work comple
 
 ### Added
 
-- **Embedding refresh opt-out** — `LLMWIKI_EMBEDDINGS=off` skips embedding
-  refreshes without reading or writing the durable pending queue. This lets
+- **Embedding refresh opt-out** — `LLMWIKI_EMBEDDINGS=off` skips all embedding
+  refreshes, including `query --save`, without reading or writing the embedding
+  store or durable pending queue. This lets
   deployments with their own semantic index keep compile and review workflows
   while avoiding an embedding store they never consume. Unset and other values
   preserve the existing behavior.

@@ -27,9 +27,9 @@
  * so an embeddings failure can never break a compile or an approval.
  */
 
-import { updateEmbeddingsLockedCore } from "./embeddings.js";
+import { embeddingsDisabled, updateEmbeddingsLockedCore } from "./embeddings.js";
 import { handleSafeEmbeddingFailure } from "./embeddings-batch.js";
-import { ENV_EMBEDDINGS } from "./constants.js";
+import { EMBEDDINGS_DISABLED_VALUE, ENV_EMBEDDINGS } from "./constants.js";
 import { verbose } from "./output.js";
 import type { PageId } from "./page-id.js";
 import {
@@ -40,8 +40,6 @@ import {
   settleAfterFailure,
   warnQuarantined,
 } from "./pending-embeddings.js";
-
-const EMBEDDINGS_DISABLED_VALUE = "off";
 
 /**
  * Refresh embeddings for `changedPageIds` while DRAINING the durable pending
@@ -72,7 +70,7 @@ export async function refreshEmbeddingsDrainingPending(
   root: string,
   changedPageIds: PageId[],
 ): Promise<void> {
-  if (process.env[ENV_EMBEDDINGS]?.trim().toLowerCase() === EMBEDDINGS_DISABLED_VALUE) {
+  if (embeddingsDisabled()) {
     verbose(`embeddings: skipped because ${ENV_EMBEDDINGS}=${EMBEDDINGS_DISABLED_VALUE}`);
     return;
   }

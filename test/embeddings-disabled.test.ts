@@ -9,9 +9,11 @@ import { tmpdir } from "os";
 import path from "path";
 import { mkdtemp } from "fs/promises";
 import { refreshEmbeddingsDrainingPending } from "../src/utils/embeddings-refresh.js";
-import { ENV_EMBEDDINGS, PENDING_EMBEDDINGS_FILE } from "../src/utils/constants.js";
+import { updateEmbeddingsLockedCore } from "../src/utils/embeddings.js";
+import { EMBEDDINGS_FILE, ENV_EMBEDDINGS, PENDING_EMBEDDINGS_FILE } from "../src/utils/constants.js";
 import * as embeddings from "../src/utils/embeddings.js";
 import * as output from "../src/utils/output.js";
+import * as provider from "../src/utils/provider.js";
 import type { PageId } from "../src/utils/page-id.js";
 
 const PAGE_ID = "concepts/alpha" as PageId;
@@ -64,6 +66,27 @@ describe("LLMWIKI_EMBEDDINGS", () => {
     expect(provider).not.toHaveBeenCalled();
     expect(await readFile(pendingPath(), "utf-8")).toBe(PENDING_CONTENT);
     expect(output.verbose).toHaveBeenCalledWith(expect.stringContaining("LLMWIKI_EMBEDDINGS=off"));
+  });
+
+  it("skips direct core refreshes used by query --save when set to off", async () => {
+    const storePath = path.join(root, EMBEDDINGS_FILE);
+    const storeContent = "existing embedding store must remain untouched\n";
+    const conceptPath = path.join(root, "wiki/concepts/alpha.md");
+    await mkdir(path.dirname(storePath), { recursive: true });
+    await mkdir(path.dirname(conceptPath), { recursive: true });
+    await writeFile(storePath, storeContent, "utf-8");
+    await writeFile(conceptPath, "---\ntitle: Alpha\nsummary: Alpha summary\n---\n\nAlpha body.\n", "utf-8");
+    process.env[ENV_EMBEDDINGS] = "off";
+    const getProvider = vi.spyOn(provider, "getProvider").mockReturnValue({
+      embed: async () => [0.5, 0.5],
+      embedBatch: async (texts: string[]) => texts.map(() => [0.5, 0.5]),
+    } as unknown as ReturnType<typeof provider.getProvider>);
+
+    const result = await updateEmbeddingsLockedCore(root, [PAGE_ID]);
+
+    expect(result).toEqual({ embedded: [], eligible: [] });
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(await readFile(storePath, "utf-8")).toBe(storeContent);
   });
 
   it("preserves embedding refresh when unset", async () => {

@@ -36,6 +36,12 @@ import { migrateEmbeddingStore } from "./embeddings-migrate.js";
 import { collectEligibleLivePages, type CollectedPage } from "./embeddings-collect.js";
 import { reembedIntoStore, type ReembedReport } from "./embeddings-write.js";
 import type { PageId } from "./page-id.js";
+import { EMBEDDINGS_DISABLED_VALUE, ENV_EMBEDDINGS } from "./constants.js";
+
+/** Return whether embedding production is explicitly disabled. */
+export function embeddingsDisabled(): boolean {
+  return process.env[ENV_EMBEDDINGS]?.trim().toLowerCase() === EMBEDDINGS_DISABLED_VALUE;
+}
 
 /**
  * Re-embed the given changed page ids and migrate the store to v3, holding the
@@ -46,6 +52,10 @@ import type { PageId } from "./page-id.js";
  * @param changedPageIds - Qualified page ids whose pages changed this write.
  */
 export async function updateEmbeddings(root: string, changedPageIds: PageId[]): Promise<void> {
+  if (embeddingsDisabled()) {
+    output.verbose(`embeddings: skipped because ${ENV_EMBEDDINGS}=${EMBEDDINGS_DISABLED_VALUE}`);
+    return;
+  }
   await acquireLockBlocking(root);
   try {
     await updateEmbeddingsLockedCore(root, changedPageIds);
@@ -79,6 +89,10 @@ export async function updateEmbeddingsLockedCore(
   root: string,
   changedPageIds: PageId[],
 ): Promise<{ embedded: PageId[]; eligible: PageId[] }> {
+  if (embeddingsDisabled()) {
+    output.verbose(`embeddings: skipped because ${ENV_EMBEDDINGS}=${EMBEDDINGS_DISABLED_VALUE}`);
+    return { embedded: [], eligible: [] };
+  }
   const model = resolveEmbeddingModel();
   const profile = await loadProfile(root);
   const collected = await collectEligibleLivePages(root, profile);
