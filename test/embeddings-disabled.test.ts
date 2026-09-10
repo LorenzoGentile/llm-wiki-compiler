@@ -4,6 +4,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync } from "fs";
 import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -55,18 +56,21 @@ async function expectRefreshRuns(value: string | undefined): Promise<void> {
 }
 
 describe("LLMWIKI_EMBEDDINGS", () => {
-  it("leaves pending state untouched and calls no provider when set to off", async () => {
-    await mkdir(path.dirname(pendingPath()), { recursive: true });
-    await writeFile(pendingPath(), PENDING_CONTENT, "utf-8");
-    process.env[ENV_EMBEDDINGS] = " OfF ";
-    const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore");
+  it.each(["0", "false", "no", "off", " OfF "])(
+    "leaves pending state untouched and calls no provider when set to %j",
+    async (value) => {
+      await mkdir(path.dirname(pendingPath()), { recursive: true });
+      await writeFile(pendingPath(), PENDING_CONTENT, "utf-8");
+      process.env[ENV_EMBEDDINGS] = value;
+      const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore");
 
-    await refreshEmbeddingsDrainingPending(root, [PAGE_ID]);
+      await refreshEmbeddingsDrainingPending(root, [PAGE_ID]);
 
-    expect(provider).not.toHaveBeenCalled();
-    expect(await readFile(pendingPath(), "utf-8")).toBe(PENDING_CONTENT);
-    expect(output.verbose).toHaveBeenCalledWith(expect.stringContaining("LLMWIKI_EMBEDDINGS=off"));
-  });
+      expect(provider).not.toHaveBeenCalled();
+      expect(await readFile(pendingPath(), "utf-8")).toBe(PENDING_CONTENT);
+      expect(output.verbose).toHaveBeenCalledWith(expect.stringContaining("LLMWIKI_EMBEDDINGS"));
+    },
+  );
 
   it("skips direct core refreshes used by query --save when set to off", async () => {
     const storePath = path.join(root, EMBEDDINGS_FILE);
@@ -91,6 +95,18 @@ describe("LLMWIKI_EMBEDDINGS", () => {
 
   it("preserves embedding refresh when unset", async () => {
     await expectRefreshRuns(undefined);
+  });
+
+  it("runs store reconciliation without creating an empty pending marker", async () => {
+    const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore").mockResolvedValue({
+      embedded: [],
+      eligible: [],
+    });
+
+    await refreshEmbeddingsDrainingPending(root, []);
+
+    expect(provider).toHaveBeenCalledWith(root, []);
+    expect(existsSync(pendingPath())).toBe(false);
   });
 
   it("preserves embedding refresh for values other than off", async () => {
