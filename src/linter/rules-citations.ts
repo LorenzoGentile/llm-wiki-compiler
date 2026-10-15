@@ -9,15 +9,24 @@
  * so the in-memory candidate-lint path (`compile --review`) surfaces the same
  * findings before a reviewer approves a candidate. Re-exported through
  * {@link file://./rules.ts}.
+ *
+ * Each walker has ONE BODY, its `...From` form, which holds no project root.
+ * `checkBrokenCitationsFrom` owns the page collection, the imported-page
+ * exemption, the ONE line-count cache for the whole run and the per-page
+ * check; its sources answer only FACTS: the pages, whether a cited source
+ * resolves, and a cited source's text. The root-taking walker of the same name
+ * is a delegate over local disk sources built for that one call. Nothing is
+ * confined here: a cited name is joined under `sources/` exactly as written,
+ * as it always was.
  */
 
-import { existsSync } from "fs";
 import path from "path";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import {
   isMalformedCitationEntry,
   parseCitationLineRanges,
   parseFrontmatter,
-  safeReadFile,
   splitCitationMarker,
 } from "../utils/markdown.js";
 import { SOURCES_DIR } from "../utils/constants.js";
@@ -27,8 +36,10 @@ import type { LintResult } from "./types.js";
 export const MALFORMED_CLAIM_CITATION_RULE = "malformed-claim-citation";
 import {
   CITATION_PATTERN,
-  collectAllPages,
+  collectAllPagesFrom,
+  diskLintPageSources,
   findMatchesInContent,
+  type LintPageSources,
 } from "./rules-shared.js";
 
 /** Strip an optional `:start-end` or `#Lstart-Lend` span suffix from a citation entry. */
@@ -51,40 +62,87 @@ function countLines(content: string): number {
  * redundant reads.
  */
 export async function checkBrokenCitations(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
-  const sourcesDir = path.join(root, SOURCES_DIR);
+  return checkBrokenCitationsFrom(diskCitationLintSources(root));
+}
+
+/**
+ * {@link checkBrokenCitations} through `sources`: THE ONE BODY. The generic
+ * pages, then each page in turn against the cited sources, with one line-count
+ * cache shared by every page of the run.
+ */
+export async function checkBrokenCitationsFrom(sources: CitationLintSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources.pages);
   const results: LintResult[] = [];
-  const lineCountCache = new Map<string, number>();
+  const lookup = directoryCitationLookup({ reads: sources.cited, relDir: SOURCES_DIR }, new Map<string, number>());
 
   for (const page of pages) {
     const { meta } = parseFrontmatter(page.content);
     // Imported pages cite EXTERNAL bundle sources (not copied into sources/), so
     // local source-existence does not apply — exempt them from broken-citation.
     if (meta.provenanceState === "imported") continue;
-    const pageFindings = await checkPageBrokenCitations(
-      page.content,
-      page.filePath,
-      sourcesDir,
-      lineCountCache,
-    );
+    const pageFindings = await checkPageCitationsWith(page.content, page.filePath, lookup);
     results.push(...pageFindings);
   }
 
   return results;
 }
 
+/** The two reads a cited source is asked for: whether it resolves, and its whole text. Both follow links; neither is confined. */
+export type CitedSourceReads = Pick<LegacyLocalReads, "exists" | "readText">;
+
+/** What the broken-citation walker asks of the project: the pages, then the cited sources, by project-relative path under `sources/`. */
+export interface CitationLintSources {
+  /** The page collection's sources. */
+  pages: LintPageSources;
+  /** The cited sources. Asked only for a page that is not imported, and for text only by a span citation. */
+  cited: CitedSourceReads;
+}
+
+/** LOCAL DISK. The sources for the project at `root`, built per call and private to this module. Building them does no I/O. */
+function diskCitationLintSources(root: string): CitationLintSources {
+  return { pages: diskLintPageSources(root), cited: diskLocalReads(root) };
+}
+
 /**
- * Pure-body variant of {@link checkBrokenCitations} that inspects a single
- * page's content against an in-memory or on-disk sources directory. Used
- * by the on-disk lint walker above, and by the in-memory candidate-lint
- * path so `compile --review` surfaces broken-source-file and out-of-bounds
- * span findings before a reviewer approves the candidate.
- *
- * @param content - Full page markdown including frontmatter.
- * @param filePath - Logical path embedded in diagnostics (may be virtual).
- * @param sourcesDir - Absolute path to the project's sources/ directory.
- * @param lineCountCache - Optional cross-page cache; provide one when
- *   linting many pages so source file line counts aren't re-read.
+ * The two things the citation check needs from storage, kept separate on
+ * purpose: a bare `^[file.md]` citation only asks whether the source EXISTS,
+ * and must not cause its body to be read. Only a citation with a line span
+ * asks for a line count. A caller with no filesystem supplies its own lookup.
+ */
+interface SourceCitationLookup {
+  /** Whether the cited source exists. Must not read its content. */
+  exists(filename: string): Promise<boolean>;
+  /** Line count of a source that exists. Called only for a span citation. */
+  lineCount(filename: string): Promise<number>;
+}
+
+/** Where cited sources are looked up: a binding, and the sources directory relative to it. */
+interface CitedSources {
+  reads: CitedSourceReads;
+  relDir: string;
+}
+
+/**
+ * A {@link SourceCitationLookup} over a sources directory read through a
+ * binding, caching counts by filename. A source that exists but cannot be read
+ * counts zero lines, as it always has.
+ */
+function directoryCitationLookup({ reads, relDir }: CitedSources, cache: Map<string, number>): SourceCitationLookup {
+  return {
+    exists: (filename) => reads.exists(path.join(relDir, filename)),
+    lineCount: async (filename) => {
+      const cached = cache.get(filename);
+      if (cached !== undefined) return cached;
+      const lineCount = countLines(await reads.readText(path.join(relDir, filename)).catch(() => ""));
+      cache.set(filename, lineCount);
+      return lineCount;
+    },
+  };
+}
+
+/**
+ * Per-page broken-citation check against a `sources/` directory. Reports a
+ * citation whose source file is missing or whose line span is out of bounds.
  */
 export async function checkPageBrokenCitations(
   content: string,
@@ -92,28 +150,47 @@ export async function checkPageBrokenCitations(
   sourcesDir: string,
   lineCountCache: Map<string, number> = new Map(),
 ): Promise<LintResult[]> {
+  return checkPageCitationsWith(content, filePath, directoryCitationLookup({ reads: diskLocalReads(sourcesDir), relDir: "" }, lineCountCache));
+}
+
+/** The same check, with cited sources looked up under the project's `sources/` through `reads`. */
+export function checkPageBrokenCitationsFrom(
+  reads: LegacyLocalReads,
+  content: string,
+  filePath: string,
+): Promise<LintResult[]> {
+  return checkPageCitationsWith(content, filePath, directoryCitationLookup({ reads, relDir: SOURCES_DIR }, new Map()));
+}
+
+/**
+ * The same check with the source lookup supplied by the caller, so it runs
+ * unchanged over any store that can answer the two lookup questions.
+ */
+async function checkPageCitationsWith(
+  content: string,
+  filePath: string,
+  lookup: SourceCitationLookup,
+): Promise<LintResult[]> {
   const results: LintResult[] = [];
   for (const { captured, line } of findMatchesInContent(content, CITATION_PATTERN)) {
-    await collectBrokenForMarker(captured, line, filePath, sourcesDir, lineCountCache, results);
+    await collectBrokenForMarker(captured, line, filePath, lookup, results);
   }
   return results;
 }
 
-/** Append broken-citation diagnostics for every entry inside a single ^[...] marker. */
+/** Inspect every source ref in one captured `^[...]` marker for missing files / OOB spans. */
 async function collectBrokenForMarker(
   captured: string,
   line: number,
   pageFile: string,
-  sourcesDir: string,
-  lineCountCache: Map<string, number>,
+  lookup: SourceCitationLookup,
   out: LintResult[],
 ): Promise<void> {
   for (const part of splitCitationMarker(captured)) {
     const trimmed = part.trim();
     if (trimmed.length === 0) continue;
     const filename = stripSpanSuffix(trimmed);
-    const citedPath = path.join(sourcesDir, filename);
-    if (!existsSync(citedPath)) {
+    if (!(await lookup.exists(filename))) {
       out.push({
         rule: "broken-citation",
         severity: "error",
@@ -125,7 +202,8 @@ async function collectBrokenForMarker(
     }
     const ranges = parseCitationLineRanges(trimmed);
     if (ranges === null || ranges.length === 0) continue;
-    const lineCount = await resolveLineCount(citedPath, filename, lineCountCache);
+    // Only now is the source body read: a bare citation never reaches here.
+    const lineCount = await lookup.lineCount(filename);
     if (ranges.every((range) => range.end <= lineCount)) continue;
     out.push({
       rule: "broken-citation",
@@ -137,27 +215,18 @@ async function collectBrokenForMarker(
   }
 }
 
-/** Return the line count for a source file, reading and caching if necessary. */
-async function resolveLineCount(
-  citedPath: string,
-  filename: string,
-  cache: Map<string, number>,
-): Promise<number> {
-  const cached = cache.get(filename);
-  if (cached !== undefined) return cached;
-  const content = await safeReadFile(citedPath);
-  const lineCount = countLines(content);
-  cache.set(filename, lineCount);
-  return lineCount;
-}
-
 /**
  * Find ^[...] markers whose entries do not parse against the documented
  * paragraph or claim-level grammar (e.g. `^[file.md:abc]` or `^[file.md#X]`).
  * Detects malformed claim-level citations without breaking the paragraph form.
  */
 export async function checkMalformedClaimCitations(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkMalformedClaimCitationsFrom(diskLintPageSources(root));
+}
+
+/** {@link checkMalformedClaimCitations} through `sources`: THE ONE BODY. No page is exempt, imported or not. */
+export async function checkMalformedClaimCitationsFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
   for (const page of pages) {
     results.push(...checkPageMalformedCitations(page.content, page.filePath));

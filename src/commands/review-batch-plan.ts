@@ -3,6 +3,16 @@
  * are read before writes; known validation refusals are individual outcomes,
  * while unexpected storage failures abort the operation. Conflicting target
  * identities are refused as a group so input order cannot decide an overwrite.
+ *
+ * ONE BODY. {@link planReviewBatchWith} owns every decision: the per-item order
+ * (read, pins, validated-answer refusal, destination precondition, generic
+ * citation refusal, typed or default plan), which errors are individual
+ * refusals, the target-conflict group refusal, then the relation gate and the
+ * source-snapshot conflicts. It runs over {@link ReviewBatchPlanSteps}, none of
+ * which takes a project root. {@link planReviewBatch} keeps its signature and
+ * passes the local steps, which call the incumbent root forms (including the
+ * default page planner, with its rooted input) when asked, with exactly their
+ * old arguments. The lock stays with the caller.
  */
 
 import { readCandidate, UnsafeCandidateIdError } from "../compiler/candidates.js";
@@ -25,6 +35,34 @@ export interface PlannedReviewApproval {
   candidate: ReviewCandidate;
   planned: PagePlannedMutation[];
   result: ReviewBatchCandidateResult;
+}
+
+/** The project steps one batch plan takes, per candidate and then once for the batch. No member takes a project root. */
+export interface ReviewBatchPlanSteps {
+  /** The under-lock candidate re-read with strict I/O: the candidate, or null when missing or malformed. */
+  readCandidate(id: string): Promise<ReviewCandidate | null>;
+  /** Whether the destination still satisfies the proposal's pins. */
+  targetUnchanged(candidate: ReviewCandidate): Promise<boolean>;
+  /** The generic citation refusal for a default candidate, or undefined. */
+  publicationRefusal(candidate: ReviewCandidate): Promise<string | undefined>;
+  /** The typed promotion plan; throws its typed refusals. */
+  planTyped(candidate: ReviewCandidate): Promise<PagePlannedMutation[]>;
+  /** The trust planner's mutations for a default candidate. */
+  planDefault(candidate: ReviewCandidate): Promise<PagePlannedMutation[]>;
+  /** The batch relation gate over the conflict-free approvals. */
+  relationGates(approvals: PlannedReviewApproval[]): Promise<PlannedReviewApproval[]>;
+}
+
+/** LOCAL DISK. The incumbent root forms for `root`, each called when asked with its old arguments. */
+function diskReviewBatchPlanSteps(root: string): ReviewBatchPlanSteps {
+  return {
+    readCandidate: (id) => readCandidate(root, id, { strictIo: true }),
+    targetUnchanged: (candidate) => targetUnchangedSincePropose(root, candidate),
+    publicationRefusal: (candidate) => genericPublicationRefusal(root, candidate),
+    planTyped: (candidate) => planTypedCandidate(root, candidate),
+    planDefault: (candidate) => planDefaultCandidateWrite(root, candidate),
+    relationGates: (approvals) => rejectBatchRelationGates(root, approvals),
+  };
 }
 
 /** Expected per-candidate refusal; unexpected errors must stop the shared batch. */
@@ -56,33 +94,42 @@ export async function planReviewBatch(
   items: ReviewBatchItem[],
   results: ReviewBatchCandidateResult[],
 ): Promise<PlannedReviewApproval[]> {
+  return planReviewBatchWith(diskReviewBatchPlanSteps(root), items, results);
+}
+
+/** {@link planReviewBatch} over {@link ReviewBatchPlanSteps}: THE ONE BODY. */
+export async function planReviewBatchWith(
+  steps: ReviewBatchPlanSteps,
+  items: ReviewBatchItem[],
+  results: ReviewBatchCandidateResult[],
+): Promise<PlannedReviewApproval[]> {
   const approvals: PlannedReviewApproval[] = [];
   for (const [index, item] of items.entries()) {
     const result = results[index];
     if (result.status === "conflict") continue;
-    const approval = await planOneCandidate(root, item, result);
+    const approval = await planOneCandidate(steps, item, result);
     if (approval) approvals.push(approval);
   }
-  const ungated = await rejectBatchRelationGates(root, rejectTargetConflicts(approvals));
+  const ungated = await steps.relationGates(rejectTargetConflicts(approvals));
   return rejectSourceSnapshotConflicts(ungated);
 }
 
 /** Validate one under-lock candidate without suppressing an unexpected I/O error. */
 async function planOneCandidate(
-  root: string,
+  steps: ReviewBatchPlanSteps,
   item: ReviewBatchItem,
   result: ReviewBatchCandidateResult,
 ): Promise<PlannedReviewApproval | null> {
   try {
-    const candidate = await readCandidate(root, item.id, { strictIo: true });
+    const candidate = await steps.readCandidate(item.id);
     if (!candidate) throw new CandidateValidationError("Candidate missing or malformed.");
     if (!candidateHashMatches(candidate, item.draftContentHash)) {
       throw new CandidateValidationError("Content hash missing or stale; re-review required.");
     }
-    await checkBatchPublication(root, candidate);
+    await checkBatchPublication(steps, candidate);
     const planned = candidate.targetEntityType
-      ? await planTypedCandidate(root, candidate)
-      : await planDefaultCandidate(root, candidate);
+      ? await steps.planTyped(candidate)
+      : await planDefaultCandidate(steps, candidate);
     const namespace = candidatePageNamespace(candidate);
     result.pagePath = `wiki/${namespace}/${candidate.slug}.md`;
     return { candidate, planned, result };
@@ -95,14 +142,14 @@ async function planOneCandidate(
 }
 
 /** Preserve shared target/citation policy while keeping validated answers on the single path. */
-async function checkBatchPublication(root: string, candidate: ReviewCandidate): Promise<void> {
+async function checkBatchPublication(steps: ReviewBatchPlanSteps, candidate: ReviewCandidate): Promise<void> {
   if (isValidatedAnswer(candidate)) {
     throw new CandidateValidationError("Validated answers must be approved individually with review approve.");
   }
-  if (!(await targetUnchangedSincePropose(root, candidate))) {
+  if (!(await steps.targetUnchanged(candidate))) {
     throw new CandidateValidationError("Target page changed since this proposal; re-propose against the current page.");
   }
-  const problem = await genericPublicationRefusal(root, candidate);
+  const problem = await steps.publicationRefusal(candidate);
   if (problem) throw new CandidateValidationError(problem);
 }
 
@@ -119,9 +166,9 @@ function isCandidateRefusal(error: unknown): error is Error {
 }
 
 /** Apply the same default-page title and trust-planner gates as single approval. */
-async function planDefaultCandidate(root: string, candidate: ReviewCandidate): Promise<PagePlannedMutation[]> {
+async function planDefaultCandidate(steps: ReviewBatchPlanSteps, candidate: ReviewCandidate): Promise<PagePlannedMutation[]> {
   if (!validateWikiPage(candidate.body)) throw new CandidateValidationError("Candidate failed page validation.");
-  const planned = await planDefaultCandidateWrite(root, candidate);
+  const planned = await steps.planDefault(candidate);
   if (planned.length === 0) throw new CandidateValidationError("Candidate blocked by the write planner.");
   return planned;
 }

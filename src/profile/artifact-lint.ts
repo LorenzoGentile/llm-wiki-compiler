@@ -3,7 +3,7 @@
  * @description Additive artifact-ref HEALTH findings, the read-surface mirror of
  * `relation-lint.ts`: every hash-pinned artifactRef value under a page's
  * declared fields OR a live relation's declared attributes is resolved against
- * the ACTUAL bytes (via `resolveArtifactRef`, the bytes-verified reader in
+ * the ACTUAL bytes (via `resolveArtifactRefFrom`, the bytes-verified reader in
  * `../artifacts/resolve.js`), and a non-`ok` health becomes a finding.
  *
  * Severity mirrors the relation-lint park/deny split: `artifact-unreadable` (a
@@ -14,7 +14,7 @@
  * `checkArtifactRefs` is the ONE resolution pass, reused by every read surface:
  *   - `lint.ts` consumes the `LintResult[]` directly;
  *   - `block.ts` (status/viewer) and `export/profile-block.ts` (export) consume
- *     the path-safe `EntityProblemView[]` from {@link artifactProblemViews}, a
+ *     the path-safe `EntityProblemView[]` from {@link artifactProblemViewsFrom}, a
  *     thin mapper over the SAME findings, and fold them into
  *     `snapshot.profile.problems`;
  *   - `context/pack-warnings.ts`'s `appendArtifactWarning` filters that SAME
@@ -36,15 +36,45 @@
  * A profile with no `artifacts` block declares no possible refs (and no
  * enforceable precondition), so this returns immediately — the
  * default/artifact-less profile's read surfaces stay byte-identical.
+ *
+ * ONE BODY. {@link checkArtifactRefs} runs it over local-disk sources
+ * ({@link diskArtifactHealthSources}); the profile summary and the JSON
+ * export's profile block run {@link artifactProblemViewsFrom} over their own.
+ * The view mapping has no root-taking form. Which pages and
+ * relation attributes are looked at, the order, what each outcome means, the
+ * wording and the path rule are decided in this file.
+ *
+ * WHAT A PINNED REF RESOLVES TO IS A RAW BINDING. The check hands the artifact
+ * store's leaf reads ({@link ArtifactStoreReads}) to the resolver's one body,
+ * `resolveArtifactRefFrom`, so the resolver's whole verdict ladder runs on
+ * what those reads serve and this file names no project root for it. What
+ * answers the leaf reads on disk is unchanged: the store's confined readers.
+ *
+ * WHETHER A RUN VOUCHES FOR IT IS WORKED OUT HERE TOO, OVER RAW LEAVES. The
+ * check hands the preparation store's leaf reads ({@link PreparationStoreLeafReads})
+ * to the verifier's one body, `verifyExecutionProvenanceFrom`, through the one
+ * composition `executionProvenanceReadsOver`: the inventory scan, the run
+ * lookup, the sealed-input read, the run's authentication against the key and
+ * the verdict all run on what those leaves serve. What answers the leaves on
+ * disk is unchanged: the store's confined readers.
+ *
+ * ONE PART IS NOT A LEAF AND IS NOT MADE NEUTRAL: the lifecycle read the
+ * inventory scan borrows, and the proof that it is genuine. On disk both stay
+ * the real capture and check for the root, carried as the leaves' `lifecycle`
+ * member. That is ROOT-BOUND LOCAL-DISK AUTHORITY, a named deferment, not an
+ * accepted mechanism.
  */
 import path from "path";
-import { scanEntityDir } from "../wiki/collect.js";
-import { safeRealpath, toPosixPath } from "../utils/path-confine.js";
+import { scanEntityDirFrom } from "../wiki/collect.js";
+import { toPosixPath } from "../utils/path-confine.js";
 import { parseArtifactRef, formatArtifactRef, type ArtifactRef } from "../artifacts/ref.js";
-import { resolveArtifactRef, type ArtifactHealth } from "../artifacts/resolve.js";
-import { verifyExecutionProvenance } from "../artifacts/execution-provenance.js";
+import { diskArtifactStoreReads, resolveArtifactRefFrom, type ArtifactHealth, type ArtifactStoreReads } from "../artifacts/resolve.js";
+import { executionProvenanceReadsOver, verifyExecutionProvenanceFrom } from "../artifacts/execution-provenance.js";
+import { diskPreparationStoreLeafReads, type PreparationStoreLeafReads } from "../preparations/store-leaf-reads.js";
 import { refValuesFor } from "./artifact-ref-validate.js";
-import { readLiveValidRelations } from "../relations/live-valid.js";
+import { readLiveValidRelationsFrom } from "../relations/live-valid.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../utils/jsonl-store.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
 import type { ArtifactPreconditionReq, ProfilePack, EntityProblemView } from "./types.js";
 import type { RelationRef } from "../relations/types.js";
 import type { LintResult } from "../linter/types.js";
@@ -54,6 +84,37 @@ export interface ArtifactRefPageSource {
   entityType: string;
   filePath: string;
   frontmatter: Record<string, unknown>;
+}
+
+/**
+ * Everything the health check reads beyond the pages it is handed: the
+ * relation store (once per check, lock-free), the artifact store's leaf reads
+ * and the preparation store's leaf reads. NOTHING TIES THESE OBJECTS TO ONE
+ * PROJECT, and nothing makes two reads agree.
+ */
+export interface ArtifactHealthSources {
+  graph: GraphStoreReads;
+  /** The artifact store's leaf reads. The resolver's one body runs over them once per ref occurrence; nothing is remembered between occurrences. */
+  artifacts: ArtifactStoreReads;
+  /** The preparation store's leaf reads and its lifecycle authority. The verifier's one body runs over them once per armed requirement that has a right-typed ref; nothing is remembered between requirements. */
+  provenance: PreparationStoreLeafReads;
+}
+
+/**
+ * LOCAL DISK. The health-check sources for the project at `root`: THE ONE
+ * BUILDER, used by the root form below and by the profile summary's builder.
+ * Building them does no I/O and no path work, and holds no ref or profile:
+ * the artifact reads are the resolver's own disk store reads for this root,
+ * asked only when a ref is resolved, and the provenance reads are the
+ * preparation store's own disk leaves, with the real lifecycle capture and
+ * check for this root. In no package index.
+ */
+export function diskArtifactHealthSources(root: string): ArtifactHealthSources {
+  return {
+    graph: diskGraphStoreReads(root),
+    artifacts: diskArtifactStoreReads(root),
+    provenance: diskPreparationStoreLeafReads(root),
+  };
 }
 
 /** The `file` label for relation-attribute artifact findings (store-level, not page-scoped). */
@@ -82,14 +143,14 @@ function healthFinding(health: ArtifactHealth, file: string, subject: string, re
 }
 
 /** Resolve and flag every artifactRef value under one page's declared fields. */
-async function checkPageArtifactRefs(root: string, page: ArtifactRefPageSource, profile: ProfilePack): Promise<LintResult[]> {
+async function checkPageArtifactRefs(artifacts: ArtifactStoreReads, page: ArtifactRefPageSource, profile: ProfilePack): Promise<LintResult[]> {
   const def = profile.entities[page.entityType];
   if (!def) return [];
   const findings: LintResult[] = [];
   for (const occ of refValuesFor(def.fields ?? {}, page.frontmatter)) {
     const ref = parseArtifactRef(occ.raw);
     if (!ref) continue; // a structural failure is Layer A's job, not health resolution
-    const { health } = await resolveArtifactRef(root, profile, ref);
+    const { health } = await resolveArtifactRefFrom(artifacts, profile, ref);
     const finding = healthFinding(health, page.filePath, `field ${JSON.stringify(occ.field)}`, ref, page.entityType);
     if (finding) findings.push(finding);
   }
@@ -97,11 +158,11 @@ async function checkPageArtifactRefs(root: string, page: ArtifactRefPageSource, 
 }
 
 /** Resolve and flag every artifactRef value under every live relation's declared attributes. */
-async function checkRelationArtifactRefs(root: string, profile: ProfilePack): Promise<LintResult[]> {
+async function checkRelationArtifactRefs(sources: ArtifactHealthSources, profile: ProfilePack): Promise<LintResult[]> {
   if (!profile.relations) return [];
   let relations: RelationRef[];
   try {
-    relations = await readLiveValidRelations(root, profile);
+    relations = await readLiveValidRelationsFrom(sources.graph, profile);
   } catch {
     return []; // the relation store's own health is already surfaced by checkRelationStore
   }
@@ -112,7 +173,7 @@ async function checkRelationArtifactRefs(root: string, profile: ProfilePack): Pr
     for (const occ of refValuesFor(attrDefs, rel.attributes)) {
       const ref = parseArtifactRef(occ.raw);
       if (!ref) continue;
-      const { health } = await resolveArtifactRef(root, profile, ref);
+      const { health } = await resolveArtifactRefFrom(sources.artifacts, profile, ref);
       const subject = `relation ${rel.id} (${rel.type}) attribute ${JSON.stringify(occ.field)}`;
       const finding = healthFinding(health, RELATION_STORE_FILE, subject, ref);
       if (finding) findings.push(finding);
@@ -182,7 +243,7 @@ function unmetRequirementFinding(page: ArtifactRefPageSource, state: string, req
  * write gate, so the read side must speak the arm too. Deny is an `error`;
  * park (store could not be verified) a `warning`.
  */
-async function checkGatedPageProvenance(root: string, page: ArtifactRefPageSource, profile: ProfilePack): Promise<LintResult[]> {
+async function checkGatedPageProvenance(provenance: PreparationStoreLeafReads, page: ArtifactRefPageSource, profile: ProfilePack): Promise<LintResult[]> {
   const gated = gatedArtifactRequirements(page, profile);
   if (!gated) return [];
   const findings: LintResult[] = [];
@@ -190,7 +251,7 @@ async function checkGatedPageProvenance(root: string, page: ArtifactRefPageSourc
     const ref = parseArtifactRef(page.frontmatter[req.field]);
     if (req.executionProvenance === undefined || !ref || ref.artifactType !== req.artifactType) continue; // the pure pass reports those
     const slug = path.basename(page.filePath, ".md");
-    const verdict = await verifyExecutionProvenance(root, req.executionProvenance, slug, `sha256:${ref.sha256}`);
+    const verdict = await verifyExecutionProvenanceFrom(executionProvenanceReadsOver(provenance), req.executionProvenance, slug, `sha256:${ref.sha256}`);
     if (verdict.verdict === "pass") continue;
     findings.push({
       rule: REQUIRED_ARTIFACT_UNPROVEN_RULE, severity: verdict.verdict === "deny" ? "error" : "warning",
@@ -229,7 +290,7 @@ function checkGatedPageRequirements(page: ArtifactRefPageSource, profile: Profil
  *
  * @param root - Absolute project root directory.
  * @param pages - The profile's collected entity pages (or any structurally
- *   compatible frontmatter-only source — see {@link collectArtifactRefPageSources}).
+ *   compatible frontmatter-only source — see {@link collectArtifactRefPageSourcesFrom}).
  * @param profile - The CURRENT profile pack (its `artifacts`/`entities`/`relations`
  *   blocks are the schema every ref is resolved and scoped against).
  * @returns All artifact-ref health findings (possibly empty).
@@ -239,14 +300,29 @@ export async function checkArtifactRefs(
   pages: ArtifactRefPageSource[],
   profile: ProfilePack,
 ): Promise<LintResult[]> {
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return checkArtifactRefsFrom(diskArtifactHealthSources(root), pages, profile);
+}
+
+/**
+ * {@link checkArtifactRefs} over {@link ArtifactHealthSources}: THE ONE BODY.
+ * Page by page in the order given: health, the pure requirement pass,
+ * provenance; then the relation store's attributes, last. One step after
+ * another, never together.
+ */
+export async function checkArtifactRefsFrom(
+  sources: ArtifactHealthSources,
+  pages: ArtifactRefPageSource[],
+  profile: ProfilePack,
+): Promise<LintResult[]> {
   if (!profile.artifacts || Object.keys(profile.artifacts).length === 0) return [];
   const findings: LintResult[] = [];
   for (const page of pages) {
-    findings.push(...(await checkPageArtifactRefs(root, page, profile)));
+    findings.push(...(await checkPageArtifactRefs(sources.artifacts, page, profile)));
     findings.push(...checkGatedPageRequirements(page, profile));
-    findings.push(...(await checkGatedPageProvenance(root, page, profile)));
+    findings.push(...(await checkGatedPageProvenance(sources.provenance, page, profile)));
   }
-  findings.push(...(await checkRelationArtifactRefs(root, profile)));
+  findings.push(...(await checkRelationArtifactRefs(sources, profile)));
   return findings;
 }
 
@@ -254,19 +330,20 @@ export async function checkArtifactRefs(
  * Frontmatter-only entity-page scan (no bodies), for callers that need
  * artifact-ref health WITHOUT already holding content-carrying `EntityPage`s —
  * e.g. `collectProfileSummary`, which otherwise only tallies counts. Mirrors
- * `block.ts`'s `tallyLifecycleStates` scan shape.
+ * `block.ts`'s `tallyLifecycleStates` scan shape. It scans through the
+ * entity-scan binding it is handed; the summary is its one caller.
  *
- * @param root - Absolute project root directory.
+ * @param scans - The entity-scan binding every declared directory is opened through.
  * @param profile - The profile pack whose declared entity directories are scanned.
  * @returns One {@link ArtifactRefPageSource} per readable page (an invalid or
  *   missing directory is silently skipped — already surfaced by the entity collector).
  */
-export async function collectArtifactRefPageSources(root: string, profile: ProfilePack): Promise<ArtifactRefPageSource[]> {
+export async function collectArtifactRefPageSourcesFrom(scans: LegacyLocalEntityScans, profile: ProfilePack): Promise<ArtifactRefPageSource[]> {
   const sources: ArtifactRefPageSource[] = [];
   for (const [entityType, def] of Object.entries(profile.entities)) {
-    const { scans, dirStatus } = await scanEntityDir(root, def.directory, { includeBody: false });
+    const { scans: found, dirStatus } = await scanEntityDirFrom(scans, def.directory, { includeBody: false });
     if (dirStatus !== "ok") continue;
-    for (const scan of scans) sources.push({ entityType, filePath: scan.filePath, frontmatter: scan.frontmatter });
+    for (const scan of found) sources.push({ entityType, filePath: scan.filePath, frontmatter: scan.frontmatter });
   }
   return sources;
 }
@@ -283,24 +360,31 @@ function relativizeFile(file: string, canonicalRoot: string): string {
   return path.isAbsolute(file) ? toPosixPath(path.relative(canonicalRoot, file)) : file;
 }
 
+/** Where a finding's page path is made relative: the project root's real path, asked ONLY when there is a finding, else the root as given. */
+interface ProblemPathRoot {
+  realRoot(): Promise<string | null>;
+  asGiven: string;
+}
+
 /**
  * The path-safe {@link EntityProblemView} mirror of {@link checkArtifactRefs},
  * for the additive status/viewer/context/export surfaces (never the absolute
- * `LintResult.file` the CLI-facing lint output carries).
+ * `LintResult.file` the CLI-facing lint output carries), over
+ * {@link ArtifactHealthSources}: THE ONE BODY of the view mapping, and its
+ * only form. The real-path look is made after the check and only when the
+ * check found something; nothing is remembered from it.
  *
- * @param root - Absolute project root directory.
- * @param pages - Same as {@link checkArtifactRefs}.
- * @param profile - Same as {@link checkArtifactRefs}.
  * @returns The SAME findings as {@link checkArtifactRefs}, reshaped path-safe.
  */
-export async function artifactProblemViews(
-  root: string,
+export async function artifactProblemViewsFrom(
+  sources: ArtifactHealthSources,
   pages: ArtifactRefPageSource[],
   profile: ProfilePack,
+  pathRoot: ProblemPathRoot,
 ): Promise<EntityProblemView[]> {
-  const results = await checkArtifactRefs(root, pages, profile);
+  const results = await checkArtifactRefsFrom(sources, pages, profile);
   if (results.length === 0) return [];
-  const canonicalRoot = (await safeRealpath(root)) ?? root;
+  const canonicalRoot = (await pathRoot.realRoot()) ?? pathRoot.asGiven;
   return results.map((r) => ({
     kind: "artifact-store" as const,
     ...(r.entityType ? { entityType: r.entityType } : {}),

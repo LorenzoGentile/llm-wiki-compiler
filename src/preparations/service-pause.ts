@@ -40,6 +40,9 @@
  * what the entrance costs — see {@link file://./service-resume.ts} — and the
  * property is stated as *escapable by a principal holding `preparation.run`*
  * rather than as a count of commands, because a count hides the authority.
+ *
+ * ONE BODY, {@link pausePreparationOperationWith}, over the control verbs' shared steps
+ * (`ControlVerbSteps`); the root form passes the local disk steps.
  */
 
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
@@ -50,8 +53,8 @@ import type {
   PreparationExecutionOwnerV1, PreparationRunBinding, PreparationRunState, PreparationRunV1,
 } from "./run-types.js";
 import { LEGAL_EDGES } from "./run-validation.js";
-import { appendControlTransitionLocked, withControlTarget } from "./service-control-transition.js";
-import type { ControlAppendV1 } from "./service-control-transition.js";
+import { appendControlTransitionWith, diskControlVerbSteps, withControlTargetFrom } from "./service-control-transition.js";
+import type { ControlAppendV1, ControlVerbSteps } from "./service-control-transition.js";
 
 /** Request for the `pause` operation. Carries no actor, surface or grant. */
 export interface PauseRequestV1 {
@@ -165,9 +168,9 @@ function pauseRefusal(run: PreparationRunV1): string | null {
 
 /** Append the pause transition through the shared control-verb primitive. */
 async function appendPaused(
-  root: string, binding: PreparationRunBinding, run: PreparationRunV1, principal: PreparationPrincipal,
+  steps: ControlVerbSteps, binding: PreparationRunBinding, run: PreparationRunV1, principal: PreparationPrincipal,
 ): Promise<ControlAppendV1> {
-  return appendControlTransitionLocked(root, binding, run, {
+  return appendControlTransitionWith(steps, binding, run, {
     type: "paused", stateAfter: "paused",
     payload: { kind: "none" },
     actor: preparationRunActor(principal), at: new Date().toISOString(),
@@ -176,7 +179,7 @@ async function appendPaused(
 
 /** Apply the state preconditions, then append. */
 async function pauseResolved(
-  root: string, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
+  steps: ControlVerbSteps, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
   principal: PreparationPrincipal,
 ): Promise<PauseResultV1> {
   // IDEMPOTENT BEFORE THE PRECONDITIONS, because `paused` has no self-edge: a
@@ -185,7 +188,7 @@ async function pauseResolved(
   if (run.state === "paused") return { status: "paused", runId, transition: "already-paused" };
   const refused = pauseRefusal(run);
   if (refused !== null) return { status: "refused", reason: refused };
-  const appended = await appendPaused(root, binding, run, principal);
+  const appended = await appendPaused(steps, binding, run, principal);
   return appended.ok
     ? { status: "paused", runId, transition: "appended" }
     : { status: "refused", reason: appended.reason };
@@ -205,6 +208,14 @@ async function pauseResolved(
 export async function pausePreparationOperation(
   root: string, principal: PreparationPrincipal, request: PauseRequestV1,
 ): Promise<PauseResultV1> {
+  // Building the disk steps does no I/O and awaits nothing, so the body's capture still runs before the first await.
+  return pausePreparationOperationWith(diskControlVerbSteps(root), principal, request);
+}
+
+/** {@link pausePreparationOperation} over {@link ControlVerbSteps}: THE ONE BODY. */
+export async function pausePreparationOperationWith(
+  steps: ControlVerbSteps, principal: PreparationPrincipal, request: PauseRequestV1,
+): Promise<PauseResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE (D-10-9), read once and threaded — a
   // field re-read after an await retargets the durable transition at a run the
   // caller never named.
@@ -215,9 +226,9 @@ export async function pausePreparationOperation(
   // HOW, and this operation was written before the capture existed — the
   // totality control caught it as the invariant's first new member.
   //
-  // AHEAD OF THE FIRST AWAIT inside `withControlTarget` below.
+  // AHEAD OF THE FIRST AWAIT inside `withControlTargetFrom` below.
   const captured = capturedRequest<PauseRequestV1>(request);
   if (captured === null) return { status: "refused", reason: REQUEST_CAPTURE_REFUSAL };
   const runId = captured.runId;
-  return withControlTarget(root, runId, (binding, run) => pauseResolved(root, runId, binding, run, principal));
+  return withControlTargetFrom(steps, runId, (binding, run) => pauseResolved(steps, runId, binding, run, principal));
 }

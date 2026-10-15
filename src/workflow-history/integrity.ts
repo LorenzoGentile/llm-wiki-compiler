@@ -70,12 +70,50 @@ export async function loadRunKey(root: string): Promise<Buffer | null> {
  * @returns The lowercase-hex HMAC.
  */
 export function runIntegrity(key: Buffer, run: WorkflowRun): string {
+  return macOf(key, canonicalRunContent(run));
+}
+
+
+/**
+ * The canonical text of `run` with `integrity` OMITTED: the exact preimage the
+ * writer signs and the reader recomputes over.
+ *
+ * @param run - The run whose content is canonicalized (its own `integrity` field is excluded).
+ * @returns The canonical JSON text.
+ */
+export function canonicalRunContent(run: WorkflowRun): string {
   const { integrity: _omit, ...content } = run;
   const canonical = canonicalize(content);
   if (canonical === undefined) {
     throw new Error("workflow run canonicalization produced no output");
   }
+  return canonical;
+}
+
+
+/** The hex HMAC-SHA256 of canonical content text, read as UTF-8, under `key`. */
+function macOf(key: Buffer, canonical: string): string {
   return createHmac("sha256", key).update(canonical, "utf8").digest("hex");
+}
+
+
+/**
+ * A store's integrity computation: canonical content text in, lowercase-hex MAC
+ * out, synchronously. A cryptographic MECHANISM and not a grant: it parses no
+ * run, checks no schema and decides nothing.
+ */
+export type RunIntegrityComputation = (canonical: string) => string;
+
+
+/**
+ * The computation for one key. The key stays inside the returned function, so a
+ * reader given the computation never holds the key.
+ *
+ * @param key - The per-project secret key.
+ * @returns The computation {@link runIntegrity} applies to {@link canonicalRunContent}.
+ */
+export function runIntegrityComputation(key: Buffer): RunIntegrityComputation {
+  return (canonical) => macOf(key, canonical);
 }
 
 

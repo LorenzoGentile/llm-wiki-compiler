@@ -20,9 +20,18 @@
  * `undefined` for a default-profile project (its caller then omits the block
  * entirely), so a default bundle's `index.md` stays byte-identical to a pre-7.6
  * export. Output is deterministic: every list is sorted and no timestamps ride.
+ *
+ * ONE BODY, {@link collectBundleBlockFrom}, over the existing raw reads
+ * ({@link BundleBlockSources}): the graph-store read and the workflow run
+ * reads. The live-valid relation read, the run listing and each run read
+ * (with its integrity check) are their readers' own one bodies over those
+ * reads, never finished answers. `collectBundleBlock(root, …)` hands it the
+ * local disk's reads. Naming the reads selects no backend and rules on no
+ * mechanism.
  */
-import { readLiveValidRelations } from "../../relations/live-valid.js";
-import { listRuns, readRun } from "../../workflow-history/store.js";
+import { readLiveValidRelationsFrom } from "../../relations/live-valid.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../../utils/jsonl-store.js";
+import { diskWorkflowRunReads, listRunsFrom, readRunFrom, type WorkflowRunReads } from "../../workflow-history/store.js";
 import type { LoadedProfile } from "../../profile/types.js";
 import type { RelationRef } from "../../relations/types.js";
 import type { WorkflowRun } from "../../workflow-history/types.js";
@@ -119,8 +128,8 @@ function byStringKey<T>(key: (item: T) => string): (a: T, b: T) => number {
 }
 
 /** Collect the live, profile-valid relations as sorted bundle entries. */
-async function collectRelationEntries(loaded: LoadedProfile, root: string): Promise<BundleRelationEntry[]> {
-  const relations = await readLiveValidRelations(root, loaded.profile);
+async function collectRelationEntries(loaded: LoadedProfile, graph: GraphStoreReads): Promise<BundleRelationEntry[]> {
+  const relations = await readLiveValidRelationsFrom(graph, loaded.profile);
   return relations.map(toRelationEntry).sort(byStringKey((r) => r.id));
 }
 
@@ -144,12 +153,12 @@ function toWorkflowEntry(run: WorkflowRun): BundleWorkflowEntry {
  * summary is best-effort metadata, never a trust surface); foreign run records
  * are never materialized (D-7.6.7 keeps them export-only + inert on import).
  */
-async function collectWorkflowEntries(root: string): Promise<BundleWorkflowEntry[]> {
-  const list = await listRuns(root);
+async function collectWorkflowEntries(runs: WorkflowRunReads): Promise<BundleWorkflowEntry[]> {
+  const list = await listRunsFrom(runs);
   if (list.status !== "ok") return [];
   const entries: BundleWorkflowEntry[] = [];
   for (const runId of list.runIds) {
-    const read = await readRun(root, runId);
+    const read = await readRunFrom(runs, runId);
     if (read.status === "ok") entries.push(toWorkflowEntry(read.run));
   }
   return entries.sort(byStringKey((entry) => entry.runId));
@@ -169,10 +178,36 @@ export async function collectBundleBlock(
   root: string,
   loaded: LoadedProfile | undefined,
 ): Promise<BundleBlock | undefined> {
+  // `async` so that a throw while the disk reads are built REJECTS.
+  return collectBundleBlockFrom({ graph: diskGraphStoreReads(root), runs: diskWorkflowRunReads(root) }, loaded);
+}
+
+/**
+ * Everything {@link collectBundleBlockFrom} reads. A narrow seam: not
+ * `ProjectStore`, not a hosted or access-control contract, and it selects no
+ * backend. Nothing ties the two to one project; production builds both from
+ * one root.
+ */
+export interface BundleBlockSources {
+  /** The relation store, read once, after the profile sub-block is built. */
+  graph: GraphStoreReads;
+  /** The workflow run store: listed once after the relations, then each listed run read in turn. */
+  runs: WorkflowRunReads;
+}
+
+/**
+ * {@link collectBundleBlock} over {@link BundleBlockSources}: THE ONE BODY. The
+ * default profile asks the reads nothing; otherwise the profile sub-block,
+ * then the relations, then the workflow summaries, one after another.
+ */
+export async function collectBundleBlockFrom(
+  sources: BundleBlockSources,
+  loaded: LoadedProfile | undefined,
+): Promise<BundleBlock | undefined> {
   if (loaded === undefined) return undefined;
   return {
     profile: buildProfileSubBlock(loaded),
-    relations: await collectRelationEntries(loaded, root),
-    workflows: await collectWorkflowEntries(root),
+    relations: await collectRelationEntries(loaded, sources.graph),
+    workflows: await collectWorkflowEntries(sources.runs),
   };
 }

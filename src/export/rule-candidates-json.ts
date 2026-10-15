@@ -10,6 +10,10 @@
  * Approved candidates remain in `.llmwiki/rule-candidates/` with `status:
  * "approved"` (only rejects are archived out), so export reads the live
  * candidate directory and filters by status scope.
+ *
+ * The scope selection is ONE BODY, {@link collectRuleCandidatesForExportFrom},
+ * over a supplied listing that takes no project root; the root form hands it the
+ * incumbent listing for its root.
  */
 
 import { listRuleCandidates } from "../compiler/rule-candidates.js";
@@ -37,7 +41,23 @@ export async function collectRuleCandidatesForExport(
   root: string,
   scope: RuleExportScope = "approved",
 ): Promise<RuleCandidate[]> {
-  const all = await listRuleCandidates(root);
+  return collectRuleCandidatesForExportFrom(() => listRuleCandidates(root), scope);
+}
+
+/**
+ * {@link collectRuleCandidatesForExport} over a supplied listing: THE ONE BODY.
+ * `all` keeps the listing whole and in its order; any other scope keeps the
+ * candidates with that status, in listing order. It reads the listing once and
+ * writes nothing.
+ *
+ * @param listCandidates - Every persisted rule candidate, in listing order.
+ * @param scope - "approved" (default), "proposed", or "all".
+ */
+export async function collectRuleCandidatesForExportFrom(
+  listCandidates: () => Promise<RuleCandidate[]>,
+  scope: RuleExportScope = "approved",
+): Promise<RuleCandidate[]> {
+  const all = await listCandidates();
   if (scope === "all") return all;
   return all.filter((c) => c.status === scope);
 }

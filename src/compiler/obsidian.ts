@@ -6,12 +6,27 @@
  *    Obsidian graph navigation and search.
  * 2. Generating a Map of Content (MOC) page that groups concept pages
  *    by tag for easy browsing.
+ *
+ * `generateMOCFrom` is THE ONE BODY of the generator and holds no project root:
+ * it reaches the project only through {@link MocGenerationSources}, three
+ * operations this module names itself, the last of which publishes the
+ * finished page. `generateMOC(root)` is a delegate over a private binding built
+ * per call, whose members call the same listing, the same confined page read
+ * and the same atomic writer as before. Naming the operations selects no
+ * backend and rules on no mechanism; every member of the local binding is
+ * still local disk.
+ *
+ * WHO WARNS ABOUT A DROPPED PAGE. The read answers a fact, the page's text or
+ * that it was dropped, and reports nothing. THE BODY decides what a drop means:
+ * it emits the incumbent warning, naming the bare `<slug>.md`, and leaves the
+ * page out. So no backend can drop a page silently.
  */
 
-import { readdir } from "fs/promises";
 import path from "path";
-import { slugify, atomicWrite, parseFrontmatter } from "../utils/markdown.js";
-import { readWikiPageInDirOrWarn } from "./confined-wiki-read.js";
+import { slugify, parseFrontmatter } from "../utils/markdown.js";
+import { listDirectoryNames, replaceLeafAtomicWithin } from "../storage/disk-guarded-leaves.js";
+import { readWikiPageInDir, warnDroppedWikiRead } from "./confined-wiki-read.js";
+import type { ConfinedReadResult } from "./confined-wiki-read.js";
 import { CONCEPTS_DIR, MOC_FILE } from "../utils/constants.js";
 
 /** Minimum word count to generate an abbreviation alias. */
@@ -108,13 +123,57 @@ function generateAbbreviation(title: string): string | null {
  * @param root - Project root directory.
  */
 export async function generateMOC(root: string): Promise<void> {
+  return generateMOCFrom(diskMocGenerationSources(root));
+}
+
+/**
+ * Everything one MOC generation asks of the project, in the order
+ * {@link generateMOCFrom} asks it: one listing; then one page read per `.md`
+ * name, one after another in listing order; then one publication. A read or a
+ * publication that rejects rejects the generation with the same error, and
+ * nothing after it is asked.
+ */
+export interface MocGenerationSources {
+  /** Every name in the concept directory, in the backend's listing order. REJECTS when it cannot be listed, which the body treats as no pages. */
+  listConceptNames(): Promise<string[]>;
+  /**
+   * One concept page's whole text, or why it was dropped. Reports nothing
+   * itself. A dropped page is a VALUE: the body warns about it once, naming
+   * `<slug>.md`, and leaves it out. A read that REJECTS fails the generation.
+   */
+  readConceptPage(slug: string): Promise<ConfinedReadResult>;
+  /**
+   * LAST. Replace the project's Map of Content with `content`, the whole
+   * finished text. On local disk this is the incumbent confined atomic
+   * replacement of `wiki/MOC.md`. What a reader sees meanwhile, durability,
+   * locking and recovery are the implementation's and are NOT promised here.
+   */
+  publishMoc(content: string): Promise<void>;
+}
+
+/**
+ * LOCAL DISK. The MOC-generation sources for the project at `root`, built per
+ * call and private to this module. Building them joins the concept directory's
+ * path once, as the generator always did first, and does no I/O; each member
+ * calls its reader or the writer only when asked.
+ */
+function diskMocGenerationSources(root: string): MocGenerationSources {
   const conceptsPath = path.join(root, CONCEPTS_DIR);
-  const pages = await loadConceptPages(conceptsPath);
+  return {
+    listConceptNames: () => listDirectoryNames(conceptsPath),
+    readConceptPage: (slug) => readWikiPageInDir(conceptsPath, slug),
+    publishMoc: (content) => replaceLeafAtomicWithin(root, path.join(root, MOC_FILE), content),
+  };
+}
+
+/** {@link generateMOC} through `sources`: THE ONE BODY. Load the concept pages; group them by tag; render; publish. */
+export async function generateMOCFrom(sources: MocGenerationSources): Promise<void> {
+  const pages = await loadConceptPages(sources);
 
   const tagGroups = groupPagesByTag(pages);
   const content = buildMOCContent(tagGroups);
 
-  await atomicWrite(path.join(root, MOC_FILE), content, { confineRoot: root });
+  await sources.publishMoc(content);
 }
 
 /** Minimal page info needed for MOC generation. */
@@ -126,38 +185,46 @@ interface PageInfo {
 
 /**
  * Load all concept pages and extract their title and tags.
- * @param conceptsPath - Absolute path to the concepts directory.
+ * @param sources - The generation's sources: the listing, then each page read.
  * @returns Array of page info objects.
  */
-async function loadConceptPages(conceptsPath: string): Promise<PageInfo[]> {
+async function loadConceptPages(sources: MocGenerationSources): Promise<PageInfo[]> {
   let files: string[];
   try {
-    files = await readdir(conceptsPath);
+    files = await sources.listConceptNames();
   } catch {
     return [];
   }
 
   // The concepts directory is itself the confinement boundary: a symlinked
-  // entry whose target escapes it is dropped (warned, skipped) and never enters
-  // the MOC. An empty file is skipped, matching the prior behavior.
+  // entry whose target escapes it is dropped by the read, and is warned about
+  // and skipped HERE, so it never enters the MOC. An empty file is skipped,
+  // matching the prior behavior.
   const pages: PageInfo[] = [];
   for (const file of files) {
     if (!file.endsWith(".md")) continue;
 
     const slug = file.replace(/\.md$/, "");
-    const result = await readWikiPageInDirOrWarn(conceptsPath, slug);
-    const content = "content" in result ? result.content : "";
-    if (!content) continue;
-
-    const { meta } = parseFrontmatter(content);
-    if (meta.orphaned) continue;
-
-    const title = typeof meta.title === "string" ? meta.title : slug;
-    const tags = Array.isArray(meta.tags) ? (meta.tags as string[]) : [];
-    pages.push({ slug, title, tags });
+    const result = await sources.readConceptPage(slug);
+    if (!("content" in result)) {
+      warnDroppedWikiRead(`${slug}.md`, result.dropped);
+      continue;
+    }
+    const info = mocPageInfo(slug, result.content);
+    if (info !== null) pages.push(info);
   }
 
   return pages;
+}
+
+/** The MOC entry for one page, or `null` for an empty or orphaned page. */
+function mocPageInfo(slug: string, content: string): PageInfo | null {
+  if (!content) return null;
+  const { meta } = parseFrontmatter(content);
+  if (meta.orphaned) return null;
+  const title = typeof meta.title === "string" ? meta.title : slug;
+  const tags = Array.isArray(meta.tags) ? (meta.tags as string[]) : [];
+  return { slug, title, tags };
 }
 
 /**

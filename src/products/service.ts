@@ -44,6 +44,17 @@
  * re-driving that same run after an operator decision resumes it; this surface
  * stages a fresh run per call, so it declines the action on both verbs rather
  * than stranding one at a gate it has no route back from.
+ *
+ * ONE BODY. {@link createProductServiceWith} owns every verb's sequence (request
+ * capture, resolution, preview/stage, the resume's sealed-input recovery, the
+ * plan-digest guard, the parent admission under the lock, the drive and its
+ * outcome) over {@link ProductServiceSteps}, none of which takes a project root;
+ * the lock, the preparation service and the drive stay capabilities the host
+ * supplies. {@link createProductService} keeps its signature and its synchronous
+ * constructor captures, and passes the local steps, which call the incumbent
+ * root forms when asked with their old arguments; {@link productServiceStepsOver}
+ * composes the reads from each one's own body and keeps the host's capabilities
+ * as given.
  */
 
 import type { OperationAdapterMap } from "../operation-bundles/adapter-registry.js";
@@ -61,18 +72,28 @@ import type { AttemptClockV1 } from "../preparations/attempts/types.js";
 import type { PreparationSurface } from "../preparations/principals.js";
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { runPreparation, type RunPreparationResultV1 } from "../preparations/runner.js";
-import { readPreparationEvidenceBytes } from "../preparations/evidence-store.js";
-import { locatePreparationManifest } from "../preparations/service-run-lookup.js";
+import {
+  readPreparationEvidenceBytes, readPreparationEvidenceBytesFrom,
+  type PreparationEvidenceBytesRead, type PreparationEvidenceLeafReads, type PreparationEvidenceLocation,
+} from "../preparations/evidence-store.js";
+import {
+  locatePreparationManifest, locatePreparationManifestFrom, resolvePreparationRunFrom,
+  type PreparationManifestLookupV1, type PreparationRunLookupReads, type PreparationRunLookupV1,
+} from "../preparations/service-run-lookup.js";
 import {
   DEFAULT_CONTROL_TRANSITION_ALLOWANCE, createPreparationService,
 } from "../preparations/service.js";
-import type { PreparationPrincipalResolverV1 } from "../preparations/service.js";
+import type { PreparationPrincipalResolverV1, PreparationServiceV1 } from "../preparations/service.js";
 import type { StageRequestV1 } from "../preparations/service-stage.js";
 import { resolvePreparationRun } from "../preparations/service-run-lookup.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "../preparations/service-request-capture.js";
 import { capturedOr, deepCaptureData } from "../utils/runtime-capture.js";
-import { resolveProductAction, type ResolvedProductActionV1 } from "./action-resolve.js";
-import { verifyWorkflowParent } from "../preparations/workflow-parent.js";
+import {
+  resolveProductAction, resolveProductActionWith,
+  type ProductActionRequestV1, type ProductActionResolutionV1, type ProductActionSteps, type ResolvedProductActionV1,
+} from "./action-resolve.js";
+import { verifyWorkflowParent, verifyWorkflowParentFrom, type WorkflowParentVerification } from "../preparations/workflow-parent.js";
+import type { WorkflowRunReads } from "../workflow-history/store.js";
 import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
 import { releaseLock } from "../utils/lock.js";
 import type { PreparationManifestV1 } from "../preparations/manifest-parse.js";
@@ -276,7 +297,6 @@ function invokeOutcome(
 
 /** Everything driving one staged run needs, gathered so the verb stays readable. */
 interface StagedDriveV1 {
-  readonly root: string;
   /** The transport this invocation arrived on; provider authority binds it. */
   readonly surface: PreparationSurface;
   readonly adapters: OperationAdapterMap;
@@ -311,14 +331,14 @@ function captureProviderInvocation(
  * digest the plan pins, exactly where the run itself reads them. Returns the
  * manifest + parsed input, or the reason it cannot be read.
  */
-async function recoverSealedResume(root: string, runId: string): Promise<
+async function recoverSealedResume(steps: ProductServiceSteps, runId: string): Promise<
   | { ok: true; manifest: PreparationManifestV1; sealed: Readonly<Record<string, PackActionInputValueV2>> }
   | { ok: false; reason: string }
 > {
-  const located = await locatePreparationManifest(root, runId);
+  const located = await steps.locateManifest(runId);
   if (!located.ok) return { ok: false, reason: located.reason };
   const inputSet = located.manifest.plan.initialInputSet;
-  const read = await readPreparationEvidenceBytes(root,
+  const read = await steps.readSealedInput(
     { workspaceId: located.manifest.workspaceId, preparationId: located.manifest.preparationId },
     inputSet.digest.replace(/^sha256:/, ""), inputSet.byteCount);
   if (read.status !== "ok") return { ok: false, reason: `the run's sealed input is ${read.status}` };
@@ -350,31 +370,95 @@ function parentAdmissionRefusal(
  * drive, so the documented post-admission parent-change residual remains.
  */
 async function parentResumeRefusal(
-  root: string, parent: WorkflowParentRefV1,
+  steps: ProductServiceSteps, parent: WorkflowParentRefV1,
 ): Promise<{ status: "refused"; reason: string } | null> {
-  await acquireMutationLockBlocking(root, "ordinary");
+  await steps.acquireAdmissionLock();
   try {
-    return parentAdmissionRefusal(await verifyWorkflowParent(root, parent), parent);
+    return parentAdmissionRefusal(await steps.verifyParent(parent), parent);
   } finally {
-    await releaseLock(root);
+    await steps.releaseAdmissionLock();
   }
 }
 
-async function driveStagedRun(drive: StagedDriveV1): Promise<ProductInvokeResultV1> {
-  const located = await resolvePreparationRun(drive.root, drive.runId);
+async function driveStagedRun(steps: ProductServiceSteps, drive: StagedDriveV1): Promise<ProductInvokeResultV1> {
+  const located = await steps.locateRun(drive.runId);
   if (!located.ok) {
     return {
       status: "incomplete", action: drive.action, runId: drive.runId,
       runState: `run-${located.failure}`, reason: located.reason,
     };
   }
-  return invokeOutcome(drive.action, await runPreparation(assembleRunnerInput(drive.compiled, {
-    root: drive.root, binding: located.binding, adapters: drive.adapters, clock: drive.clock,
+  return invokeOutcome(drive.action, await steps.drive(drive.compiled, {
+    binding: located.binding, adapters: drive.adapters, clock: drive.clock,
     // The REAL surface, so a provider grant is resolved for the transport the
     // operator actually used rather than a default stamped somewhere below.
     surface: drive.surface,
     ...(drive.providerInvocation === undefined ? {} : { providerInvocation: drive.providerInvocation }),
-  })), drive.compiled);
+  }), drive.compiled);
+}
+
+/** The runner context one drive takes, without the project root the host binds. */
+type DriveContextV1 = Omit<Parameters<typeof assembleRunnerInput>[1], "root">;
+
+/** The project steps the service's verbs take, each asked when needed. No member takes a project root. */
+export interface ProductServiceSteps {
+  /** Resolve one product invocation to its compiled action (the authority half). */
+  resolveAction(request: ProductActionRequestV1): Promise<ProductActionResolutionV1>;
+  /** The host's preparation service, constructed with the host's principals. */
+  readonly preparations: Pick<PreparationServiceV1, "preview" | "stage">;
+  /** A run's durable manifest, located by run id. */
+  locateManifest(runId: string): Promise<PreparationManifestLookupV1>;
+  /** The run's sealed input bytes, verified against their digest, within `maxBytes`. */
+  readSealedInput(location: PreparationEvidenceLocation, digest: string, maxBytes: number): Promise<PreparationEvidenceBytesRead>;
+  /** The host's blocking project lock for the parent admission (throws on a gate refusal), and its release. */
+  acquireAdmissionLock(): Promise<void>;
+  releaseAdmissionLock(): Promise<void>;
+  /** The outer workflow parent's verdict. */
+  verifyParent(parent: WorkflowParentRefV1): Promise<WorkflowParentVerification>;
+  /** A staged run's binding, located by run id. */
+  locateRun(runId: string): Promise<PreparationRunLookupV1>;
+  /** Drive one staged run through the production runner: the host's writing capability. */
+  drive(compiled: CompiledPackActionV1, context: DriveContextV1): Promise<RunPreparationResultV1>;
+}
+
+/** LOCAL DISK AND HOST. The incumbent root forms for the constructor's root, each called when asked with its old arguments. */
+function diskProductServiceSteps(root: string, preparations: ProductServiceSteps["preparations"]): ProductServiceSteps {
+  return {
+    resolveAction: (request) => resolveProductAction(root, request),
+    preparations,
+    locateManifest: (runId) => locatePreparationManifest(root, runId),
+    readSealedInput: (location, digest, maxBytes) => readPreparationEvidenceBytes(root, location, digest, maxBytes),
+    acquireAdmissionLock: () => acquireMutationLockBlocking(root, "ordinary"),
+    releaseAdmissionLock: () => releaseLock(root),
+    verifyParent: (parent) => verifyWorkflowParent(root, parent),
+    locateRun: (runId) => resolvePreparationRun(root, runId),
+    drive: (compiled, context) => runPreparation(assembleRunnerInput(compiled, { root, ...context })),
+  };
+}
+
+/**
+ * The same steps over each read's own body (the action resolver's steps, the run
+ * lookup, the evidence leaves, the workflow run store) with the host's
+ * preparation service, admission lock and drive kept as given. Building it does no I/O.
+ */
+export function productServiceStepsOver(sources: {
+  action: ProductActionSteps;
+  lookup: PreparationRunLookupReads;
+  evidence: PreparationEvidenceLeafReads;
+  parents: WorkflowRunReads;
+  host: Pick<ProductServiceSteps, "preparations" | "acquireAdmissionLock" | "releaseAdmissionLock" | "drive">;
+}): ProductServiceSteps {
+  return {
+    resolveAction: (request) => resolveProductActionWith(sources.action, request),
+    preparations: sources.host.preparations,
+    locateManifest: (runId) => locatePreparationManifestFrom(sources.lookup, runId),
+    readSealedInput: (location, digest, maxBytes) => readPreparationEvidenceBytesFrom(sources.evidence, location, digest, maxBytes),
+    acquireAdmissionLock: () => sources.host.acquireAdmissionLock(),
+    releaseAdmissionLock: () => sources.host.releaseAdmissionLock(),
+    verifyParent: (parent) => verifyWorkflowParentFrom(sources.parents, parent),
+    locateRun: (runId) => resolvePreparationRunFrom(sources.lookup, runId),
+    drive: (compiled, context) => sources.host.drive(compiled, context),
+  };
 }
 
 /**
@@ -405,6 +489,25 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
   // `clock.now` and the adapter map above are captured.
   const providerInvocation = captureProviderInvocation(deps.providerInvocation);
   const preparations = createPreparationService({ root, surface, principals: deps.principals });
+  return createProductServiceWith(diskProductServiceSteps(root, preparations), { surface, adapters, clock, providerInvocation });
+}
+
+/** What the host pinned at construction: its transport, adapters, clock and provider invocation. */
+interface ProductServicePinsV1 {
+  readonly surface: PreparationSurface;
+  readonly adapters: OperationAdapterMap;
+  readonly clock: AttemptClockV1;
+  readonly providerInvocation?: PackProviderInvocationV1;
+}
+
+/**
+ * {@link createProductService} over {@link ProductServiceSteps}: THE ONE BODY.
+ * The pins are read into locals ONCE, here, synchronously, so a caller retaining
+ * the pins object cannot retarget a later request.
+ */
+export function createProductServiceWith(steps: ProductServiceSteps, pins: ProductServicePinsV1): ProductServiceV1 {
+  const { surface, adapters, clock, providerInvocation } = pins;
+  const preparations = steps.preparations;
 
   /**
    * Capture the caller's request by own DATA descriptors before resolving it —
@@ -437,7 +540,7 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
       ? undefined
       : capturedOr(() => deepCaptureData(parentRaw) as WorkflowParentRefV1, () => null);
     if (workflowParent === null) return { status: "refused" as const, reason: REQUEST_CAPTURE_REFUSAL };
-    return resolveProductAction(root, {
+    return steps.resolveAction({
       workspaceId: captured.workspaceId, token: captured.token, surface, input,
       ...(workflowParent === undefined ? {} : { workflowParent }),
     });
@@ -460,8 +563,8 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
       const action = summaryOf(resolved.action);
       const staged = await preparations.stage(stageRequestFor(resolved.action.compiled));
       if (staged.status !== "staged") return { status: "refused", reason: staged.reason };
-      return driveStagedRun({
-        root, adapters, clock, providerInvocation, surface,
+      return driveStagedRun(steps, {
+        adapters, clock, providerInvocation, surface,
         compiled: resolved.action.compiled, action, runId: staged.runId,
       });
     },
@@ -469,7 +572,7 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
     resume: async (request) => {
       const captured = capturedRequest<ProductResumeRequestV1>(request);
       if (captured === null) return { status: "refused" as const, reason: REQUEST_CAPTURE_REFUSAL };
-      const recovered = await recoverSealedResume(root, captured.runId);
+      const recovered = await recoverSealedResume(steps, captured.runId);
       if (!recovered.ok) return { status: "refused", reason: recovered.reason };
       // Recompile from the run's OWN sealed input, and graft the sealed plan's
       // workflowParent (if any) into the SAME compile request — the parent is
@@ -477,7 +580,7 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
       // reproduces its planDigest ONLY when resume reconstructs it. Without this
       // a parent-bound run is unresumable (P6.2 / plan finding 3).
       const sealedParent = recovered.manifest.plan.workflowParent;
-      const resolved = await resolveProductAction(root, {
+      const resolved = await steps.resolveAction({
         workspaceId: captured.workspaceId, token: captured.token, surface, input: recovered.sealed,
         ...(sealedParent === undefined ? {} : { workflowParent: sealedParent }),
       });
@@ -492,13 +595,13 @@ export function createProductService(deps: ProductServiceDependenciesV1): Produc
       // while its parent is still running AND this stage is current — the same
       // lifecycle gate staging applies on invoke, re-evaluated immediately before
       // the resume drives (plan v8 finding 1).
-      const resumeRefusal = sealedParent === undefined ? null : await parentResumeRefusal(root, sealedParent);
+      const resumeRefusal = sealedParent === undefined ? null : await parentResumeRefusal(steps, sealedParent);
       if (resumeRefusal !== null) return resumeRefusal;
       // RESUME DRIVES TOO, so it needs the same capability: a run suspended at a
       // gate and then resumed must be able to execute the provider phases the
       // original drive could, or resuming would silently degrade the run.
-      return driveStagedRun({
-        root, adapters, clock, providerInvocation, surface,
+      return driveStagedRun(steps, {
+        adapters, clock, providerInvocation, surface,
         compiled: resolved.action.compiled,
         action: summaryOf(resolved.action), runId: captured.runId,
       });

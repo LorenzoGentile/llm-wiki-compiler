@@ -24,12 +24,20 @@
  *   - `queries`  → `QUERIES_DIR`  (`wiki/queries`)
  *   - a typed entity namespace → `profile.entities[namespace].directory`
  *   - unknown namespace → dropped (never falls back to `wiki/<namespace>`)
+ *
+ * Read bindings: the loaders read through a `LegacyLocalReads` binding and the
+ * listings scan through a `LegacyLocalEntityScans` binding. Each `…From` function
+ * takes its binding; the root form of the same name builds the local-disk one
+ * and passes its other arguments straight through, which is what every
+ * production caller uses. `buildLiveRegistryEntry` is the exception: it returns
+ * two absolute resolved paths, so it stays a local-disk function.
  */
 
 import path from "path";
 import { safeRealpath, isInsideDir } from "./path-confine.js";
-import { readConfinedPage } from "./confined-read.js";
-import { scanEntityDir, type RawEntityScan } from "../wiki/collect.js";
+import { diskLocalEntityScans, diskLocalReads, readConfinedPageText } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans, LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import { scanEntityDirFrom, type RawEntityScan } from "../wiki/collect.js";
 import { parseFrontmatter } from "./markdown.js";
 import { qualifiedPageId, parseQualifiedPageId, type PageId } from "./page-id.js";
 import { hashChunkText, splitIntoChunks } from "./retrieval.js";
@@ -40,6 +48,28 @@ import { validateEntityFields } from "../profile/field-contract.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "./constants.js";
 import type { PageRecord } from "../pages/read.js";
 import type { ProfilePack, LoadedProfile, EntityTypeDef } from "../profile/types.js";
+
+/**
+ * The live-page reads retrieval makes, held together: confined page text
+ * (`reads`) and entity-directory scans (`scans`). It is the two existing legacy
+ * bindings and nothing more: physical, lenient and internal. It is NOT a strict
+ * or streaming read, NOT a capped-byte read, NOT `ProjectStore`, and not a
+ * hosted or access-control contract.
+ */
+export interface LivePageReads {
+  reads: LegacyLocalReads;
+  scans: LegacyLocalEntityScans;
+}
+
+/**
+ * The live-page reads of an ordinary local project rooted at `root`. Building
+ * it does no I/O and no path work.
+ *
+ * @param root - Project root directory, as the caller holds it.
+ */
+export function diskLivePageReads(root: string): LivePageReads {
+  return { reads: diskLocalReads(root), scans: diskLocalEntityScans(root) };
+}
 
 /** Immutable realpath + confinement anchor for one live page. */
 export interface LiveRegistryEntry {
@@ -150,8 +180,18 @@ function isTypedScanEligible(scan: RawEntityScan, def: EntityTypeDef): boolean {
  * @param profile - Active loaded profile; required for typed-namespace eligibility.
  * @returns Qualified page ids for all embed-eligible pages across the namespaces.
  */
-export async function buildLiveIdSet(
+export function buildLiveIdSet(
   root: string,
+  namespaces: string[],
+  namespaceDirs?: Map<string, string>,
+  profile?: LoadedProfile,
+): Promise<Set<PageId>> {
+  return buildLiveIdSetFrom(diskLocalEntityScans(root), namespaces, namespaceDirs, profile);
+}
+
+/** {@link buildLiveIdSet}, with each namespace directory scanned through `scans`. */
+export async function buildLiveIdSetFrom(
+  scans: LegacyLocalEntityScans,
   namespaces: string[],
   namespaceDirs?: Map<string, string>,
   profile?: LoadedProfile,
@@ -162,8 +202,8 @@ export async function buildLiveIdSet(
     namespaces.map(async (ns) => {
       const relDir = dirs.get(ns);
       if (!relDir) return;
-      const { scans } = await scanEntityDir(root, relDir, { includeBody: false });
-      for (const scan of scans) {
+      const { scans: found } = await scanEntityDirFrom(scans, relDir, { includeBody: false });
+      for (const scan of found) {
         if (!isScanEligible(scan, ns, profile)) continue;
         ids.add(qualifiedPageId(ns, scan.stem));
       }
@@ -217,9 +257,33 @@ export async function buildLiveRegistryEntry(
   const filePath = path.join(expectedCanonicalDir, `${pagePart}.md`);
   const capturedRealpath = await safeRealpath(filePath);
   if (!capturedRealpath || !isInsideDir(capturedRealpath, expectedCanonicalDir)) return null;
-  const content = await readConfinedPage(capturedRealpath, expectedCanonicalDir);
+  const content = await readConfinedPageText(capturedRealpath, expectedCanonicalDir);
   if (content === null) return null;
   return buildEntryFromContent(capturedRealpath, expectedCanonicalDir, content);
+}
+
+/** The two live hashes of one page: what a stored embedding is compared with. */
+export interface LiveContentHashes {
+  /** SHA-256 prefix of `buildEmbeddingText({title, summary})`. */
+  embeddingTextHash: string;
+  /** Ordered hashes of `splitIntoChunks(body)`, one per chunk. */
+  chunkHashes: string[];
+}
+
+/**
+ * Hash a page's RAW confined content. A title or summary that is not a string
+ * is the empty string here, and the body is hashed as parsed, NOT trimmed.
+ * That is deliberately not a `PageRecord`, whose title falls back to the page
+ * part and whose body is trimmed: hashing a record would make an untitled page
+ * look stale against its own stored embedding.
+ */
+function hashLiveContent(content: string): LiveContentHashes {
+  const { meta, body } = parseFrontmatter(content);
+  const title = typeof meta.title === "string" ? meta.title : "";
+  const summary = typeof meta.summary === "string" ? meta.summary : "";
+  const embeddingTextHash = hashChunkText(buildEmbeddingText({ title, summary }));
+  const chunkHashes = splitIntoChunks(body).map(hashChunkText);
+  return { embeddingTextHash, chunkHashes };
 }
 
 /** Build a `LiveRegistryEntry` from already-read confined content. */
@@ -228,12 +292,45 @@ function buildEntryFromContent(
   expectedCanonicalDir: string,
   content: string,
 ): LiveRegistryEntry {
-  const { meta, body } = parseFrontmatter(content);
-  const title = typeof meta.title === "string" ? meta.title : "";
-  const summary = typeof meta.summary === "string" ? meta.summary : "";
-  const embeddingTextHash = hashChunkText(buildEmbeddingText({ title, summary }));
-  const chunkHashes = splitIntoChunks(body).map(hashChunkText);
+  const { embeddingTextHash, chunkHashes } = hashLiveContent(content);
   return { capturedRealpath, expectedCanonicalDir, embeddingTextHash, chunkHashes };
+}
+
+/**
+ * The live hashes of one page, or `null` when the page cannot be read: the same
+ * hashes and the same refusals as {@link buildLiveRegistryEntry}, without its two
+ * paths. For a caller that only compares hashes.
+ *
+ * @param root - Project root path.
+ * @param pageId - Qualified page id (`<namespace>/<pagePart>`).
+ * @param namespaceDirs - Namespace→dir map; defaults to reserved concepts/queries.
+ */
+export function readLiveContentHashes(
+  root: string,
+  pageId: PageId,
+  namespaceDirs?: Map<string, string>,
+): Promise<LiveContentHashes | null> {
+  return readLiveContentHashesFrom(diskLocalReads(root), pageId, namespaceDirs);
+}
+
+/**
+ * {@link readLiveContentHashes}, with the page read through `reads`. The id is
+ * parsed and its namespace looked up BEFORE any read; then exactly one confined
+ * page read is made. A malformed id, an unknown namespace and every refusal of
+ * that read are all `null`.
+ */
+export async function readLiveContentHashesFrom(
+  reads: LegacyLocalReads,
+  pageId: PageId,
+  namespaceDirs?: Map<string, string>,
+): Promise<LiveContentHashes | null> {
+  const parsed = parseQualifiedPageId(pageId);
+  if (!parsed) return null;
+  const relDir = (namespaceDirs ?? buildNamespaceDirs()).get(parsed.namespace);
+  if (!relDir) return null;
+  const read = await reads.readConfinedPage(relDir, parsed.pagePart);
+  if (!("content" in read)) return null;
+  return hashLiveContent(read.content);
 }
 
 /**
@@ -246,15 +343,24 @@ function buildEntryFromContent(
  * @param namespaceDirs - Namespace→dir map; defaults to reserved concepts/queries.
  * @returns `PageRecord` objects for all found, readable pages.
  */
-export async function loadPageRecordsByPageId(
+export function loadPageRecordsByPageId(
   root: string,
+  pageIds: PageId[],
+  namespaceDirs?: Map<string, string>,
+): Promise<PageRecord[]> {
+  return loadPageRecordsByPageIdFrom(diskLocalReads(root), pageIds, namespaceDirs);
+}
+
+/** {@link loadPageRecordsByPageId}, with each page read through `reads`. */
+export async function loadPageRecordsByPageIdFrom(
+  reads: LegacyLocalReads,
   pageIds: PageId[],
   namespaceDirs?: Map<string, string>,
 ): Promise<PageRecord[]> {
   const dirs = namespaceDirs ?? buildNamespaceDirs();
   const records: PageRecord[] = [];
   for (const pageId of pageIds) {
-    const record = await resolvePageRecord(root, pageId, dirs);
+    const record = await resolvePageRecord(reads, pageId, dirs);
     if (record) records.push(record);
   }
   return records;
@@ -296,15 +402,24 @@ export interface PageRecordWithId {
  * @param namespaceDirs - Namespace→dir map; defaults to reserved concepts/queries.
  * @returns `{pageId, record}` pairs for all found, readable pages.
  */
-export async function loadPageRecordPairsByPageId(
+export function loadPageRecordPairsByPageId(
   root: string,
+  pageIds: PageId[],
+  namespaceDirs?: Map<string, string>,
+): Promise<PageRecordWithId[]> {
+  return loadPageRecordPairsByPageIdFrom(diskLocalReads(root), pageIds, namespaceDirs);
+}
+
+/** {@link loadPageRecordPairsByPageId}, with each page read through `reads`. */
+export async function loadPageRecordPairsByPageIdFrom(
+  reads: LegacyLocalReads,
   pageIds: PageId[],
   namespaceDirs?: Map<string, string>,
 ): Promise<PageRecordWithId[]> {
   const dirs = namespaceDirs ?? buildNamespaceDirs();
   const pairs: PageRecordWithId[] = [];
   for (const pageId of pageIds) {
-    const record = await resolvePageRecord(root, pageId, dirs);
+    const record = await resolvePageRecord(reads, pageId, dirs);
     if (record) pairs.push({ pageId, record });
   }
   return pairs;
@@ -316,7 +431,7 @@ export async function loadPageRecordPairsByPageId(
  * an unknown namespace.
  */
 async function resolvePageRecord(
-  root: string,
+  reads: LegacyLocalReads,
   pageId: PageId,
   dirs: Map<string, string>,
 ): Promise<PageRecord | null> {
@@ -325,15 +440,13 @@ async function resolvePageRecord(
   const { namespace, pagePart } = parsed;
   const relDir = dirs.get(namespace);
   if (!relDir) return null;
-  const canonicalRoot = await safeRealpath(root);
-  if (!canonicalRoot) return null;
-  const expectedDir = path.join(canonicalRoot, relDir);
-  const filePath = path.join(expectedDir, `${pagePart}.md`);
-  const capturedRealpath = await safeRealpath(filePath);
-  if (!capturedRealpath || !isInsideDir(capturedRealpath, expectedDir)) return null;
-  const content = await readConfinedPage(capturedRealpath, expectedDir);
-  if (content === null) return null;
-  return parsePageRecord(content, pagePart);
+  // The binding's confined page read. On local disk: resolve the root, resolve
+  // `<relDir>/<pagePart>.md` and require it inside `<canonical root>/<relDir>`,
+  // then the handle-bound read. Every refusal (no root, an escape, an unreadable
+  // page) is `null`, as it was.
+  const read = await reads.readConfinedPage(relDir, pagePart);
+  if (!("content" in read)) return null;
+  return parsePageRecord(read.content, pagePart);
 }
 
 /** Parse raw confined content into a `PageRecord`. */
@@ -378,15 +491,15 @@ function scanToCandidate(scan: RawEntityScan, namespace: string): SurfaceCandida
  * An unknown namespace, or a typed namespace with no profile/def, yields none.
  */
 async function collectNamespaceCandidates(
-  root: string,
+  scans: LegacyLocalEntityScans,
   surface: SurfaceName,
   namespace: string,
   relDir: string,
   profile?: LoadedProfile,
 ): Promise<SurfaceCandidate[]> {
-  const { scans } = await scanEntityDir(root, relDir, { includeBody: false });
+  const { scans: found } = await scanEntityDirFrom(scans, relDir, { includeBody: false });
   const def = profile?.profile.entities[namespace];
-  return scans
+  return found
     .filter((scan) =>
       RESERVED_NAMESPACES.has(namespace)
         ? isLegacyScanEligible(scan)
@@ -413,8 +526,19 @@ async function collectNamespaceCandidates(
  * @param profile - Active loaded profile; required for typed-namespace eligibility.
  * @returns Surface-eligible candidates across the namespaces (metadata only).
  */
-export async function buildSurfaceEligibleCandidates(
+export function buildSurfaceEligibleCandidates(
   root: string,
+  surface: SurfaceName,
+  namespaces: string[],
+  namespaceDirs?: Map<string, string>,
+  profile?: LoadedProfile,
+): Promise<SurfaceCandidate[]> {
+  return buildSurfaceEligibleCandidatesFrom(diskLocalEntityScans(root), surface, namespaces, namespaceDirs, profile);
+}
+
+/** {@link buildSurfaceEligibleCandidates}, with each namespace directory scanned through `scans`. */
+export async function buildSurfaceEligibleCandidatesFrom(
+  scans: LegacyLocalEntityScans,
   surface: SurfaceName,
   namespaces: string[],
   namespaceDirs?: Map<string, string>,
@@ -425,7 +549,7 @@ export async function buildSurfaceEligibleCandidates(
     namespaces.map((ns) => {
       const relDir = dirs.get(ns);
       if (!relDir) return Promise.resolve<SurfaceCandidate[]>([]);
-      return collectNamespaceCandidates(root, surface, ns, relDir, profile);
+      return collectNamespaceCandidates(scans, surface, ns, relDir, profile);
     }),
   );
   return perNamespace.flat();

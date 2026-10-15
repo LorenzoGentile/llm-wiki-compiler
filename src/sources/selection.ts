@@ -3,7 +3,9 @@
  * source-relative prefixes, not a second glob language or a temporary pause.
  */
 import path from "node:path";
-import { loadProjectConfig, normalizeProjectConfig, ProjectConfigError, requireConfigRecord } from "../project/config.js";
+import { loadProjectConfigFrom, normalizeProjectConfig, ProjectConfigError, requireConfigRecord } from "../project/config.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 
 /** Normalized project source discovery settings. */
 export interface SourceSelection {
@@ -23,8 +25,13 @@ function normalizeExclusion(value: unknown): string {
 }
 
 /** Load source settings without interfering with sibling review configuration. */
-export async function loadSourceSelection(root: string): Promise<SourceSelection> {
-  const config = await loadProjectConfig(root);
+export function loadSourceSelection(root: string): Promise<SourceSelection> {
+  return loadSourceSelectionFrom(diskLocalReads(root));
+}
+
+/** The same settings, read through `reads`. */
+export async function loadSourceSelectionFrom(reads: LegacyLocalReads): Promise<SourceSelection> {
+  const config = await loadProjectConfigFrom(reads);
   if (config?.sources === undefined) return { recursive: false, exclude: [] };
   normalizeProjectConfig(config);
   const sources = requireConfigRecord(config.sources, "sources");

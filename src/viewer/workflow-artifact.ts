@@ -12,12 +12,20 @@
  * declared content kind — no product vocabulary. The member/PDF variant is deferred;
  * embedding also needs a reviewed CSP because this response inherits the server's
  * `frame-ancestors 'none'`, which forbids even a same-origin viewer ancestor.
+ *
+ * ONE BODY. {@link gatherServableOutputWith} decides over {@link StageOutputReads}
+ * (the run, the profile, the re-verified body). {@link handleApiStageOutput} keeps
+ * its signature and passes the incumbent root readers, called when asked;
+ * {@link stageOutputReadsOver} composes the same reads from each one's root-free
+ * body. Response writing is unchanged. In no package index.
  */
 
 import type { ServerResponse } from "http";
-import { readRun } from "../workflow-history/store.js";
-import { loadProfile } from "../profile/load.js";
-import { readVerifiedArtifactBody } from "../artifacts/read-verified.js";
+import { readRun, readRunFrom, type WorkflowRunReads } from "../workflow-history/store.js";
+import { loadProfile, loadProfileFrom, type EffectiveProfileSources } from "../profile/load.js";
+import type { ProfilePack } from "../profile/types.js";
+import { readVerifiedArtifactBody, verifiedBodyOf } from "../artifacts/read-verified.js";
+import { readVerifiedArtifactFrom, type ArtifactStoreReads } from "../artifacts/resolve.js";
 import { parseArtifactRef, formatArtifactRef, type ArtifactRef } from "../artifacts/ref.js";
 
 /** Fixed, safe content-type + download filename per the artifact type's declared content kind. */
@@ -66,14 +74,42 @@ function validateOutputRef(recorded: unknown): ArtifactRef | null {
   return parseArtifactRef(formatArtifactRef({ artifactType: ref.artifactType, slug: ref.slug, sha256: ref.sha256 }));
 }
 
+/** The three reads one stage-output serve makes, in order. No member takes a project root. */
+export interface StageOutputReads {
+  /** One run, authenticated. */
+  readRun(runId: string): ReturnType<typeof readRun>;
+  /** The effective profile. */
+  loadProfile(): ReturnType<typeof loadProfile>;
+  /** The artifact body re-verified against `ref` under `profile`. */
+  verifiedBody(profile: ProfilePack, ref: ArtifactRef): ReturnType<typeof readVerifiedArtifactBody>;
+}
+
+/** LOCAL DISK. The incumbent root readers for `root`, each called when asked. */
+function diskStageOutputReads(root: string): StageOutputReads {
+  return {
+    readRun: (runId) => readRun(root, runId),
+    loadProfile: () => loadProfile(root),
+    verifiedBody: (profile, ref) => readVerifiedArtifactBody(root, profile, ref),
+  };
+}
+
+/** The same reads over the run store's, the profile loader's and the artifact store's own seams. */
+export function stageOutputReadsOver(sources: { runs: WorkflowRunReads; profile: EffectiveProfileSources; store: ArtifactStoreReads }): StageOutputReads {
+  return {
+    readRun: (runId) => readRunFrom(sources.runs, runId),
+    loadProfile: () => loadProfileFrom(sources.profile),
+    verifiedBody: async (profile, ref) => verifiedBodyOf(await readVerifiedArtifactFrom(sources.store, profile, ref)),
+  };
+}
+
 /** The verified bytes + their fixed content mapping, or a fail-visible problem message. */
 type ServableOutput = { readonly bytes: Buffer; readonly mapping: { contentType: string; filename: string } } | { readonly problem: string };
 
 /** Resolve the run and derive its stage-output {@link ArtifactRef} server-side, or a problem. */
 async function resolveStageOutputRef(
-  root: string, ids: { workflowId: string; runId: string; stageId: string },
+  reads: StageOutputReads, ids: { workflowId: string; runId: string; stageId: string },
 ): Promise<{ readonly ref: ArtifactRef } | { readonly problem: string }> {
-  const read = await readRun(root, ids.runId);
+  const read = await reads.readRun(ids.runId);
   if (read.status !== "ok") return { problem: `run "${ids.runId}" is not readable` };
   if (read.run.workflowId !== ids.workflowId) {
     return { problem: `run belongs to workflow "${read.run.workflowId}", not "${ids.workflowId}"` };
@@ -87,16 +123,16 @@ async function resolveStageOutputRef(
  * (loadProfile on a profile gone unavailable after startup, the verified-artifact reader)
  * are caught here, so EVERY failure becomes the route's typed problem — never a 500.
  */
-async function gatherServableOutput(
-  root: string, ids: { workflowId: string; runId: string; stageId: string },
+export async function gatherServableOutputWith(
+  reads: StageOutputReads, ids: { workflowId: string; runId: string; stageId: string },
 ): Promise<ServableOutput> {
   try {
-    const resolved = await resolveStageOutputRef(root, ids);
+    const resolved = await resolveStageOutputRef(reads, ids);
     if ("problem" in resolved) return resolved;
-    const { profile } = await loadProfile(root);
+    const { profile } = await reads.loadProfile();
     const mapping = SERVABLE_KINDS[profile.artifacts?.[resolved.ref.artifactType]?.contentKind ?? ""];
     if (mapping === undefined) return { problem: `artifact type "${resolved.ref.artifactType}" is not a servable content kind` };
-    const body = await readVerifiedArtifactBody(root, profile, resolved.ref);
+    const body = await reads.verifiedBody(profile, resolved.ref);
     if (body.health !== "ok" || body.bytes === undefined) return { problem: `artifact did not verify (${body.health})` };
     return { bytes: body.bytes, mapping };
   } catch {
@@ -113,7 +149,7 @@ async function gatherServableOutput(
 export async function handleApiStageOutput(res: ServerResponse, pathname: string, root: string): Promise<void> {
   const ids = parseStageOutputPath(pathname);
   if (ids === null) return writeArtifactProblem(res, `bad stage-output path: ${pathname}`);
-  const served = await gatherServableOutput(root, ids);
+  const served = await gatherServableOutputWith(diskStageOutputReads(root), ids);
   if ("problem" in served) return writeArtifactProblem(res, served.problem);
   res.statusCode = 200;
   res.setHeader("Content-Type", served.mapping.contentType);

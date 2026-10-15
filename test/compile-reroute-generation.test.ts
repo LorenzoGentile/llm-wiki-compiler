@@ -5,15 +5,20 @@
  *
  * Pins three contracts of the live-write branch reroute:
  *  - a DEFAULT compile produces the same page bytes AND routes the generation
- *    write through the executor (a single journal batch is opened);
+ *    write through the executor (a single journal batch is opened), and reaches
+ *    interlink resolution once, through the `resolveAndApplyLinks` wrapper;
  *  - the two CANDIDATE branches (`--review` and a policy hold) are untouched:
  *    they write ONLY a candidate JSON, open NO executor batch / journal, and
  *    write NO live page;
  *  - (HIGH-A) a floor-SKIPPED page (oversized body > GENERATED_PAGE_MAX_CHARS,
  *    the compile guardrail) is
  *    ABSENT from the committed set: it is NOT in `result.pages`, IS surfaced in
- *    errors, and is NEITHER resolved (resolveLinks slug set) NOR embedded
- *    (updateEmbeddingsLockedCore page-id set).
+ *    errors, and is NEITHER resolved NOR embedded
+ *    (updateEmbeddingsLockedCoreFrom page-id set). Resolution is observed at the
+ *    wrapper compile calls across modules, `resolveAndApplyLinks`: the root
+ *    `resolveLinks` is only ever called module-locally by that wrapper, so a
+ *    spy on it would see nothing. With every page skipped, finalize never
+ *    reaches the wrapper at all.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -59,7 +64,9 @@ async function holdEveryPage(): Promise<void> {
 describe("compile generation routed through planner/executor", () => {
   it("default compile writes the pages via a single journal batch", async () => {
     stubConcepts();
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
+    // Call-through: the real resolution still runs; this only observes that compile reaches it.
+    const resolveSpy = vi.spyOn(resolver, "resolveAndApplyLinks");
 
     const result = await compileAndReport(ctx.dir);
     const onDisk = (slug: string) => existsSync(path.join(ctx.dir, CONCEPTS_DIR, `${slug}.md`));
@@ -68,13 +75,17 @@ describe("compile generation routed through planner/executor", () => {
     expect(onDisk("alpha") && onDisk("beta")).toBe(true);
     // Generation writes now flow through the executor: exactly one batch opened.
     expect(openSpy).toHaveBeenCalledTimes(1);
+    // Both generated pages are new, so both are the changed AND the new slugs.
+    expect(resolveSpy).toHaveBeenCalledTimes(1);
+    const [, changed, created] = resolveSpy.mock.calls[0]!;
+    expect([[...changed].sort(), [...created].sort()]).toEqual([["alpha", "beta"], ["alpha", "beta"]]);
   });
 });
 
 describe("candidate branches stay off the executor", () => {
   it("--review writes only a candidate JSON, opens no journal batch, no live page", async () => {
     stubConcepts();
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
 
     const result = await compileAndReport(ctx.dir, { review: true });
 
@@ -89,7 +100,7 @@ describe("candidate branches stay off the executor", () => {
   it("a policy-held page writes only a candidate JSON, opens no journal batch", async () => {
     await holdEveryPage();
     stubConcepts();
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
 
     const result = await compileAndReport(ctx.dir);
 
@@ -107,11 +118,10 @@ describe("HIGH-A: floor-skipped page absent from committed set", () => {
     // generated cap, not the single-source MAX_SOURCE_CHARS, so the skip threshold
     // is the larger guardrail.
     stubConcepts("z".repeat(GENERATED_PAGE_MAX_CHARS + 1));
-    // resolveLinks now COMPUTES rewrites (returns CompilePageWrite[]); the stub
-    // returns an empty plan so finalizeWiki's resolution batch is a no-op.
-    const resolveSpy = vi.spyOn(resolver, "resolveLinks").mockResolvedValue([]);
+    // Observe resolution at the wrapper compile actually calls (call-through).
+    const resolveSpy = vi.spyOn(resolver, "resolveAndApplyLinks");
     const embedSpy = vi
-      .spyOn(embeddings, "updateEmbeddingsLockedCore")
+      .spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
       .mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
 
     const result = await compileAndReport(ctx.dir);
@@ -121,6 +131,8 @@ describe("HIGH-A: floor-skipped page absent from committed set", () => {
     expect(result.errors.some((e) => /floor:/.test(e))).toBe(true);
     expect(existsSync(path.join(ctx.dir, CONCEPTS_DIR, "alpha.md"))).toBe(false);
 
+    // No page committed, so finalize skips resolution entirely: zero wrapper calls.
+    expect(resolveSpy).not.toHaveBeenCalled();
     const resolvedSlugs = resolveSpy.mock.calls.flatMap((c) => c[1] as string[]);
     expect(resolvedSlugs).not.toContain("alpha");
     expect(resolvedSlugs).not.toContain("beta");

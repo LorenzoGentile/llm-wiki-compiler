@@ -8,9 +8,13 @@
  * drifted parent parks the preparation; it is never silently recreated. The
  * workflow store records `workflowDigest` as bare lowercase hex, so the plan's
  * `sha256:`-prefixed reference digest is stripped before comparison.
+ *
+ * ONE VERDICT over the one run read. {@link verifyWorkflowParent} keeps its
+ * signature and asks the incumbent root reader; {@link verifyWorkflowParentFrom}
+ * asks the run store's own body over {@link WorkflowRunReads}. In no package index.
  */
 
-import { readRun } from "../workflow-history/store.js";
+import { readRun, readRunFrom, type WorkflowRunRead, type WorkflowRunReads } from "../workflow-history/store.js";
 import type { WorkflowRunStatus } from "../workflow-history/types.js";
 import type { WorkflowParentRefV1 } from "./types.js";
 
@@ -46,7 +50,19 @@ export async function verifyWorkflowParent(
   root: string,
   ref: WorkflowParentRefV1,
 ): Promise<WorkflowParentVerification> {
-  const read = await readRun(root, ref.workflowRunId);
+  return parentVerificationOf(await readRun(root, ref.workflowRunId), ref);
+}
+
+/** {@link verifyWorkflowParent} over the run store's reads: the same verdict over the store's one body. */
+export async function verifyWorkflowParentFrom(
+  runs: WorkflowRunReads,
+  ref: WorkflowParentRefV1,
+): Promise<WorkflowParentVerification> {
+  return parentVerificationOf(await readRunFrom(runs, ref.workflowRunId), ref);
+}
+
+/** The verdict over one run read: absent, unreadable, a drift, or verified with the parent's live state. Pure. */
+function parentVerificationOf(read: WorkflowRunRead, ref: WorkflowParentRefV1): WorkflowParentVerification {
   if (read.status === "absent") return { status: "absent" };
   if (read.status !== "ok") return { status: "unreadable", detail: read.detail };
   const run = read.run;

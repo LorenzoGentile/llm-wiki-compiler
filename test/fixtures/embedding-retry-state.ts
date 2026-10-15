@@ -1,8 +1,8 @@
 /**
  * Shared helpers for embedding retry-state tests: run refreshes under the project
  * lock their production callers hold, capture both retry files byte-for-byte, and
- * simulate a marker writer that reports success without persisting (the real
- * writer swallows write and unlink failures, so callers must verify).
+ * refuse one marker's physical writes so the real writer reports success without
+ * persisting (it swallows write and unlink failures, so callers must verify).
  */
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -29,9 +29,36 @@ export function retryFileBytes(root: string): Promise<(string | null)[]> {
     readFile(path.join(root, file), "utf8").catch(() => null)));
 }
 
-/** Make writes to one retry file report success without persisting anything. */
-export function swallowMarkerWrites(file: string): void {
-  const write = markers.writePendingEmbeddings;
-  vi.spyOn(markers, "writePendingEmbeddings").mockImplementation(async (root, entries, target = PENDING_EMBEDDINGS_FILE) =>
-    target === file ? undefined : write(root, entries, target));
+/** A physical marker write a test can refuse: the atomic replacement, or the unlink. */
+export type MarkerOperation = "replace" | "remove";
+
+/**
+ * Make writes to one retry file report success without persisting anything, at
+ * the PHYSICAL layer: the disk marker writes are wrapped so that a replacement
+ * and/or an unlink of exactly `file` is refused with a plain error, which the
+ * real writer swallows (no errno code, so no warning). Every other call, and
+ * every other marker, is delegated to the real mechanism, so normalization, the
+ * verifying re-read and settlement stay real.
+ *
+ * Scope: only storage built through the exported `diskEmbeddingMarkerWrites`
+ * after this call, which is the retry lifecycle's root forms. The root writers
+ * inside `pending-embeddings.ts` keep their module-local reference and stay real.
+ * Install it before the refresh loads its retry. Returns the restore.
+ */
+export function swallowMarkerWrites(file: string, operations: readonly MarkerOperation[] = ["replace", "remove"]): () => void {
+  const real = markers.diskEmbeddingMarkerWrites;
+  // The marker constants are POSIX-relative; the real leaf is a native path, so compare native separators.
+  const suffix = `${path.sep}${path.normalize(file)}`;
+  const refuse = (operation: MarkerOperation, leaf: string): void => {
+    if (operations.includes(operation) && leaf.endsWith(suffix)) throw new Error(`test refused ${operation} of ${file}`);
+  };
+  const spy = vi.spyOn(markers, "diskEmbeddingMarkerWrites").mockImplementation((root) => {
+    const writes = real(root);
+    return {
+      ...writes,
+      replaceLeaf: async (confineRoot, leaf, body) => { refuse("replace", leaf); await writes.replaceLeaf(confineRoot, leaf, body); },
+      removeLeaf: async (leaf) => { refuse("remove", leaf); await writes.removeLeaf(leaf); },
+    };
+  });
+  return () => spy.mockRestore();
 }

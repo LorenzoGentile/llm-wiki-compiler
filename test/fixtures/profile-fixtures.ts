@@ -119,6 +119,36 @@ export function gatedResearchProfile(minCount = 1): ProfilePack {
   } as ProfilePack;
 }
 
+/**
+ * A GENERIC gated profile with NO research vocabulary: an `alpha.mode` lifecycle
+ * whose `sealed` state requires 1 `bonds` relation to a `beta`, over a
+ * union-endpoint relation (from/to both accept alpha|beta). Shared by the
+ * standing-invariant suite on disk and the profile-summary suite over in-memory
+ * sources, so the one generic gated shape is spelled once.
+ */
+export function genericGatedProfile(): ProfilePack {
+  return {
+    schemaVersion: 1,
+    profileId: "generic-gated",
+    entities: {
+      beta: { directory: "wiki/beta", fields: {} },
+      alpha: {
+        directory: "wiki/alpha",
+        requiredFields: ["mode"],
+        fields: { title: { type: "string" }, mode: { type: "enum", enum: ["open", "sealed"] } },
+        lifecycle: {
+          field: "mode",
+          initial: "open",
+          terminal: ["sealed"],
+          transitions: { open: ["sealed"] },
+          transitionRelationRequirements: { sealed: [{ relationType: "bonds", role: "from", otherTypes: ["beta"], minCount: 1 }] },
+        },
+      },
+    },
+    relations: { bonds: { from: ["alpha", "beta"], to: ["alpha", "beta"], direction: "directed", attributes: {} } },
+  } as ProfilePack;
+}
+
 /** Write a profile.json into the project's `.llmwiki/` dir. */
 export async function writeProfileFile(root: string, pack: ProfilePack): Promise<void> {
   await mkdir(path.join(root, path.dirname(PROFILE_FILE)), { recursive: true });

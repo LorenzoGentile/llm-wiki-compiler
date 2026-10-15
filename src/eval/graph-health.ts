@@ -13,9 +13,15 @@
  *  - hubPages: top 5 real pages by total degree (in + out), tie-broken by slug.
  *  - danglingCount: total number of ghost (unresolved) wikilink targets.
  *  - topDangling: up to 5 most-referenced dangling targets.
+ *
+ * The measure has ONE body, {@link evaluateGraphHealthFrom}, over the viewer
+ * page collector's own scans. It names no project root. `evaluateGraphHealth`
+ * builds the local-disk scans from its root and delegates.
  */
 
-import { collectViewerPages } from "../viewer/collect.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { collectViewerPagesFrom } from "../viewer/collect.js";
 import { buildGraphData } from "../viewer/graph.js";
 import type { ViewerPage, GraphData, GraphNode, GraphNodeId } from "../viewer/types.js";
 import type { GraphHealthResult, HubPage } from "./types.js";
@@ -86,6 +92,31 @@ function topDanglingTargets(graph: GraphData): GraphHealthResult["topDangling"] 
 }
 
 /**
+ * The hub pages: real pages by total degree over real→real edges, highest
+ * first and tie-broken by id, at most {@link MAX_HUB_PAGES}, and of those only
+ * the ones with any such edge.
+ */
+function hubPagesOf(
+  realNodes: GraphNode[], realIds: Set<GraphNodeId>, realIndegrees: Map<GraphNodeId, number>, edges: GraphData["edges"],
+): HubPage[] {
+  const realOutdegrees = new Map<GraphNodeId, number>();
+  for (const e of edges) {
+    if (realIds.has(e.source) && realIds.has(e.target)) {
+      realOutdegrees.set(e.source, (realOutdegrees.get(e.source) ?? 0) + 1);
+    }
+  }
+  return realNodes
+    .map((n) => {
+      const indegree = realIndegrees.get(n.id) ?? 0;
+      const outdegree = realOutdegrees.get(n.id) ?? 0;
+      return { id: n.id, indegree, outdegree, totalDegree: indegree + outdegree };
+    })
+    .sort((a, b) => b.totalDegree - a.totalDegree || a.id.localeCompare(b.id))
+    .slice(0, MAX_HUB_PAGES)
+    .filter((h) => h.totalDegree > 0);
+}
+
+/**
  * Evaluate graph health for the current wiki.
  * Returns null when there are no wiki pages (graph not measurable).
  * @param root - Absolute path to the project root.
@@ -93,7 +124,22 @@ function topDanglingTargets(graph: GraphData): GraphHealthResult["topDangling"] 
 export async function evaluateGraphHealth(
   root: string,
 ): Promise<GraphHealthResult | null> {
-  const pages = await collectViewerPages(root);
+  return evaluateGraphHealthFrom(diskLocalEntityScans(root));
+}
+
+/**
+ * {@link evaluateGraphHealth} over {@link LegacyLocalEntityScans}: THE ONE
+ * BODY. The viewer's page collection, then the viewer's graph, then the
+ * metrics. A page that cannot be read is left out by the collector, as it
+ * always was. A directory the scans report as missing or invalid is read as
+ * empty, as it always was; an `openEntityDirectory` call that itself rejects
+ * passes its error on unchanged.
+ *
+ * @param scans - The scans the viewer page collector reads both page directories through.
+ * @returns The metrics, or null when there are no wiki pages.
+ */
+export async function evaluateGraphHealthFrom(scans: LegacyLocalEntityScans): Promise<GraphHealthResult | null> {
+  const pages = await collectViewerPagesFrom(scans);
   if (pages.length === 0) return null;
 
   const graph = buildGraphData(pages);
@@ -108,21 +154,7 @@ export async function evaluateGraphHealth(
     ? Math.round((totalIndegree / realNodes.length) * 100) / 100
     : 0;
 
-  const realOutdegrees = new Map<GraphNodeId, number>();
-  for (const e of graph.edges) {
-    if (realIds.has(e.source) && realIds.has(e.target)) {
-      realOutdegrees.set(e.source, (realOutdegrees.get(e.source) ?? 0) + 1);
-    }
-  }
-  const hubPages: HubPage[] = realNodes
-    .map((n) => {
-      const indegree = realIndegrees.get(n.id) ?? 0;
-      const outdegree = realOutdegrees.get(n.id) ?? 0;
-      return { id: n.id, indegree, outdegree, totalDegree: indegree + outdegree };
-    })
-    .sort((a, b) => b.totalDegree - a.totalDegree || a.id.localeCompare(b.id))
-    .slice(0, MAX_HUB_PAGES)
-    .filter((h) => h.totalDegree > 0);
+  const hubPages = hubPagesOf(realNodes, realIds, realIndegrees, graph.edges);
 
   const danglingNodes = graph.nodes.filter((n) => n.isDangling);
 

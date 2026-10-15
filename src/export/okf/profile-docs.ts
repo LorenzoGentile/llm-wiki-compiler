@@ -15,8 +15,15 @@
  * {@link loadNonDefaultProfile} returning a non-default profile, so a
  * default-profile project yields NO entity docs and the bundle stays
  * byte-identical to a pre-7.6 export.
+ *
+ * ONE BODY, {@link collectProfileEntityDocsFrom}, over the existing entity-scan
+ * binding: the page collection is the collector's own one body over it, never
+ * a finished page list. `collectProfileEntityDocs(root, …)` hands it the local
+ * disk's scans. Naming the scans selects no backend and rules on no mechanism.
  */
-import { collectEntityPages } from "../../profile/collect.js";
+import { collectEntityPagesFrom } from "../../profile/collect.js";
+import { diskLocalEntityScans } from "../../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../../storage/legacy-local-reads.js";
 import type { EntityPage, EntityTypeDef, LoadedProfile, ProfilePack } from "../../profile/types.js";
 import { buildFrontmatter } from "../../utils/markdown.js";
 import { canonicalBody, hashCanonicalBody, wikilinksToOkf } from "./mapping.js";
@@ -196,8 +203,22 @@ export async function collectProfileEntityDocs(
   resolve: LinkResolver,
   loaded: LoadedProfile | undefined,
 ): Promise<ProfileEntityDoc[]> {
+  // `async` so that a throw while the disk scans are built REJECTS.
+  return collectProfileEntityDocsFrom(diskLocalEntityScans(root), resolve, loaded);
+}
+
+/**
+ * {@link collectProfileEntityDocs} over the entity-scan binding: THE ONE BODY.
+ * The default profile asks the scans nothing; otherwise one collection, then
+ * the rendering and the sort.
+ */
+export async function collectProfileEntityDocsFrom(
+  scans: LegacyLocalEntityScans,
+  resolve: LinkResolver,
+  loaded: LoadedProfile | undefined,
+): Promise<ProfileEntityDoc[]> {
   if (loaded === undefined) return [];
-  const { pages } = await collectEntityPages(root, loaded.profile);
+  const { pages } = await collectEntityPagesFrom(scans, loaded.profile);
   const docs = pages.map((page) => toEntityDoc(page, entityDef(loaded.profile, page), resolve));
   return docs.sort(compareDocs);
 }

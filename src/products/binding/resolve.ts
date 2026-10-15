@@ -23,13 +23,15 @@
  */
 
 import { MAX_KNOWLEDGE_PROFILE_BYTES } from "../constants.js";
-import { readInstalledProductPackage } from "../packages/store.js";
+import { diskProductPackageReads, readInstalledProductPackageFrom, type ProductPackageReads } from "../packages/store.js";
 import type { LoadedProfile } from "../../profile/types.js";
 import type { ProductPackageManifestV1 } from "../types.js";
 import {
-  bindingComponentMismatch, knowledgeProfileMemberPath, loadKnowledgeProfileMember, readStoredMemberText,
+  bindingComponentMismatch, knowledgeProfileMemberPath, loadKnowledgeProfileMember, readStoredMemberTextFrom,
 } from "./manifest-authority.js";
-import { profileJsonPresent, readActiveProductBinding } from "./store.js";
+import {
+  diskActiveBindingReads, profileJsonPresentFrom, readActiveProductBindingFrom, type ActiveBindingReads,
+} from "./store.js";
 import type { ActiveProductBindingV1 } from "./types.js";
 
 /**
@@ -44,26 +46,55 @@ export type ActiveProductResolution =
   | { mode: "conflict" }
   | { mode: "unavailable"; detail: string };
 
+/**
+ * Everything {@link resolveActiveProductFrom} reads. OWNED BY THE RESOLVER: a
+ * narrow seam with one disk implementation; not `ProjectStore`, not a hosted or
+ * access-control contract, and it selects no backend. Nothing ties the three to
+ * one project; production builds all from one root.
+ */
+export interface ActiveProductSources {
+  /**
+   * The project root as the caller gave it. NOT READ THROUGH: it only builds the
+   * paths reported as `loadedFrom` (the knowledge-profile member here, the
+   * legacy profile in `profile/load.ts`). The ONE origin for both.
+   */
+  root: string;
+  /** The binding leaf and the looks at the private directory. */
+  binding: ActiveBindingReads;
+  /** The installed package and its members. */
+  packages: ProductPackageReads;
+}
+
+/** LOCAL DISK. The sources for the project at `root`. Building them does no I/O. In no package index. */
+export function diskActiveProductSources(root: string): ActiveProductSources {
+  return { root, binding: diskActiveBindingReads(root), packages: diskProductPackageReads(root) };
+}
+
 /** Load the product-mode effective profile from the knowledge-profile member. */
 async function loadProductProfile(
-  root: string, binding: ActiveProductBindingV1, manifest: ProductPackageManifestV1,
+  sources: ActiveProductSources, binding: ActiveProductBindingV1, manifest: ProductPackageManifestV1,
 ): Promise<LoadedProfile> {
-  const text = await readStoredMemberText(
-    root, binding.packageDigest, manifest.knowledgeProfile, MAX_KNOWLEDGE_PROFILE_BYTES);
-  const memberPath = knowledgeProfileMemberPath(root, binding.packageDigest, manifest.knowledgeProfile.digest);
+  const text = await readStoredMemberTextFrom(
+    sources.packages, binding.packageDigest, manifest.knowledgeProfile, MAX_KNOWLEDGE_PROFILE_BYTES);
+  const memberPath = knowledgeProfileMemberPath(sources.root, binding.packageDigest, manifest.knowledgeProfile.digest);
   return loadKnowledgeProfileMember(text, memberPath);
 }
 
-/** Resolve a present, non-conflicting binding to product mode or `unavailable`. */
+/**
+ * Resolve a present, non-conflicting binding to product mode or `unavailable`.
+ * The package read is OUTSIDE the `try`: if it rejects, that same error leaves.
+ * Only the knowledge-profile member load is inside it, where any throw becomes
+ * `unavailable` carrying its message.
+ */
 async function resolveProductMode(
-  root: string, binding: ActiveProductBindingV1,
+  sources: ActiveProductSources, binding: ActiveProductBindingV1,
 ): Promise<ActiveProductResolution> {
-  const pkg = await readInstalledProductPackage(root, binding.packageDigest);
+  const pkg = await readInstalledProductPackageFrom(sources.packages, binding.packageDigest);
   if (pkg.status !== "ok") return { mode: "unavailable", detail: `package-${pkg.status}` };
   const mismatch = bindingComponentMismatch(binding, pkg.manifest);
   if (mismatch !== null) return { mode: "unavailable", detail: `component-mismatch:${mismatch}` };
   try {
-    const loaded = await loadProductProfile(root, binding, pkg.manifest);
+    const loaded = await loadProductProfile(sources, binding, pkg.manifest);
     return { mode: "product", binding, loaded };
   } catch (error) {
     return { mode: "unavailable", detail: error instanceof Error ? error.message : "knowledge-profile" };
@@ -78,9 +109,20 @@ async function resolveProductMode(
  * unavailable and never falls back to legacy.
  */
 export async function resolveActiveProduct(root: string): Promise<ActiveProductResolution> {
-  const read = await readActiveProductBinding(root);
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return resolveActiveProductFrom(diskActiveProductSources(root));
+}
+
+/**
+ * {@link resolveActiveProduct} over {@link ActiveProductSources}: THE ONE BODY.
+ * In order: the binding leaf (absent is legacy; malformed is unavailable); the
+ * profile-presence look (present is a conflict, and no package read follows);
+ * then the package. Nothing is remembered between calls.
+ */
+export async function resolveActiveProductFrom(sources: ActiveProductSources): Promise<ActiveProductResolution> {
+  const read = await readActiveProductBindingFrom(sources.binding);
   if (read.kind === "absent") return { mode: "legacy" };
   if (read.kind === "malformed") return { mode: "unavailable", detail: read.detail };
-  if (await profileJsonPresent(root)) return { mode: "conflict" };
-  return resolveProductMode(root, read.binding);
+  if (await profileJsonPresentFrom(sources.binding)) return { mode: "conflict" };
+  return resolveProductMode(sources, read.binding);
 }

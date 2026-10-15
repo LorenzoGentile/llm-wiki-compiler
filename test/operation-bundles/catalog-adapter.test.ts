@@ -9,24 +9,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createHash } from "node:crypto";
 import { catalogAdapter } from "../../src/operation-bundles/adapters/catalog.js";
-import { catalogRecordId } from "../../src/operation-bundles/ids.js";
-import type { CatalogOperationMutation, OperationDigest } from "../../src/operation-bundles/types.js";
-import { makeBinding, makeContext, publishPayload, WORKSPACE_ID, type BindingSet } from "./adapter-fixtures.js";
+import { CATALOG_PAYLOAD as PAYLOAD, catalogMutation, makeBinding, makeContext, publishPayload, WORKSPACE_ID } from "./adapter-fixtures.js";
 import { readCatalogStore } from "../../src/operation-bundles/catalog-store.js";
-
-const PAYLOAD = Buffer.from(JSON.stringify({ title: "record a" }));
-const HEX = createHash("sha256").update(PAYLOAD).digest("hex");
-const DUMMY = `sha256:${"4".repeat(64)}` as OperationDigest;
-
-function catalogMutation(set: BindingSet): CatalogOperationMutation {
-  return {
-    kind: "catalog-record", index: 0, mutationId: set.onDisk.mutationId, dependsOn: [], reconciliationRefs: [],
-    operation: "create", target: { logicalRecordId: "rec-a" }, payloadRef: HEX,
-    precondition: { kind: "absent" }, postcondition: { digest: DUMMY, recordId: catalogRecordId(set.binding.mutationId) },
-  };
-}
 
 let root = "";
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "cat-adapter-")); });

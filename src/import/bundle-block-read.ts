@@ -16,7 +16,8 @@
  *    summary; nothing here flows into any write of `.llmwiki/profile.json` or
  *    `.llmwiki/config.json` (Invariant 7 / D-7.6.8 — the parsed block is inert).
  */
-import { loadNonDefaultProfile } from "../profile/block.js";
+import { loadNonDefaultProfileFrom } from "../profile/block.js";
+import { diskEffectiveProfileSources, type EffectiveProfileSources } from "../profile/load.js";
 import type { OkfImportLimits } from "./types.js";
 import type {
   BundleProfileBlock,
@@ -232,8 +233,8 @@ function notDeclaredLocally(candidates: string[], declared: string[]): string[] 
  * loads the local profile, writes nothing). A default-profile project yields a
  * `noActiveProfile` note; a differing digest attaches the OQ12 no-migration note.
  */
-async function buildMismatch(root: string, profile: BundleProfileBlock): Promise<BundleProfileMismatch> {
-  const local = await loadNonDefaultProfile(root);
+async function buildMismatch(sources: EffectiveProfileSources, profile: BundleProfileBlock): Promise<BundleProfileMismatch> {
+  const local = await loadNonDefaultProfileFrom(sources);
   if (local === undefined) {
     return {
       noActiveProfile: true,
@@ -268,12 +269,25 @@ export async function buildBundleSections(
   root: string,
   block: ParsedBundleBlock,
 ): Promise<BundleReportSections> {
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return buildBundleSectionsFrom(diskEffectiveProfileSources(root), block);
+}
+
+/**
+ * {@link buildBundleSections} over the effective profile's sources: THE ONE BODY.
+ * The local profile is loaded only when the bundle declares a profile, and
+ * nothing is written.
+ */
+export async function buildBundleSectionsFrom(
+  profileSources: EffectiveProfileSources,
+  block: ParsedBundleBlock,
+): Promise<BundleReportSections> {
   const sections: BundleReportSections = {
     bundleRelations: { count: block.relations.length, entries: block.relations },
     bundleWorkflows: { count: block.workflows.length, runIds: block.workflows.map((run) => run.runId) },
   };
   if (block.profile !== undefined) {
-    sections.bundleProfile = { profile: block.profile, mismatch: await buildMismatch(root, block.profile) };
+    sections.bundleProfile = { profile: block.profile, mismatch: await buildMismatch(profileSources, block.profile) };
   }
   return sections;
 }

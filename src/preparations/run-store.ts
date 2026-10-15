@@ -9,15 +9,36 @@
  * re-verifies the candidate in memory, charges the correct budget lane, and only
  * then durably replaces the record. Handoff and abandonment run through dedicated
  * writers that verify their evidence before the state changes.
+ *
+ * ONE READ BODY, OVER THE READER'S OWN LEAVES. `readPreparationRunFrom` is the
+ * single body of the read; it takes `PreparationRunLeafReads` and no project
+ * root. `readPreparationRun` keeps its signature and delegates to it over the
+ * private local-disk leaves, built on each call. What is bound is THIS READER'S
+ * decisions: the cap it asks for, leaf before key, the typed codes, parsing
+ * against the caller's binding, and AUTHENTICATION, which stays in the body
+ * with the real key. Path derivation, confinement and cap enforcement stay in
+ * the local-disk leaves. Nothing here selects a backend.
+ *
+ * ONE BODY PER WRITER, OVER THE WRITERS' OWN STEPS. Genesis, the authenticated
+ * append (with or without a projector), the handoff settlement and the
+ * abandonment each have one root-free body (`…With`) over
+ * {@link PreparationRunWriteSteps}: the authenticated read, a fresh key, the
+ * verifying evidence read, create-only genesis publication and durable
+ * replacement. The bodies own predecessor authentication, the epoch, signing,
+ * the budget lane, the projector invariant, the reserved handoff identities and
+ * evidence verification BEFORE the write. Every root form keeps its signature and
+ * passes {@link diskPreparationRunWriteSteps}, whose closures keep the incumbent
+ * confinement, exact-parent, durability and mode flags.
  */
 
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
-import { atomicWrite } from "../utils/atomic-write.js";
-import { authenticatedRunRead, publishRunGenesis } from "../utils/run-store-io.js";
+import { genesisCollisionMessage, publishRunGenesis, readAuthenticatedRunFrom, replaceRunLeaf } from "../utils/run-store-io.js";
 import { readDurableOperationLeaf } from "../operation-bundles/durable-leaf.js";
+import type { CappedLeafRead } from "../utils/confined-read.js";
 import { MAX_PREPARATION_RUN_BYTES } from "./constants.js";
-import { readPreparationEvidence } from "./evidence-store.js";
+import { readPreparationEvidence, type PreparationEvidenceLocation, type PreparationEvidenceRead } from "./evidence-store.js";
 import { readPreparationKey } from "./key-epoch.js";
+import type { PreparationKeyRead } from "./key-epoch.js";
 import { preparationPaths } from "./paths.js";
 import { assertPreparationRunWriteBudget, preparationRunWriteBudgetClass, projectPreparationRunBudget, type RunBudgetInput, type RunWriteBudgetClass } from "./run-budget.js";
 import {
@@ -75,26 +96,90 @@ export interface HandoffPreparationRunInput {
 }
 
 /** Read one exact workspace run leaf before consulting any project key. */
-async function readRunLeaf(root: string, binding: PreparationRunBinding) {
+async function readRunLeaf(root: string, binding: PreparationRunBinding, maxBytes: number) {
   const paths = preparationPaths(root, binding.workspaceId);
-  return readDurableOperationLeaf(root, paths.runFile(binding.runId), paths.runsRoot, MAX_PREPARATION_RUN_BYTES);
+  return readDurableOperationLeaf(root, paths.runFile(binding.runId), paths.runsRoot, maxBytes);
+}
+
+/**
+ * What the run read asks of the store. Owned by the run reader; no read takes
+ * a project root.
+ */
+export interface PreparationRunLeafReads {
+  /**
+   * One run leaf's text by its binding, within `maxBytes`. May throw or reject,
+   * for an unsafe identity or otherwise; the body maps both to `identity`.
+   */
+  readRunLeaf(binding: PreparationRunBinding, maxBytes: number): Promise<CappedLeafRead>;
+  /**
+   * The preparation key, WITH ITS BYTES. Deliberate: this body is the one that
+   * authenticates, so it needs the key itself. An `ok` answer whose key is not
+   * 32 bytes fails verification and reads as integrity-invalid; the local-disk
+   * key reader never returns one.
+   */
+  readKey(): Promise<PreparationKeyRead>;
+}
+
+/**
+ * The local-disk run leaves for one project root, built per call: each closure
+ * calls the incumbent's function when it is asked. Exported for the store's
+ * leaf composition (`store-leaf-reads.ts`) only; in no package index.
+ */
+export function diskPreparationRunLeafReads(root: string): PreparationRunLeafReads {
+  return {
+    readRunLeaf: (binding, maxBytes) => readRunLeaf(root, binding, maxBytes),
+    readKey: () => readPreparationKey(root),
+  };
 }
 
 /** Read, parse, and authenticate only against all caller-requested identities. */
 export async function readPreparationRun(root: string, binding: PreparationRunBinding): Promise<PreparationRunRead> {
-  let leaf: Awaited<ReturnType<typeof readRunLeaf>>;
-  try {
-    leaf = await readRunLeaf(root, binding);
-  } catch {
-    return { status: "unavailable", detail: "identity", code: "identity" };
-  }
-  if (leaf.kind === "absent") return { status: "absent" };
-  if (leaf.kind === "unavailable") return { status: "unavailable", detail: "run-leaf", code: "run-leaf-unavailable" };
-  const key = await readPreparationKey(root);
-  if (key.status === "absent") return { status: "unavailable", detail: "key-missing", code: "integrity-key-missing" };
-  if (key.status === "unavailable") return { status: "unavailable", detail: "key-unreadable", code: "integrity-key-unreadable" };
-  return authenticatedRunRead(() => parsePreparationRun(leaf.body, binding),
-    (run) => verifyPreparationRunIntegrity(run, key.key, binding));
+  return readPreparationRunFrom(diskPreparationRunLeafReads(root), binding);
+}
+
+/**
+ * {@link readPreparationRun} over the reader's own leaves: the one body. It
+ * reads the leaf, then the key only if the leaf is present, then parses and
+ * AUTHENTICATES here. It confines nothing and trusts no leaf it cannot verify.
+ */
+export async function readPreparationRunFrom(
+  leaves: PreparationRunLeafReads, binding: PreparationRunBinding,
+): Promise<PreparationRunRead> {
+  return readAuthenticatedRunFrom<PreparationRunBinding, PreparationRunV1, Extract<PreparationRunRead, { status: "unavailable" }>>(leaves, binding, {
+    maxBytes: MAX_PREPARATION_RUN_BYTES,
+    parse: (body) => parsePreparationRun(body, binding),
+    verify: (run, key) => verifyPreparationRunIntegrity(run, key, binding),
+    // THE PREPARATION TAXONOMY: the identity and run-leaf refusals carry their own codes.
+    identity: { status: "unavailable", detail: "identity", code: "identity" },
+    runLeaf: { status: "unavailable", detail: "run-leaf", code: "run-leaf-unavailable" },
+  });
+}
+
+/** What the run writers ask of the store. No member takes a project root. */
+export interface PreparationRunWriteSteps {
+  /** The authenticated exact-binding run read. Local: `readPreparationRun(root, binding)`. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The preparation key WITH ITS BYTES, fresh on each call. Local: `readPreparationKey(root)`. */
+  readKey(): Promise<PreparationKeyRead>;
+  /** The verifying evidence read. Local: `readPreparationEvidence(root, location, digest)`. */
+  readEvidence(location: PreparationEvidenceLocation, digest: string): Promise<PreparationEvidenceRead>;
+  /** Create-only genesis publication; `collisionMessage` is asked only on a genuine create collision. */
+  publishGenesis(binding: PreparationRunBinding, serialized: string, collisionMessage: () => Promise<string>): Promise<void>;
+  /** Durable, strictly synced replacement of the run leaf. */
+  replaceRun(binding: PreparationRunBinding, serialized: string): Promise<void>;
+}
+
+/** The local-disk run write steps for one root, built per call; each closure calls the incumbent when asked. In no package index. */
+function diskPreparationRunWriteSteps(root: string): PreparationRunWriteSteps {
+  return {
+    readRun: (binding) => readPreparationRun(root, binding),
+    readKey: () => readPreparationKey(root),
+    readEvidence: (location, digest) => readPreparationEvidence(root, location, digest),
+    publishGenesis: (binding, serialized, collisionMessage) =>
+      publishRunGenesis({ root, file: preparationPaths(root, binding.workspaceId).runFile(binding.runId) }, serialized, collisionMessage),
+    replaceRun: (binding, serialized) =>
+      replaceRunLeaf({ root, file: preparationPaths(root, binding.workspaceId).runFile(binding.runId) }, serialized),
+  };
 }
 
 /** Sign, serialize, parse, and authenticate a candidate before touching disk. */
@@ -110,8 +195,8 @@ function prepareSignedRun(
 }
 
 /** Require one healthy current key without ever creating or replacing it. */
-async function requirePreparationKey(root: string) {
-  const key = await readPreparationKey(root);
+async function requirePreparationKey(steps: Pick<PreparationRunWriteSteps, "readKey">) {
+  const key = await steps.readKey();
   if (key.status === "absent") throw new Error("preparation integrity key is missing");
   if (key.status === "unavailable") throw new Error("preparation integrity key is unreadable");
   return key;
@@ -125,16 +210,22 @@ async function requirePreparationKey(root: string) {
 export async function createPreparationRunLocked(
   root: string, input: InitialPreparationRunInput, budgetInput: RunBudgetInput,
 ): Promise<PreparationRunV1> {
+  return createPreparationRunWith(diskPreparationRunWriteSteps(root), input, budgetInput);
+}
+
+/**
+ * {@link createPreparationRunLocked} over the writers' own steps: the one genesis
+ * body. Exported for its memory witness and in no package index.
+ */
+export async function createPreparationRunWith(
+  steps: PreparationRunWriteSteps, input: InitialPreparationRunInput, budgetInput: RunBudgetInput,
+): Promise<PreparationRunV1> {
   projectPreparationRunBudget(budgetInput);
-  const key = await requirePreparationKey(root);
+  const key = await requirePreparationKey(steps);
   if (input.keyEpochId !== key.keyEpochId) throw new Error("preparation run key epoch mismatch");
   const content = createInitialPreparationRun(input), binding = preparationRunBinding(content);
   const prepared = prepareSignedRun(content, key.key, binding, "ordinary");
-  const file = preparationPaths(root, binding.workspaceId).runFile(binding.runId);
-  await publishRunGenesis({ root, file }, prepared.serialized, async () => {
-    const collision = await readPreparationRun(root, binding);
-    return `preparation run genesis already exists: ${collision.status}`;
-  });
+  await steps.publishGenesis(binding, prepared.serialized, genesisCollisionMessage("preparation", (asked) => steps.readRun(asked), binding));
   return prepared.parsed;
 }
 
@@ -159,14 +250,14 @@ export type PreparationRunContentProjector = (
 
 /** Append one already-proof-checked transition to an authenticated exact prefix. */
 async function appendAuthenticatedTransition(
-  root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   input: AppendPreparationTransitionInput, project?: PreparationRunContentProjector,
 ): Promise<PreparationRunV1> {
-  const read = await readPreparationRun(root, binding);
+  const read = await steps.readRun(binding);
   if (read.status !== "ok") throw new Error(`preparation run unavailable: ${read.status === "unavailable" ? read.detail : read.status}`);
   assertExpectedPredecessor(read.run, expected);
   if (!preparationRunBindingMatches(read.run, binding)) throw new Error("preparation run binding mismatch");
-  const key = await requirePreparationKey(root);
+  const key = await requirePreparationKey(steps);
   if (key.keyEpochId !== binding.keyEpochId) throw new Error("preparation run key epoch changed");
   const base = appendPreparationTransition(read.run, input);
   const next = project ? project(base) : base;
@@ -175,9 +266,7 @@ async function appendAuthenticatedTransition(
     throw new Error("preparation run append did not produce exactly one next state version");
   }
   const prepared = prepareSignedRun(next, key.key, binding, preparationRunWriteBudgetClass(input.type));
-  await atomicWrite(preparationPaths(root, binding.workspaceId).runFile(binding.runId), prepared.serialized, {
-    confineRoot: root, exactParent: true, durable: true, strictDurability: true, mode: 0o600,
-  });
+  await steps.replaceRun(binding, prepared.serialized);
   return prepared.parsed;
 }
 
@@ -195,7 +284,7 @@ export function appendProjectedTransitionLocked(
   if (input.type === "handed-off" || input.type === "abandoned") {
     throw new Error(`${input.type} requires its evidence-verifying control writer`);
   }
-  return appendAuthenticatedTransition(root, binding, expected, input, project);
+  return appendAuthenticatedTransition(diskPreparationRunWriteSteps(root), binding, expected, input, project);
 }
 
 /** Append one ordinary or fixed-shape control transition under the project lock. */
@@ -203,10 +292,24 @@ export async function appendPreparationTransitionLocked(
   root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   input: AppendPreparationTransitionInput,
 ): Promise<PreparationRunV1> {
+  return appendPreparationTransitionWith(diskPreparationRunWriteSteps(root), binding, expected, input);
+}
+
+/**
+ * {@link appendPreparationTransitionLocked} over the writers' own steps. Handoff and
+ * abandonment are refused here; they have their own evidence-verifying bodies.
+ * {@link appendProjectedTransitionLocked} does NOT route through this function: it
+ * keeps its own SYNCHRONOUS guard (a throw, not a rejection) and then reaches the same
+ * shared authenticated-append body with its projector.
+ */
+export async function appendPreparationTransitionWith(
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  input: AppendPreparationTransitionInput, project?: PreparationRunContentProjector,
+): Promise<PreparationRunV1> {
   if (input.type === "handed-off" || input.type === "abandoned") {
     throw new Error(`${input.type} requires its evidence-verifying control writer`);
   }
-  return appendAuthenticatedTransition(root, binding, expected, input);
+  return appendAuthenticatedTransition(steps, binding, expected, input, project);
 }
 
 /** Append the reserved-lane park move to `recovery-required`. */
@@ -214,7 +317,7 @@ export function appendHeadroomExhaustedControl(
   root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   actor: PreparationPrincipalV1, at: string,
 ): Promise<PreparationRunV1> {
-  return appendAuthenticatedTransition(root, binding, expected, {
+  return appendAuthenticatedTransition(diskPreparationRunWriteSteps(root), binding, expected, {
     type: "headroom-exhausted", stateAfter: "recovery-required", actor, at,
     payload: { kind: "problem", code: "preparation-run-headroom-exhausted" },
   });
@@ -232,7 +335,15 @@ export function appendHandoffStartedTransitionLocked(
   root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   input: HandoffStartInput,
 ): Promise<PreparationRunV1> {
-  return appendAuthenticatedTransition(root, binding, expected, {
+  return appendHandoffStartedTransitionWith(diskPreparationRunWriteSteps(root), binding, expected, input);
+}
+
+/** {@link appendHandoffStartedTransitionLocked} over the writers' own steps: the one append. */
+export function appendHandoffStartedTransitionWith(
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  input: HandoffStartInput,
+): Promise<PreparationRunV1> {
+  return appendAuthenticatedTransition(steps, binding, expected, {
     type: "handoff-started", stateAfter: "handoff-started", actor: input.actor, at: input.at,
     payload: { kind: "handoff-started", ...input.start },
   });
@@ -262,7 +373,15 @@ export async function appendHandoffTransitionLocked(
   root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   input: HandoffPreparationRunInput,
 ): Promise<PreparationRunV1> {
-  const read = await readPreparationRun(root, binding);
+  return appendHandoffTransitionWith(diskPreparationRunWriteSteps(root), binding, expected, input);
+}
+
+/** {@link appendHandoffTransitionLocked} over the writers' own steps: identities only from the durable handoff-started record. */
+export async function appendHandoffTransitionWith(
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  input: HandoffPreparationRunInput,
+): Promise<PreparationRunV1> {
+  const read = await steps.readRun(binding);
   if (read.status !== "ok") throw new Error(`preparation run unavailable: ${read.status}`);
   const start = handoffStartBinding(read.run);
   if (start === undefined) throw new Error("handed-off requires a prior handoff-started transition");
@@ -270,7 +389,7 @@ export async function appendHandoffTransitionLocked(
     handoffId: start.handoffId, bundleId: start.reservedBundleId,
     bundleManifestDigest: start.bundleManifestDigest, finalTransitionHash: start.preHandoffTransitionHash,
   };
-  return appendAuthenticatedTransition(root, binding, expected, {
+  return appendAuthenticatedTransition(steps, binding, expected, {
     type: "handed-off", stateAfter: "handed-off", actor: input.actor, at: input.at, handoff,
     payload: { kind: "handoff", handoffId: start.handoffId, bundleManifestDigest: start.bundleManifestDigest },
   });
@@ -278,12 +397,12 @@ export async function appendHandoffTransitionLocked(
 
 /** Verify every residual finding's evidence before the abandonment transition. */
 async function verifyResidualEvidence(
-  root: string, binding: PreparationRunBinding, findings: readonly ResidualFindingV1[],
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, findings: readonly ResidualFindingV1[],
 ): Promise<void> {
   for (const finding of findings) {
     if (finding.evidence === undefined) continue;
-    const read = await readPreparationEvidence(
-      root, { workspaceId: binding.workspaceId, preparationId: binding.preparationId },
+    const read = await steps.readEvidence(
+      { workspaceId: binding.workspaceId, preparationId: binding.preparationId },
       finding.evidence.digest.slice("sha256:".length),
     );
     if (read.status !== "ok" || read.byteCount !== finding.evidence.byteCount) {
@@ -297,9 +416,17 @@ export async function appendAbandonedTransitionLocked(
   root: string, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
   input: AbandonPreparationRunInput,
 ): Promise<PreparationRunV1> {
+  return appendAbandonedTransitionWith(diskPreparationRunWriteSteps(root), binding, expected, input);
+}
+
+/** {@link appendAbandonedTransitionLocked} over the writers' own steps: every evidence byte verified before the append. */
+export async function appendAbandonedTransitionWith(
+  steps: PreparationRunWriteSteps, binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  input: AbandonPreparationRunInput,
+): Promise<PreparationRunV1> {
   if (input.confirmResidualState !== true) throw new Error("residual-state confirmation is required");
-  await verifyResidualEvidence(root, binding, input.findings);
-  return appendAuthenticatedTransition(root, binding, expected, {
+  await verifyResidualEvidence(steps, binding, input.findings);
+  return appendAuthenticatedTransition(steps, binding, expected, {
     type: "abandoned", stateAfter: "abandoned", actor: input.actor, at: input.at,
     residualFindings: input.findings,
     payload: { kind: "abandonment", confirmation: "confirm-residual-state", findingCount: input.findings.length },

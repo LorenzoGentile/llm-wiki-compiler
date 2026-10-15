@@ -26,20 +26,38 @@
  * The journal NEVER records a post-state, so a half-applied batch can only ever
  * resolve toward the FULL pre-state, never toward a partial post-state. All
  * journal files live under `.llmwiki/`, the project's existing private dir.
+ *
+ * STORAGE. The batch LIFECYCLE — open, pre-state capture, commit and the
+ * persist they share — has one body each (`…From`) over {@link JournalBatchIo},
+ * the raw physical answers it asks for. The exported root forms keep their
+ * signatures and run that body over {@link diskJournalBatchIo}, the incumbent
+ * local disk. The journal itself still decides everything: the layout, the
+ * payload's JSON form, dedupe, the aggregate budget, the `unavailable`
+ * refusal, rollback and order. The RESTORATION and trust reads — `confinedUnlink`,
+ * `revertEntry`, `loadBatch`, `targetConfinedUnderRoot`, `allTargetsConfined`
+ * and `classifyJournalDir` — likewise have one body each over
+ * {@link JournalRestoreIo}, with root forms over {@link diskJournalRestoreIo}.
+ * The best-effort {@link replayJournal}, with its private pending, quarantine
+ * and directory helpers, has ONE body ({@link replayJournalFrom}) over
+ * {@link JournalReplayIo} plus a REQUIRED, separate diagnostics port; the root
+ * form passes {@link diskJournalReplayIo} and the incumbent `note`. The raw
+ * contracts and their disk objects live in `./journal-io.ts` and are
+ * re-exported here. Callers still hold the project lock: nothing here acquires
+ * or releases it. Nothing here is a `ProjectStore`, hosted, access-controlled,
+ * or power-loss durable.
  */
 
-import { mkdir, readdir, unlink, rename, type FileHandle } from "fs/promises";
-import { openFileNoFollow } from "../utils/no-follow-open.js";
-import { constants as fsConstants } from "node:fs";
 import path from "path";
 import {
   LLMWIKI_DIR, JOURNAL_PRESTATE_MAX_BYTES,
 } from "../utils/constants.js";
-import { realpath } from "fs/promises";
-import { confineUnderRoot, safeRealpath, isInsideDir } from "../utils/path-confine.js";
-import { readConfinedLeaf, readConfinedLeafBuffer, type ReadLeafOptions } from "../utils/confined-read.js";
-import { atomicWrite } from "../utils/markdown.js";
+import { isInsideDir } from "../utils/path-confine.js";
+import type { ReadLeafOptions } from "../utils/confined-read.js";
 import { note } from "../utils/output.js";
+import {
+  diskJournalBatchIo, diskJournalReplayIo, diskJournalRestoreIo,
+  type JournalBatchIo, type JournalNote, type JournalReplayIo, type JournalRestoreIo,
+} from "./journal-io.js";
 import {
   binaryPreState, isCanonicalBase64, preStateDecodedByteCount, preStateRestoreContent,
   JournalAggregateBudgetExceededError, type RecordedPreState,
@@ -48,6 +66,9 @@ import {
 // The pre-state encoding/budget rules live in ./journal-prestate.ts; re-export
 // the pieces callers catch or type against so the journal stays one import.
 export { JournalAggregateBudgetExceededError, type RecordedPreState } from "./journal-prestate.js";
+// The raw contracts live in ./journal-io.ts; their types are re-exported so the
+// journal stays one import (callers take the disk values from ./journal-io.ts).
+export type { JournalBatchIo, JournalNote, JournalReplayIo, JournalRestoreIo } from "./journal-io.js";
 
 /**
  * A mutation target could not be safely captured into the pre-state journal: it
@@ -133,11 +154,11 @@ function journalDir(root: string): string {
  * so a planted escaping symlink is rejected up front with a clear error rather
  * than only at persist time. A confined real journal dir resolves cleanly (no-op).
  */
-async function assertJournalDirConfined(root: string): Promise<void> {
+async function assertJournalDirConfined(io: JournalBatchIo, root: string): Promise<void> {
   // Pass the journal dir RELATIVE to root: confineUnderRoot resolves it against
   // realpath(root), so an absolute path built from a pre-realpath root would be
   // judged outside on a symlinked root (macOS /var → /private/var).
-  await confineUnderRoot(path.join(LLMWIKI_DIR, "journal"), root, { mustExist: false });
+  await io.confineTarget(path.join(LLMWIKI_DIR, "journal"), root);
 }
 
 /** Absolute path to a batch's journal file. Exported as a seam for recovery. */
@@ -150,41 +171,27 @@ function quarantinePath(root: string, batchId: string): string {
   return path.join(journalDir(root), "quarantine", `${batchId}.json`);
 }
 
-/**
- * Read a journal storage file's bytes, or `null` when it is absent, a SYMLINKED
- * leaf, or otherwise unreadable. Opened with `O_NOFOLLOW` so a planted
- * `.llmwiki/journal/<id>.json` symlink is not followed out of tree — matching the
- * write side, which persists through the no-follow hardened {@link atomicWrite}.
- * `classifyJournalDir` confines the journal DIR, but that does not confine the LEAF;
- * a followed symlink would let out-of-tree bytes be parsed as a batch and replayed.
- * A refused read yields `null` → the batch is simply not loadable (never replayed).
- */
-async function readOrNull(filePath: string): Promise<string | null> {
-  let handle: FileHandle | null = null;
-  try {
-    handle = await openFileNoFollow(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    return await handle.readFile("utf-8");
-  } catch {
-    return null;
-  } finally {
-    await handle?.close();
-  }
-}
+/** The members each restoration body asks for. */
+type ConfineIo = Pick<JournalRestoreIo, "confineTarget" | "realPath">;
+type UnlinkIo = ConfineIo & Pick<JournalRestoreIo, "removeLeaf">;
+type RevertIo = UnlinkIo & Pick<JournalRestoreIo, "safeRealPath" | "replaceLeafContentWithin">;
+/** What quarantine asks beyond unlinking: the two unguarded moves. */
+type QuarantineIo = UnlinkIo & Pick<JournalReplayIo, "makeDirectoryTree" | "renameLeafUnguarded">;
 
 /**
  * Atomically persist a batch's current state to its journal file via the shared
- * hardened {@link atomicWrite} primitive (random O_EXCL temp + rename), so the
+ * hardened `atomicWrite` primitive (random O_EXCL temp + rename), so the
  * journal writer inherits the same leaf-symlink write-escape defenses rather than
  * carrying its own bespoke temp+rename.
  */
-async function persist(batch: JournalBatch): Promise<void> {
+async function persist(io: JournalBatchIo, batch: JournalBatch): Promise<void> {
   const file = journalPath(batch.root, batch.batchId);
   const payload = {
     batchId: batch.batchId,
     status: batch.status,
     entries: batch.entries,
   };
-  await atomicWrite(file, JSON.stringify(payload, null, 2), { confineRoot: batch.root });
+  await io.replaceLeafAtomicWithin(batch.root, file, JSON.stringify(payload, null, 2));
 }
 
 /** {@link openBatch} options: the aggregate pre-state budget override. */
@@ -210,10 +217,18 @@ export interface OpenBatchOptions {
  * @returns The opened, persisted {@link JournalBatch}.
  */
 export async function openBatch(root: string, opts: OpenBatchOptions = {}): Promise<JournalBatch> {
+  return openBatchFrom(diskJournalBatchIo, root, opts);
+}
+
+/**
+ * THE ONE BODY of {@link openBatch}, over the given raw I/O. The batch id still
+ * comes from the incumbent clock, process id and `Math.random` (no project I/O).
+ */
+export async function openBatchFrom(io: JournalBatchIo, root: string, opts: OpenBatchOptions = {}): Promise<JournalBatch> {
   // FAIL CLOSED UP FRONT on a symlinked `.llmwiki/journal` escaping root, with a
   // clear error, rather than relying solely on the persist-time `confineRoot`
   // (defense in depth). A confined real journal dir is a no-op on the happy path.
-  await assertJournalDirConfined(root);
+  await assertJournalDirConfined(io, root);
   const random = Math.random().toString(36).slice(2, 2 + BATCH_ID_RANDOM_CHARS);
   const batchId = `${Date.now()}-${process.pid}-${random}`;
   const batch: JournalBatch = {
@@ -222,7 +237,7 @@ export async function openBatch(root: string, opts: OpenBatchOptions = {}): Prom
       ? {} : { aggregatePreStateBudget: opts.maxAggregatePreStateBytes }),
     aggregatePreStateBytes: 0,
   };
-  await persist(batch);
+  await persist(io, batch);
   return batch;
 }
 
@@ -252,11 +267,11 @@ function admitWithinAggregateBudget(batch: JournalBatch, targetPath: string, pre
  * failure the entry and its budget charge are withdrawn, so the retry genuinely
  * re-records (or fails again).
  */
-async function appendDurably(batch: JournalBatch, entry: JournalEntry): Promise<void> {
+async function appendDurably(io: JournalBatchIo, batch: JournalBatch, entry: JournalEntry): Promise<void> {
   admitWithinAggregateBudget(batch, entry.targetPath, entry.preState);
   batch.entries.push(entry);
   try {
-    await persist(batch);
+    await persist(io, batch);
   } catch (error) {
     batch.entries.pop();
     batch.aggregatePreStateBytes =
@@ -277,10 +292,17 @@ async function appendDurably(batch: JournalBatch, entry: JournalEntry): Promise<
  *
  * @param batch - The open pending batch.
  * @param targetPath - Absolute path of the target about to be written.
- * @param opts - Test-only seam threaded to {@link readConfinedLeaf} so the
+ * @param opts - Test-only seam threaded to `readConfinedLeaf` so the
  *   parent-swap race can be exercised deterministically (see {@link ReadLeafOptions}).
  */
 export async function recordPreState(batch: JournalBatch, targetPath: string, opts: ReadLeafOptions = {}): Promise<void> {
+  return recordPreStateFrom(diskJournalBatchIo, batch, targetPath, opts);
+}
+
+/** THE ONE BODY of {@link recordPreState}, over the given raw I/O; `opts` reach the read unchanged. */
+export async function recordPreStateFrom(
+  io: JournalBatchIo, batch: JournalBatch, targetPath: string, opts: ReadLeafOptions = {},
+): Promise<void> {
   if (batch.entries.some((entry) => entry.targetPath === targetPath)) {
     return;
   }
@@ -291,11 +313,11 @@ export async function recordPreState(batch: JournalBatch, targetPath: string, op
   // REFUSES the whole mutation. `unavailable` is NEVER coerced to `absent`
   // (which would make a crash-revert DELETE a target that held content); `absent`
   // is ENOENT only.
-  const expectedDir = await expectedLeafParentDir(targetPath, batch.root);
-  const prior = await readConfinedLeaf(batch.root, targetPath, expectedDir, JOURNAL_PRESTATE_MAX_BYTES, opts);
+  const expectedDir = await expectedLeafParentDir(io, targetPath, batch.root);
+  const prior = await io.readConfinedLeafText(batch.root, targetPath, expectedDir, JOURNAL_PRESTATE_MAX_BYTES, opts);
   if (prior.kind === "unavailable") throw new JournalPreStateUnreadableError(targetPath);
   const preState: PreState = prior.kind === "absent" ? ABSENT : { absent: false, content: prior.body };
-  await appendDurably(batch, { targetPath, preState });
+  await appendDurably(io, batch, { targetPath, preState });
 }
 
 /** {@link recordBinaryPreState} options: the per-target cap plus the read seam. */
@@ -320,19 +342,26 @@ export interface RecordBinaryPreStateOptions extends ReadLeafOptions {
 export async function recordBinaryPreState(
   batch: JournalBatch, targetPath: string, opts: RecordBinaryPreStateOptions = {},
 ): Promise<void> {
+  return recordBinaryPreStateFrom(diskJournalBatchIo, batch, targetPath, opts);
+}
+
+/** THE ONE BODY of {@link recordBinaryPreState}, over the given raw I/O. */
+export async function recordBinaryPreStateFrom(
+  io: JournalBatchIo, batch: JournalBatch, targetPath: string, opts: RecordBinaryPreStateOptions = {},
+): Promise<void> {
   if (batch.entries.some((entry) => entry.targetPath === targetPath)) return;
   const { maxPreStateBytes, ...readOpts } = opts;
-  const expectedDir = await expectedLeafParentDir(targetPath, batch.root);
-  const prior = await readConfinedLeafBuffer(
+  const expectedDir = await expectedLeafParentDir(io, targetPath, batch.root);
+  const prior = await io.readConfinedLeafBytes(
     batch.root, targetPath, expectedDir, maxPreStateBytes ?? JOURNAL_PRESTATE_MAX_BYTES, readOpts);
   if (prior.kind === "unavailable") throw new JournalPreStateUnreadableError(targetPath);
   const preState: PreState = prior.kind === "absent" ? ABSENT : binaryPreState(prior.body);
-  await appendDurably(batch, { targetPath, preState });
+  await appendDurably(io, batch, { targetPath, preState });
 }
 
 /**
  * The LEXICAL expected parent dir for a mutation `targetPath`, expressed under
- * `path.resolve(root)` so {@link readConfinedLeaf}'s `resolveExpectedReal`
+ * `path.resolve(root)` so `readConfinedLeaf`'s `resolveExpectedReal`
  * re-anchors its in-root remainder against `realpath(root)` — the SAME
  * lexical-in-root-join discipline the artifact store's `expectedDir` uses (NOT a
  * realpath'd dir, which would FOLLOW a symlinked parent and defeat the check).
@@ -341,8 +370,8 @@ export async function recordBinaryPreState(
  * escapes both root forms keeps its absolute dirname, which then fails the
  * parent-realpath confinement inside `readConfinedLeaf` (fail closed).
  */
-async function expectedLeafParentDir(targetPath: string, root: string): Promise<string> {
-  const rel = await targetRelativeToRoot(targetPath, root);
+async function expectedLeafParentDir(io: JournalBatchIo, targetPath: string, root: string): Promise<string> {
+  const rel = await targetRelativeToRoot(io, targetPath, root);
   return path.join(path.resolve(root), path.dirname(rel));
 }
 
@@ -363,9 +392,14 @@ async function expectedLeafParentDir(targetPath: string, root: string): Promise<
  * @param batch - The batch whose writes have all succeeded.
  */
 export async function commitBatch(batch: JournalBatch): Promise<void> {
+  return commitBatchFrom(diskJournalBatchIo, batch);
+}
+
+/** THE ONE BODY of {@link commitBatch}, over the given raw I/O: `committed` is set BEFORE the removal, and only ENOENT is swallowed. */
+export async function commitBatchFrom(io: JournalBatchIo, batch: JournalBatch): Promise<void> {
   batch.status = "committed";
   try {
-    await unlink(journalPath(batch.root, batch.batchId));
+    await io.removeLeaf(journalPath(batch.root, batch.batchId));
   } catch (error) {
     if (isErrno(error, "ENOENT")) return;
     throw error;
@@ -383,9 +417,9 @@ function isErrno(error: unknown, code: string): boolean {
  * escaping symlink AFTER the initial confinement would otherwise let a raw write
  * or delete land outside the project. Throws if the target escapes root.
  */
-async function reconfineTarget(targetPath: string, root: string): Promise<string> {
-  const rel = await targetRelativeToRoot(targetPath, root);
-  return confineUnderRoot(rel, root, { mustExist: false });
+async function reconfineTarget(io: ConfineIo, targetPath: string, root: string): Promise<string> {
+  const rel = await targetRelativeToRoot(io, targetPath, root);
+  return io.confineTarget(rel, root);
 }
 
 /**
@@ -394,9 +428,14 @@ async function reconfineTarget(targetPath: string, root: string): Promise<string
  * journal's own revert path uses, rather than hand-rolling a second unlink.
  */
 export async function confinedUnlink(targetPath: string, root: string): Promise<void> {
-  const confinedPath = await reconfineTarget(targetPath, root);
+  return confinedUnlinkFrom(diskJournalRestoreIo, targetPath, root);
+}
+
+/** THE ONE BODY of {@link confinedUnlink}: the re-confinement is OUTSIDE the try, and EVERY removal error is swallowed (incumbent). */
+export async function confinedUnlinkFrom(io: UnlinkIo, targetPath: string, root: string): Promise<void> {
+  const confinedPath = await reconfineTarget(io, targetPath, root);
   try {
-    await unlink(confinedPath);
+    await io.removeLeaf(confinedPath);
   } catch {
     // Already absent — the pre-state is already satisfied.
   }
@@ -405,18 +444,23 @@ export async function confinedUnlink(targetPath: string, root: string): Promise<
 /**
  * Revert one target to its recorded pre-state (restore prior bytes or delete).
  * Each branch RE-CONFINES `entry.targetPath` under root immediately before
- * acting and routes content through the hardened {@link atomicWrite}
+ * acting and routes content through the hardened `atomicWrite`
  * (`confineRoot:root`) — never a raw `mkdir`+`writeFile` to a previously-confined
  * path — so a parent-dir swap to an escaping symlink after the replay-time
  * {@link allTargetsConfined} gate can never drive a write/delete outside the
  * project. Exported as an internal seam for {@link recoverJournalBeforeCompile}.
  */
 export async function revertEntry(entry: JournalEntry, root: string): Promise<void> {
+  return revertEntryFrom(diskJournalRestoreIo, entry, root);
+}
+
+/** THE ONE BODY of {@link revertEntry}: re-confine BEFORE decoding, refuse non-canonical base64, restore against the real root. */
+export async function revertEntryFrom(io: RevertIo, entry: JournalEntry, root: string): Promise<void> {
   if (entry.preState.absent) {
-    await confinedUnlink(entry.targetPath, root);
+    await confinedUnlinkFrom(io, entry.targetPath, root);
     return;
   }
-  const confinedPath = await reconfineTarget(entry.targetPath, root);
+  const confinedPath = await reconfineTarget(io, entry.targetPath, root);
   // Decode per the entry's recorded encoding: the raw string for a UTF-8
   // (legacy) entry — byte-identical to the pre-discriminant behavior — or the
   // decoded Buffer for a base64 entry. Null means non-canonical base64, which
@@ -427,8 +471,8 @@ export async function revertEntry(entry: JournalEntry, root: string): Promise<vo
   // `confinedPath` is resolved against realpath(root); pass that SAME canonical
   // root form to atomicWrite so its relative-path confine check is invariant to
   // the symlink form root was supplied in (e.g. /var vs /private/var on macOS).
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
-  await atomicWrite(confinedPath, restored, { confineRoot: realRoot });
+  const realRoot = (await io.safeRealPath(root)) ?? path.resolve(root);
+  await io.replaceLeafContentWithin(realRoot, confinedPath, restored);
 }
 
 /** Validate one parsed entry has a string `targetPath` and a well-formed `preState`. */
@@ -468,12 +512,13 @@ function isValidBatchShape(parsed: unknown): parsed is Omit<JournalBatch, "root"
 }
 
 /**
- * Parse a single journal file, returning null on unreadable/malformed/unshaped
- * input. Exported as an internal seam for {@link recoverJournalBeforeCompile}.
+ * PURE. Parse one journal file's text and validate its shape, returning what
+ * was parsed or null for unparseable or misshapen input. It reads nothing and
+ * attaches NO root: a `root` the file itself carries is still in the returned
+ * object at run time and MUST NOT be trusted or read. {@link loadBatch} replaces
+ * it; the shared classifier never looks at it.
  */
-export async function loadBatch(root: string, batchId: string): Promise<JournalBatch | null> {
-  const raw = await readOrNull(journalPath(root, batchId));
-  if (raw === null) return null;
+export function parseJournalBatch(raw: string): Omit<JournalBatch, "root"> | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -481,6 +526,26 @@ export async function loadBatch(root: string, batchId: string): Promise<JournalB
     return null;
   }
   if (!isValidBatchShape(parsed)) return null;
+  return parsed;
+}
+
+/**
+ * Parse a single journal file, returning null on unreadable/malformed/unshaped
+ * input. Exported as an internal seam for {@link recoverJournalBeforeCompile}.
+ */
+export async function loadBatch(root: string, batchId: string): Promise<JournalBatch | null> {
+  return loadBatchFrom(diskJournalRestoreIo, root, batchId);
+}
+
+/** THE ONE BODY of {@link loadBatch}: a no-follow read, null on any refusal or bad parse, and the caller's root replaces the file's. */
+export async function loadBatchFrom(io: Pick<JournalRestoreIo, "readLeafTextNoFollow">, root: string, batchId: string): Promise<JournalBatch | null> {
+  // No-follow read: a planted `<id>.json` symlink is not followed out of tree,
+  // and any refused or failed read is `null`, so the batch is simply not loadable.
+  const raw = await io.readLeafTextNoFollow(journalPath(root, batchId));
+  if (raw === null) return null;
+  const parsed = parseJournalBatch(raw);
+  if (parsed === null) return null;
+  // The caller's root REPLACES any `root` the file carries.
   return { ...parsed, root };
 }
 
@@ -491,15 +556,15 @@ export async function loadBatch(root: string, batchId: string): Promise<JournalB
  * invariant is NEVER to write or move outside the project root, so we delete it
  * rather than follow the escaping symlink.
  */
-async function removeUntrustedInPlace(root: string, batchId: string): Promise<void> {
+async function removeUntrustedInPlace(io: UnlinkIo, notes: JournalNote, root: string, batchId: string): Promise<void> {
   try {
-    const rel = await targetRelativeToRoot(journalPath(root, batchId), root);
-    const confinedJournal = await confineUnderRoot(rel, root, { mustExist: false });
-    await unlink(confinedJournal);
+    const confinedJournal = await reconfineTarget(io, journalPath(root, batchId), root);
+    await io.removeLeaf(confinedJournal);
   } catch {
     // Journal path itself escapes/cannot be confined — touch nothing outside root.
   }
-  note(`⚠ Untrusted journal ${batchId}.json could not be safely quarantined — removed.`);
+  // Inherited: announced as removed even when the removal above failed.
+  notes(`⚠ Untrusted journal ${batchId}.json could not be safely quarantined — removed.`);
 }
 
 /**
@@ -509,18 +574,17 @@ async function removeUntrustedInPlace(root: string, batchId: string): Promise<vo
  * file outside the project. If confinement fails, the journal is removed in
  * place instead via {@link removeUntrustedInPlace}.
  */
-async function quarantineBatch(root: string, batchId: string): Promise<void> {
+async function quarantineBatch(io: QuarantineIo, notes: JournalNote, root: string, batchId: string): Promise<void> {
   let dest: string;
   try {
-    const rel = await targetRelativeToRoot(quarantinePath(root, batchId), root);
-    dest = await confineUnderRoot(rel, root, { mustExist: false });
+    dest = await reconfineTarget(io, quarantinePath(root, batchId), root);
   } catch {
-    await removeUntrustedInPlace(root, batchId);
+    await removeUntrustedInPlace(io, notes, root, batchId);
     return;
   }
-  await mkdir(path.dirname(dest), { recursive: true });
-  await rename(journalPath(root, batchId), dest);
-  note(`⚠ Untrusted journal ${batchId}.json quarantined to ${dest} — not replayed.`);
+  await io.makeDirectoryTree(path.dirname(dest));
+  await io.renameLeafUnguarded(journalPath(root, batchId), dest);
+  notes(`⚠ Untrusted journal ${batchId}.json quarantined to ${dest} — not replayed.`);
 }
 
 /**
@@ -529,10 +593,12 @@ async function quarantineBatch(root: string, batchId: string): Promise<void> {
  * `/private/var/...` on macOS). An absolute target under either the literal or
  * the realpath'd root is reduced to its in-root remainder; a target that lies
  * outside both forms is returned unchanged so {@link confineUnderRoot} rejects it.
+ * ONE body: the bound capture, restoration, quarantine and replay all pass
+ * their own raw I/O.
  */
-async function targetRelativeToRoot(targetPath: string, root: string): Promise<string> {
+async function targetRelativeToRoot(io: Pick<JournalBatchIo, "realPath">, targetPath: string, root: string): Promise<string> {
   if (!path.isAbsolute(targetPath)) return targetPath;
-  const realRoot = (await realpath(root).catch(() => null)) ?? path.resolve(root);
+  const realRoot = (await io.realPath(root).catch(() => null)) ?? path.resolve(root);
   for (const base of [path.resolve(root), realRoot]) {
     const rel = path.relative(base, targetPath);
     if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
@@ -549,15 +615,36 @@ async function targetRelativeToRoot(targetPath: string, root: string): Promise<s
  * an internal seam for {@link recoverJournalBeforeCompile}.
  */
 export async function allTargetsConfined(batch: JournalBatch): Promise<boolean> {
+  return allTargetsConfinedFrom(diskJournalRestoreIo, batch);
+}
+
+/** THE ONE BODY of {@link allTargetsConfined}: sequential, stopping at the first target that does not confine. */
+export async function allTargetsConfinedFrom(io: ConfineIo, batch: JournalBatch): Promise<boolean> {
   for (const entry of batch.entries) {
-    try {
-      const rel = await targetRelativeToRoot(entry.targetPath, batch.root);
-      await confineUnderRoot(rel, batch.root, { mustExist: false });
-    } catch {
-      return false; // a target escapes root → untrusted batch
-    }
+    // a target escapes root → untrusted batch
+    if (!(await targetConfinedUnderRootFrom(io, entry.targetPath, batch.root))) return false;
   }
   return true;
+}
+
+/**
+ * LOCAL DISK. Whether ONE recorded target confines under `root`, by either
+ * spelling of the root ({@link targetRelativeToRoot}), without requiring it to
+ * exist. Never rejects: every refusal and failure is `false`. The one check
+ * {@link allTargetsConfined} and the shared classifier both apply per target.
+ */
+export async function targetConfinedUnderRoot(targetPath: string, root: string): Promise<boolean> {
+  return targetConfinedUnderRootFrom(diskJournalRestoreIo, targetPath, root);
+}
+
+/** THE ONE BODY of {@link targetConfinedUnderRoot}: every refusal and failure is `false`. */
+export async function targetConfinedUnderRootFrom(io: ConfineIo, targetPath: string, root: string): Promise<boolean> {
+  try {
+    await reconfineTarget(io, targetPath, root);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -566,26 +653,26 @@ export async function allTargetsConfined(batch: JournalBatch): Promise<boolean> 
  * {@link allTargetsConfined} pass remains the whole-batch trust gate (any escaping
  * target quarantines the batch before this runs).
  */
-async function resolvePending(batch: JournalBatch): Promise<void> {
+async function resolvePending(io: RevertIo, batch: JournalBatch): Promise<void> {
   for (const entry of batch.entries) {
-    await revertEntry(entry, batch.root);
+    await revertEntryFrom(io, entry, batch.root);
   }
-  await unlink(journalPath(batch.root, batch.batchId));
+  await io.removeLeaf(journalPath(batch.root, batch.batchId));
 }
 
 /** Replay (or quarantine) one pending batch loaded from `batchId`. */
-async function replayPending(root: string, batchId: string): Promise<void> {
-  const batch = await loadBatch(root, batchId);
+async function replayPending(io: JournalReplayIo, notes: JournalNote, root: string, batchId: string): Promise<void> {
+  const batch = await loadBatchFrom(io, root, batchId);
   if (batch === null) {
-    await quarantineBatch(root, batchId); // unreadable JSON or malformed shape
+    await quarantineBatch(io, notes, root, batchId); // unreadable JSON or malformed shape
     return;
   }
   if (batch.status !== "pending") return; // committed → leave untouched
-  if (!(await allTargetsConfined(batch))) {
-    await quarantineBatch(root, batchId); // a target escapes root
+  if (!(await allTargetsConfinedFrom(io, batch))) {
+    await quarantineBatch(io, notes, root, batchId); // a target escapes root
     return;
   }
-  await resolvePending(batch);
+  await resolvePending(io, batch);
 }
 
 /**
@@ -609,9 +696,18 @@ export type JournalDirState =
  * @param root - Absolute project root whose journal directory is classified.
  */
 export async function classifyJournalDir(root: string): Promise<JournalDirState> {
-  const realDir = await safeRealpath(journalDir(root));
+  return classifyJournalDirFrom(diskJournalRestoreIo, root);
+}
+
+/**
+ * THE ONE BODY of {@link classifyJournalDir}. A null realpath for the directory
+ * means `absent` — any failure, not only ENOENT: the inherited fault-to-free
+ * behaviour (F5), kept as it is and not claimed safe for a hosted store.
+ */
+export async function classifyJournalDirFrom(io: Pick<JournalRestoreIo, "safeRealPath">, root: string): Promise<JournalDirState> {
+  const realDir = await io.safeRealPath(journalDir(root));
   if (realDir === null) return { kind: "absent" };
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
+  const realRoot = (await io.safeRealPath(root)) ?? path.resolve(root);
   if (!isInsideDir(realDir, realRoot)) return { kind: "escape" };
   return { kind: "ok", dir: realDir };
 }
@@ -623,11 +719,13 @@ export async function classifyJournalDir(root: string): Promise<JournalDirState>
  * but is a symlink escaping root (filesystem tampering → fail closed). A null
  * caused by escape is announced via {@link note} before returning.
  */
-async function resolveConfinedJournalDir(root: string): Promise<string | null> {
-  const state = await classifyJournalDir(root);
+async function resolveConfinedJournalDir(
+  io: Pick<JournalRestoreIo, "safeRealPath">, notes: JournalNote, root: string,
+): Promise<string | null> {
+  const state = await classifyJournalDirFrom(io, root);
   if (state.kind === "absent") return null; // nothing pending
   if (state.kind === "escape") {
-    note(`⚠ Journal directory escapes project root — refusing to replay (tampering).`);
+    notes(`⚠ Journal directory escapes project root — refusing to replay (tampering).`);
     return null;
   }
   return state.dir;
@@ -660,16 +758,25 @@ async function resolveConfinedJournalDir(root: string): Promise<string | null> {
  * @param root - Absolute project root whose journal directory is replayed.
  */
 export async function replayJournal(root: string): Promise<void> {
-  const confinedDir = await resolveConfinedJournalDir(root);
+  return replayJournalFrom(diskJournalReplayIo, note, root);
+}
+
+/**
+ * THE ONE BODY of {@link replayJournal}, over the given raw I/O, with every
+ * diagnostic sent to `notes`. A listing failure of ANY kind is "nothing
+ * pending" (inherited); names are taken in the order the store lists them.
+ */
+export async function replayJournalFrom(io: JournalReplayIo, notes: JournalNote, root: string): Promise<void> {
+  const confinedDir = await resolveConfinedJournalDir(io, notes, root);
   if (confinedDir === null) return; // absent or escaping → nothing safe to replay
   let files: string[];
   try {
-    files = await readdir(confinedDir);
+    files = await io.listDirectoryNames(confinedDir);
   } catch {
     return; // no journal directory → nothing pending
   }
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
-    await replayPending(root, file.replace(/\.json$/, ""));
+    await replayPending(io, notes, root, file.replace(/\.json$/, ""));
   }
 }

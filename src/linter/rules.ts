@@ -12,6 +12,12 @@
  * `src/linter/index.ts` and every other importer see a single `rules.js`
  * surface unchanged. Shared walk helpers live in
  * {@link file://./rules-shared.ts} to keep the families cycle-free.
+ *
+ * Every rule hosted here has ONE BODY, its `...From` form, which holds no
+ * project root and reaches the project only through the sources it is given.
+ * The root-taking rule of the same name is a delegate that builds the local
+ * disk sources for that one call. Each body still collects the pages itself,
+ * so a lint run reads the wiki once per rule exactly as before.
  */
 
 import path from "path";
@@ -27,10 +33,14 @@ import {
 import type { LintResult } from "./types.js";
 import { computeFreshness } from "../freshness/index.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
-import { listLinkResolvablePendingSlugs } from "../compiler/candidates.js";
+import { listLinkResolvablePendingSlugsFrom } from "../compiler/candidate-read.js";
 import {
   CITATION_PATTERN,
-  collectAllPages,
+  collectAllPagesFrom,
+  diskLintLinkSources,
+  diskLintPageSources,
+  type LintLinkSources,
+  type LintPageSources,
   type PageScope,
 } from "./rules-shared.js";
 import { findWikilinks } from "../wiki/wikilinks.js";
@@ -41,6 +51,7 @@ export { collectAllPages } from "./rules-shared.js";
 export {
   checkBrokenCitations,
   checkPageBrokenCitations,
+  checkPageBrokenCitationsFrom,
   checkMalformedClaimCitations,
   checkPageMalformedCitations,
 } from "./rules-citations.js";
@@ -71,10 +82,15 @@ function buildPageSlugSet(
 
 /** Find [[Title]] wikilinks that don't match any existing wiki page. */
 export async function checkBrokenWikilinks(root: string, scope: PageScope = "generic"): Promise<LintResult[]> {
+  return checkBrokenWikilinksFrom(diskLintLinkSources(root), scope);
+}
+
+/** {@link checkBrokenWikilinks} through `sources`: THE ONE BODY. The pages under `scope`, then the pending candidates. */
+export async function checkBrokenWikilinksFrom(sources: LintLinkSources, scope: PageScope = "generic"): Promise<LintResult[]> {
   // Existing profile projects also retain public default coverage.
-  const pages = await collectAllPages(root, scope);
+  const pages = await collectAllPagesFrom(sources.pages, scope);
   const existingSlugs = buildPageSlugSet(pages);
-  const pendingSlugs = await listLinkResolvablePendingSlugs(root);
+  const pendingSlugs = await listLinkResolvablePendingSlugsFrom(sources.candidates);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -106,7 +122,12 @@ export async function checkBrokenWikilinks(root: string, scope: PageScope = "gen
 
 /** Find pages with `orphaned: true` in their frontmatter. */
 export async function checkOrphanedPages(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkOrphanedPagesFrom(diskLintPageSources(root));
+}
+
+/** {@link checkOrphanedPages} through `sources`: THE ONE BODY. */
+export async function checkOrphanedPagesFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -135,7 +156,12 @@ export async function checkOrphanedPages(root: string): Promise<LintResult[]> {
  * source-hash pass happens once per lint run.
  */
 export async function checkStalePages(root: string, snapshot: FreshnessSnapshot): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkStalePagesFrom(diskLintPageSources(root), snapshot);
+}
+
+/** {@link checkStalePages} through `sources`: THE ONE BODY. The snapshot is the caller's, as before. */
+export async function checkStalePagesFrom(sources: LintPageSources, snapshot: FreshnessSnapshot): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
   for (const page of pages) {
     const { meta } = parseFrontmatter(page.content);
@@ -164,7 +190,12 @@ export async function checkStalePages(root: string, snapshot: FreshnessSnapshot)
 
 /** Find pages with empty or missing `summary` in frontmatter. */
 export async function checkMissingSummaries(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkMissingSummariesFrom(diskLintPageSources(root));
+}
+
+/** {@link checkMissingSummaries} through `sources`: THE ONE BODY. */
+export async function checkMissingSummariesFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -187,7 +218,12 @@ export async function checkMissingSummaries(root: string): Promise<LintResult[]>
 
 /** Find multiple pages whose titles match case-insensitively. */
 export async function checkDuplicateConcepts(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkDuplicateConceptsFrom(diskLintPageSources(root));
+}
+
+/** {@link checkDuplicateConcepts} through `sources`: THE ONE BODY. */
+export async function checkDuplicateConceptsFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const titleMap = new Map<string, string[]>();
 
   for (const page of pages) {
@@ -219,7 +255,12 @@ export async function checkDuplicateConcepts(root: string): Promise<LintResult[]
 
 /** Find pages with frontmatter but very short or empty body content. */
 export async function checkEmptyPages(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkEmptyPagesFrom(diskLintPageSources(root));
+}
+
+/** {@link checkEmptyPages} through `sources`: THE ONE BODY. */
+export async function checkEmptyPagesFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -265,7 +306,12 @@ export function checkPageEmpty(page: {
  * backward-compatibility with pre-existing wikis.
  */
 export async function checkLowConfidencePages(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkLowConfidencePagesFrom(diskLintPageSources(root));
+}
+
+/** {@link checkLowConfidencePages} through `sources`: THE ONE BODY. */
+export async function checkLowConfidencePagesFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -285,7 +331,12 @@ export async function checkLowConfidencePages(root: string): Promise<LintResult[
 
 /** Flag pages whose frontmatter records contradictions with other pages. */
 export async function checkContradictedPages(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkContradictedPagesFrom(diskLintPageSources(root));
+}
+
+/** {@link checkContradictedPages} through `sources`: THE ONE BODY. */
+export async function checkContradictedPagesFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {
@@ -315,7 +366,12 @@ export async function checkContradictedPages(root: string): Promise<LintResult[]
  * reviewer would see and survives hand-edits.
  */
 export async function checkInferredWithoutCitations(root: string): Promise<LintResult[]> {
-  const pages = await collectAllPages(root);
+  return checkInferredWithoutCitationsFrom(diskLintPageSources(root));
+}
+
+/** {@link checkInferredWithoutCitations} through `sources`: THE ONE BODY. */
+export async function checkInferredWithoutCitationsFrom(sources: LintPageSources): Promise<LintResult[]> {
+  const pages = await collectAllPagesFrom(sources);
   const results: LintResult[] = [];
 
   for (const page of pages) {

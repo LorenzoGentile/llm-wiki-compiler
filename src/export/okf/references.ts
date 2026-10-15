@@ -6,6 +6,10 @@
  * is the single source of truth for WHICH cited files are actually bundled: a file is
  * kept only if it exists and realpaths inside `sources/`. Rendering keys citation links
  * off this same map, so a doc never links a `/references/` file that was not copied.
+ *
+ * ONE BODY, {@link resolveReferencesFrom}, over a real-path look; the root form
+ * hands it the local disk's `safeRealpath`. The inside-`sources/` decision is
+ * the body's, not the look's.
  */
 import path from "path";
 import { safeRealpath, isInsideDir } from "../../utils/path-confine.js";
@@ -49,11 +53,25 @@ export async function resolveReferences(
   root: string,
   pages: ExportPage[],
 ): Promise<Map<string, ResolvedReference>> {
+  return resolveReferencesFrom(safeRealpath, root, pages);
+}
+
+/**
+ * {@link resolveReferences} over a real-path look: THE ONE BODY. The sources
+ * directory is looked up once, then each cited file in citation order.
+ *
+ * @param realpath - The real path of a location, or `null` when it does not resolve.
+ */
+export async function resolveReferencesFrom(
+  realpath: (location: string) => Promise<string | null>,
+  root: string,
+  pages: ExportPage[],
+): Promise<Map<string, ResolvedReference>> {
   const resolved = new Map<string, ResolvedReference>();
   // Canonicalize sources dir so isInsideDir works on macOS (/private/var vs /var).
-  const sourcesDir = (await safeRealpath(path.join(root, SOURCES_DIR))) ?? path.join(root, SOURCES_DIR);
+  const sourcesDir = (await realpath(path.join(root, SOURCES_DIR))) ?? path.join(root, SOURCES_DIR);
   for (const file of collectReferenceFiles(pages)) {
-    const realSrc = await safeRealpath(path.join(sourcesDir, file));
+    const realSrc = await realpath(path.join(sourcesDir, file));
     if (!realSrc || !isInsideDir(realSrc, sourcesDir)) continue;
     resolved.set(file, { srcAbs: realSrc, destName: safeRefName(file) });
   }

@@ -31,6 +31,17 @@
  *
  * The custody input is assembled field by field rather than by spreading the
  * adapter's plan, so an adapter cannot introduce a field the driver did not name.
+ *
+ * ONE BODY. {@link runLifecycleCustodyOperationWith} owns every phase decision
+ * (the request seal before the first await, the in-flight guard, the one
+ * capture, reauthorization against it before assess, the plan seal, the
+ * planKind check before the permit and materialize, the engine chosen by plan
+ * kind, and completion only after the durable receipt) over
+ * {@link LifecycleDriverSteps}: the root identity the in-flight guard keys on,
+ * the read lease and the three custody engines. The project root is only the
+ * opaque handle the existing adapter contract and engine inputs already carry;
+ * the body reads nothing through it. {@link runLifecycleCustodyOperation} keeps its signature
+ * and passes the local steps, which call the incumbent lease and engines.
  */
 
 import { evaluateDestructiveAuthorization } from "../operation-bundles/lock-gate.js";
@@ -43,9 +54,11 @@ import { canonicalPreparationRootIdentity } from "./lifecycle-fs/namespace.js";
 import {
   withPreparationLifecycleRead, type PreparationLifecycleReadV1,
 } from "./lifecycle-snapshot/read.js";
-import { runTwoPhaseQuarantine, type QuarantineMoveFaultsForTest, type ScopedQuarantineObject } from "./quarantine-move.js";
-import { runTwoPhaseVerifiedDelete, type DeleteFaultsForTest } from "./prune-delete.js";
-import { destroySettledQuarantineUnit } from "./quarantine-destroy.js";
+import {
+  runTwoPhaseQuarantine, type QuarantineMoveFaultsForTest, type QuarantineMoveInput, type ScopedQuarantineObject,
+} from "./quarantine-move.js";
+import { runTwoPhaseVerifiedDelete, type DeleteFaultsForTest, type VerifiedDeleteEngineInput } from "./prune-delete.js";
+import { destroySettledQuarantineUnit, type VerifiedDestroyEngineInput } from "./quarantine-destroy.js";
 import type {
   PruneReceiptContentV1, PruneReceiptV1,
   QuarantineReason, QuarantineReceiptV1, QuarantineScope, RetiredQuarantineUnitV1,
@@ -242,6 +255,37 @@ export interface LifecycleCustodyAdapter<
 const custodyOperationsInFlight = new Set<string>();
 
 /**
+ * The disk mechanisms the driver's phases reach: the lifecycle read lease and
+ * the three custody engines. No member takes a project root; each engine input
+ * carries the opaque `root` handle its incumbent already takes.
+ */
+export interface LifecycleDriverSteps {
+  /** The project's canonical identity, the in-flight guard's key (any alias of one project yields the same value). */
+  rootIdentity(): Promise<string>;
+  /** Take exactly ONE lifecycle capture under its read lease, hand it to `consume`, and close the lease. */
+  withRead<T>(consume: (read: PreparationLifecycleReadV1) => Promise<T> | T): Promise<T>;
+  /** The two-phase custody move. */
+  moveEngine(input: QuarantineMoveInput): Promise<QuarantineReceiptV1>;
+  /** The two-phase verified delete. */
+  verifiedDeleteEngine(input: VerifiedDeleteEngineInput): Promise<PruneReceiptV1>;
+  /** The permit-gated destroy of a settled quarantine unit. */
+  destroyEngine(input: VerifiedDestroyEngineInput): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent root identity and read lease for `root` and the three engines, each called when asked. */
+function diskLifecycleDriverSteps(root: string): LifecycleDriverSteps {
+  return {
+    rootIdentity: () => canonicalPreparationRootIdentity(root),
+    withRead<T>(consume: (read: PreparationLifecycleReadV1) => Promise<T> | T): Promise<T> {
+      return withPreparationLifecycleRead(root, consume);
+    },
+    moveEngine: (input) => runTwoPhaseQuarantine(input),
+    verifiedDeleteEngine: (input) => runTwoPhaseVerifiedDelete(input),
+    destroyEngine: (input) => destroySettledQuarantineUnit(input),
+  };
+}
+
+/**
  * Freeze the draft, the arrays it carries, AND their elements.
  *
  * Freezing only the arrays left every field the receipt actually attests still
@@ -343,6 +387,18 @@ export async function runLifecycleCustodyOperation<
   adapter: LifecycleCustodyAdapter<TInput, K>,
   input: TInput,
 ): Promise<LifecycleReceiptOfKind<K>> {
+  return runLifecycleCustodyOperationWith(diskLifecycleDriverSteps(root), root, adapter, input);
+}
+
+/** {@link runLifecycleCustodyOperation} over {@link LifecycleDriverSteps}: THE ONE BODY. `root` is an opaque handle. */
+export async function runLifecycleCustodyOperationWith<
+  TInput extends LifecycleCustodyRequest, K extends LifecyclePlanKind,
+>(
+  steps: LifecycleDriverSteps,
+  root: string,
+  adapter: LifecycleCustodyAdapter<TInput, K>,
+  input: TInput,
+): Promise<LifecycleReceiptOfKind<K>> {
   // BEFORE THE FIRST AWAIT. An earlier version copied these after `assess`
   // resolved, which left the whole asynchronous assessment as a mutation window:
   // review reproduced changing `actor` and `at` while assess was pending, and the
@@ -355,7 +411,7 @@ export async function runLifecycleCustodyOperation<
   // concurrent operation on the same project with the guard none the wiser.
   // Resolution happens before the check, and the has/add pair stays synchronous
   // and adjacent, so no second caller can interleave between them.
-  const canonicalRoot = await canonicalPreparationRootIdentity(root);
+  const canonicalRoot = await steps.rootIdentity();
   if (custodyOperationsInFlight.has(canonicalRoot)) {
     throw new Error(`a custody operation is already in flight for ${canonicalRoot}; the driver is not re-entrant`);
   }
@@ -364,7 +420,7 @@ export async function runLifecycleCustodyOperation<
     // The `await` is LOAD-BEARING: without it the `finally` releases the root
     // before the operation settles and the guard stops guarding. Lint rules that
     // flag `return await` will tell you to delete it. Do not — a test pins this.
-    return await driveCustodyOperation(root, adapter, sealed);
+    return await driveCustodyOperation(steps, root, adapter, sealed);
   } finally {
     custodyOperationsInFlight.delete(canonicalRoot);
   }
@@ -399,13 +455,14 @@ function sealCustodyRequest<TInput extends LifecycleCustodyRequest>(input: TInpu
  */
 /** The custody-move engine input, named field by field. */
 async function runCustodyMove(
+  steps: LifecycleDriverSteps,
   root: string,
   plan: LifecycleCustodyMovePlan,
   key: LifecycleGoverningKey,
   permit: LifecycleMutationPermitV1,
   attested: { actor: PreparationPrincipalV1; at: string; faults?: QuarantineMoveFaultsForTest | DeleteFaultsForTest },
 ): Promise<QuarantineReceiptV1> {
-  return runTwoPhaseQuarantine({
+  return steps.moveEngine({
     permit,
     root,
     unitId: plan.unitId,
@@ -424,20 +481,21 @@ async function runCustodyMove(
 }
 
 async function runPlanEngine(
+  steps: LifecycleDriverSteps,
   root: string,
   plan: LifecycleCustodyPlan,
   key: LifecycleGoverningKey,
   permit: LifecycleMutationPermitV1,
   attested: { actor: PreparationPrincipalV1; at: string; faults?: QuarantineMoveFaultsForTest | DeleteFaultsForTest },
 ): Promise<QuarantineReceiptV1 | PruneReceiptV1> {
-  if (plan.kind === "custody-move") return runCustodyMove(root, plan, key, permit, attested);
+  if (plan.kind === "custody-move") return runCustodyMove(steps, root, plan, key, permit, attested);
   if (plan.kind === "verified-destroy") {
-    await destroySettledQuarantineUnit({
+    await steps.destroyEngine({
       permit, root, unitId: plan.unitId, objects: plan.objects,
     });
     return plan.settled;
   }
-  return runTwoPhaseVerifiedDelete({
+  return steps.verifiedDeleteEngine({
     permit,
     root,
     unitId: plan.unitId,
@@ -531,6 +589,7 @@ function describeTicket(ticket: LifecycleGateTicketV1 | null): string {
 async function driveCustodyOperation<
   TInput extends LifecycleCustodyRequest, K extends LifecyclePlanKind,
 >(
+  steps: LifecycleDriverSteps,
   root: string,
   adapter: LifecycleCustodyAdapter<TInput, K>,
   input: TInput,
@@ -552,7 +611,7 @@ async function driveCustodyOperation<
   //
   // So the gate's decision is RE-EVALUATED here, against this capture, by
   // calling the gate's own predicate rather than a local equivalent.
-  const assessment = await withPreparationLifecycleRead(root, (read) => {
+  const assessment = await steps.withRead((read) => {
     reauthorizeAgainstCapture(input.authorization, read);
     return adapter.assess(root, input, read);
   });
@@ -585,7 +644,7 @@ async function driveCustodyOperation<
   // that `plan.kind` and `K` are the same discriminant through the adapter. Every
   // OTHER site -- adapter, assessment, complete -- is checked, so a wrong pairing
   // is caught there rather than here.
-  const receipt = await runPlanEngine(root, plan, key, permit, attested) as LifecycleReceiptOfKind<K>;
+  const receipt = await runPlanEngine(steps, root, plan, key, permit, attested) as LifecycleReceiptOfKind<K>;
   // AFTER the receipt is durable, still inside the driver, still under the same
   // permit. Anything here runs only because the operation genuinely completed.
   await adapter.complete?.(root, input, receipt, permit);

@@ -105,6 +105,32 @@ export async function openFileNoFollow(file: string, flags: number, mode?: numbe
   return openPortable(file, nonBlocking, mode, true);
 }
 
+/** What a capped text read of an already-open leaf found: over the cap (its size, never read), or its text. */
+type OpenedCappedText = { kind: "oversize"; size: number } | { kind: "text"; text: string };
+
+/**
+ * THE POST-OPEN TAIL of a capped text read, for a handle its caller has ALREADY
+ * opened under that caller's own policy. It TAKES OWNERSHIP of `handle`: the
+ * caller must not use or close it afterwards. This opens nothing, confines
+ * nothing and maps no error; what a failed open means stays with each caller.
+ *
+ * Order: `stat` the HANDLE, compare its size with `maxBytes`, and read the
+ * whole leaf as text only when it is within the cap (Node's own lenient
+ * `"utf-8"` decoding). An over-cap leaf is `oversize` with its size and is
+ * NEVER read. A failed `stat` or a failed read REJECTS with the raw error.
+ * `close` runs in `finally`, exactly once, and a failing `close` rejects too,
+ * replacing a result or an earlier rejection.
+ */
+export async function readOpenedTextWithinCap(handle: FileHandle, maxBytes: number): Promise<OpenedCappedText> {
+  try {
+    const size = (await handle.stat()).size;
+    if (size > maxBytes) return { kind: "oversize", size };
+    return { kind: "text", text: await handle.readFile("utf-8") };
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Close and refuse a handle to anything but a regular file (a FIFO, device, directory or socket). */
 async function requireRegularHandle(handle: FileHandle): Promise<FileHandle> {
   try {

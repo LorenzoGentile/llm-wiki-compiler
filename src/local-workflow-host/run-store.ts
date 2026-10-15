@@ -1,6 +1,12 @@
 /**
  * @file src/local-workflow-host/run-store.ts
  * @description Compiler-owned confined, signed local-run persistence. Callers hold the project mutation lock; the constructed host additionally checks its transaction lease.
+ *
+ * ONE BODY EACH: {@link writeRunWith} and {@link writeRunCandidatesWith} keep the
+ * run-id gate, the lazy one-key signing, the size cap and the candidate fallback
+ * over {@link RunRecordStore}. The root forms pass {@link diskRunRecordStore}, whose
+ * key is the incumbent {@link loadOrCreateRunKey} and whose persistence is the
+ * incumbent confined durable write, both called when asked.
  */
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -42,6 +48,22 @@ async function ensureRunsDir(privateDir: string): Promise<string> {
 
 
 
+/** What run persistence asks of the project. No member takes a project root. */
+export interface RunRecordStore {
+  /** The per-project run HMAC key, created if absent (the caller holds the lock). */
+  loadKey(): Promise<Buffer>;
+  /** Persist already-serialized run JSON as `<runId>.json`, confined and durable. */
+  persist(runId: string, json: string): Promise<void>;
+}
+
+/** LOCAL DISK: the incumbent key load and confined persistence for one root, built per call. In no package index. */
+function diskRunRecordStore(root: string): RunRecordStore {
+  return {
+    loadKey: () => loadOrCreateRunKey(root),
+    persist: (runId, json) => persistRunJson(root, runId, json),
+  };
+}
+
 /**
  * Persist a run record to `.llmwiki/workflows/runs/<runId>.json`.
  *
@@ -61,12 +83,17 @@ async function ensureRunsDir(privateDir: string): Promise<string> {
  * @throws {WorkflowRunTooLargeError} If the serialized record exceeds the byte cap.
  */
 export async function writeRun(root: string, run: WorkflowRun): Promise<void> {
+  return writeRunWith(diskRunRecordStore(root), run);
+}
+
+/** {@link writeRun} over {@link RunRecordStore}: THE ONE BODY. */
+export async function writeRunWith(store: RunRecordStore, run: WorkflowRun): Promise<void> {
   if (!isValidRunId(run.runId)) {
     throw new WorkflowRunIdError(`not slug-safe or too long: ${JSON.stringify(run.runId.slice(0, 64))}`);
   }
-  const stamped = await stampRunIntegrity(root, run);
+  const stamped = await stampRunIntegrity(store, run);
   const json = serializeRunWithinCap(stamped);
-  await persistRunJson(root, stamped.runId, json);
+  await store.persist(stamped.runId, json);
 }
 
 /** Persist the first fitting engine-supplied representation, signing each with one project key.
@@ -74,7 +101,12 @@ export async function writeRun(root: string, run: WorkflowRun): Promise<void> {
  * when needed. Core owns size enforcement and custody, not terminal compaction policy.
  */
 export async function writeRunCandidates(root: string, candidates: Iterable<WorkflowRun>): Promise<WorkflowRun> {
-  let key: Awaited<ReturnType<typeof loadOrCreateRunKey>> | undefined;
+  return writeRunCandidatesWith(diskRunRecordStore(root), candidates);
+}
+
+/** {@link writeRunCandidates} over {@link RunRecordStore}: THE ONE BODY. */
+export async function writeRunCandidatesWith(store: RunRecordStore, candidates: Iterable<WorkflowRun>): Promise<WorkflowRun> {
+  let key: Buffer | undefined;
   let runId: string | undefined;
   let oversized: WorkflowRunTooLargeError | undefined;
   for (const candidate of candidates) {
@@ -82,7 +114,7 @@ export async function writeRunCandidates(root: string, candidates: Iterable<Work
       throw new WorkflowRunIdError("candidate run id is invalid or changed");
     }
     runId = candidate.runId;
-    key ??= await loadOrCreateRunKey(root);
+    key ??= await store.loadKey();
     const stamped = { ...candidate, integrity: runIntegrity(key, candidate) };
     let json: string;
     try {
@@ -92,7 +124,7 @@ export async function writeRunCandidates(root: string, candidates: Iterable<Work
       oversized = error;
       continue;
     }
-    await persistRunJson(root, runId, json);
+    await store.persist(runId, json);
     return stamped;
   }
   if (oversized !== undefined) throw oversized;
@@ -108,8 +140,8 @@ export async function writeRunCandidates(root: string, candidates: Iterable<Work
  * it; a record not produced by THIS project's key cannot match. The key is
  * created-if-absent under the project lock the writer already holds.
  */
-async function stampRunIntegrity(root: string, run: WorkflowRun): Promise<WorkflowRun> {
-  const key = await loadOrCreateRunKey(root);
+async function stampRunIntegrity(store: RunRecordStore, run: WorkflowRun): Promise<WorkflowRun> {
+  const key = await store.loadKey();
   return { ...run, integrity: runIntegrity(key, run) };
 }
 

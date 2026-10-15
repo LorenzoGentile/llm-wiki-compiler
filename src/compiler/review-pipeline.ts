@@ -8,7 +8,6 @@
  * caller to commit as a journalled batch.
  */
 
-import path from "path";
 import {
   parseFrontmatter,
   parseProvenanceMetadata,
@@ -17,9 +16,8 @@ import {
 import { promptModifiersDigest } from "./prompt-modifiers.js";
 import { pickStatesForSources } from "./source-state.js";
 import { renderMergedPageContent } from "./page-renderer.js";
-import { deleteCandidateBySlug, writeCandidate } from "./candidates.js";
+import type { CompileAccess } from "./compile-access.js";
 import {
-  checkPageBrokenCitations,
   checkPageCrossLinks,
   checkPageMalformedCitations,
 } from "../linter/rules.js";
@@ -27,7 +25,6 @@ import type { LintResult } from "../linter/types.js";
 import * as output from "../utils/output.js";
 import { evaluatePolicy } from "../review/policy.js";
 import type { HeldReason, ReviewPolicy } from "../review/policy.js";
-import { SOURCES_DIR } from "../utils/constants.js";
 import type { SchemaConfig } from "../schema/index.js";
 import type {
   CompileOptions,
@@ -59,28 +56,28 @@ interface ReviewCandidateMeta {
  * written into `wiki/`.
  */
 export async function generateMergedPage(
-  root: string,
+  access: CompileAccess,
   entry: MergedConcept,
   schema: SchemaConfig,
   options: CompileOptions,
   sourceStates: SourceStateMap,
   policy: ReviewPolicy,
 ): Promise<MergedPageOutcome> {
-  const fullPage = await renderMergedPageContent(root, entry, schema);
-  const diagnostics = await collectReviewDiagnostics(root, entry, fullPage, schema);
+  const fullPage = await renderMergedPageContent(access, entry, schema);
+  const diagnostics = await collectReviewDiagnostics(access, entry, fullPage, schema);
   const signals = buildPolicySignals(fullPage, diagnostics);
   const reasons = evaluatePolicy(signals, policy);
 
   if (options.review) {
     const heldReasons = [{ code: "manual-review-requested" } as HeldReason, ...reasons];
-    return await persistReviewCandidate(root, entry, fullPage, sourceStates, diagnostics, signals, {
+    return await persistReviewCandidate(access, entry, fullPage, sourceStates, diagnostics, signals, {
       reviewMode: "forced",
       heldReasons,
     });
   }
 
   if (reasons.length > 0) {
-    return await persistReviewCandidate(root, entry, fullPage, sourceStates, diagnostics, signals, {
+    return await persistReviewCandidate(access, entry, fullPage, sourceStates, diagnostics, signals, {
       reviewMode: "policy",
       heldReasons: reasons,
     });
@@ -94,13 +91,13 @@ export async function generateMergedPage(
     output.status("!", output.warn(`Invalid page for "${entry.concept.concept}" — skipped.`));
     return { error: `Invalid page for "${entry.concept.concept}" — failed validation` };
   }
-  await deleteCandidateBySlug(root, entry.slug);
+  await access.discardCandidatesForSlug(entry.slug);
   return { liveWrite: { namespace: "concepts", slug: entry.slug, body: fullPage } };
 }
 
 /** Persist a candidate JSON record for later review and report it on stdout. */
 async function collectReviewDiagnostics(
-  root: string,
+  access: CompileAccess,
   entry: MergedConcept,
   fullPage: string,
   schema: SchemaConfig,
@@ -113,7 +110,7 @@ async function collectReviewDiagnostics(
   const virtualPath = `wiki/concepts/${entry.slug}.md`;
   const schemaViolations = checkPageCrossLinks(fullPage, virtualPath, schema);
   const provenanceViolations = await collectCandidateProvenanceViolations(
-    root,
+    access,
     fullPage,
     virtualPath,
   );
@@ -134,7 +131,7 @@ function buildPolicySignals(fullPage: string, diagnostics: ReviewDiagnostics) {
 
 /** Persist a candidate JSON record for later review and report it on stdout. */
 async function persistReviewCandidate(
-  root: string,
+  access: CompileAccess,
   entry: MergedConcept,
   fullPage: string,
   sourceStates: SourceStateMap,
@@ -142,7 +139,7 @@ async function persistReviewCandidate(
   signals: ReturnType<typeof buildPolicySignals>,
   meta: ReviewCandidateMeta,
 ): Promise<MergedPageOutcome> {
-  const candidate: ReviewCandidate = await writeCandidate(root, {
+  const candidate: ReviewCandidate = await access.emitCandidate({
     title: entry.concept.concept,
     slug: entry.slug,
     summary: entry.concept.summary,
@@ -175,15 +172,11 @@ async function persistReviewCandidate(
  * Returns the combined diagnostics so writeCandidate can persist them.
  */
 async function collectCandidateProvenanceViolations(
-  root: string,
+  access: CompileAccess,
   fullPage: string,
   virtualPath: string,
 ): Promise<LintResult[]> {
   const malformed = checkPageMalformedCitations(fullPage, virtualPath);
-  const broken = await checkPageBrokenCitations(
-    fullPage,
-    virtualPath,
-    path.join(root, SOURCES_DIR),
-  );
+  const broken = await access.checkBrokenCitations(fullPage, virtualPath);
   return [...malformed, ...broken];
 }

@@ -7,6 +7,17 @@
  * journalled executor batch under compile's held lock. Seed pages land under
  * `wiki/concepts/` so existing tooling (index, MOC, lint, embeddings) treats
  * them uniformly with concept pages.
+ *
+ * ONE BODY, THREE COLLABORATORS. {@link generateSeedPagesWith} is the one body,
+ * handed {@link SeedPageSteps}: the model completion (a HOST collaborator — the
+ * configured provider, never storage), the confined page read with its drop
+ * warning, and the compile page write (both DOMAIN steps). The root
+ * {@link generateSeedPages} keeps its signature and passes {@link localSeedPageSteps},
+ * which call `callClaude`, `readWikiPageContentOrWarn` and
+ * `applyCompilePageWritesLocked` at call time with exactly their old arguments,
+ * so their module spies and mocks still intercept. The clock (`createdAt` kept
+ * from an existing page, `updatedAt` now), the provenance stamp, the dedup, the
+ * validation prefilter and the committed-slug report all stay in the body.
  */
 
 import {
@@ -31,6 +42,23 @@ import { CONCEPTS_DIR } from "../utils/constants.js";
 import type { WikiFrontmatter } from "../utils/types.js";
 import type { PageGenerationResult } from "./types.js";
 
+/** The three steps a seed pass composes. Only `complete` reaches a provider; none is storage. */
+export interface SeedPageSteps {
+  /** HOST. One model completion. Local: `callClaude(request)`. */
+  complete(request: Parameters<typeof callClaude>[0]): Promise<string>;
+  /** One page's text confined to `relDir`, or `""` when dropped (warned per `warnAlways`). Local: `readWikiPageContentOrWarn`. */
+  readPage(root: string, relDir: string, slug: string, warnAlways: boolean): Promise<string>;
+  /** Apply the seed batch under the held lock. Local: `applyCompilePageWritesLocked(root, writes)`. */
+  writePages(root: string, writes: CompilePageWrite[]): Promise<{ skipped: SkippedWrite[] }>;
+}
+
+/** LOCAL. The incumbent provider call, page read and compile write, called at call time; frozen. In no package index. */
+const localSeedPageSteps: SeedPageSteps = Object.freeze({
+  complete: (request: Parameters<typeof callClaude>[0]) => callClaude(request),
+  readPage: (root: string, relDir: string, slug: string, warnAlways: boolean) => readWikiPageContentOrWarn(root, relDir, slug, warnAlways),
+  writePages: (root: string, writes: CompilePageWrite[]) => applyCompilePageWritesLocked(root, writes),
+});
+
 /**
  * Materialise schema-declared seed pages (overview, comparison, entity).
  * Each seed page is written under wiki/concepts/ next to concept pages so
@@ -42,6 +70,16 @@ import type { PageGenerationResult } from "./types.js";
  * @param generation - Result of the concept-page generation phase.
  */
 export async function generateSeedPages(
+  root: string,
+  schema: SchemaConfig,
+  generation: PageGenerationResult,
+): Promise<void> {
+  return generateSeedPagesWith(localSeedPageSteps, root, schema, generation);
+}
+
+/** THE ONE BODY of {@link generateSeedPages}, over the steps it is handed. */
+export async function generateSeedPagesWith(
+  steps: SeedPageSteps,
   root: string,
   schema: SchemaConfig,
   generation: PageGenerationResult,
@@ -60,14 +98,14 @@ export async function generateSeedPages(
   // an error and is excluded from the batch (skip-not-abort, like generation).
   const writes: CompilePageWrite[] = [];
   for (const seed of dedupedSeeds) {
-    const result = await generateSingleSeedPage(root, schema, seed);
+    const result = await generateSingleSeedPage(steps, root, schema, seed);
     if (result.error) {
       generation.errors.push(result.error);
       continue;
     }
     if (result.write) writes.push(result.write);
   }
-  const { skipped } = await applyCompilePageWritesLocked(root, writes);
+  const { skipped } = await steps.writePages(root, writes);
   reportSeedOutcome(generation, writes, skipped);
 }
 
@@ -133,21 +171,22 @@ interface SeedPageOutcome {
 
 /** Build, prompt, and render a single seed page into a validated CompilePageWrite. */
 async function generateSingleSeedPage(
+  steps: SeedPageSteps,
   root: string,
   schema: SchemaConfig,
   seed: SeedPage,
 ): Promise<SeedPageOutcome> {
   const slug = slugify(seed.title);
-  const relatedContent = await loadSeedRelatedPages(root, seed.relatedSlugs ?? []);
+  const relatedContent = await loadSeedRelatedPages(steps, root, seed.relatedSlugs ?? []);
   const rule = schema.kinds[seed.kind];
   const system = buildSeedPagePrompt(seed, rule, relatedContent);
-  const pageBody = await callClaude({
+  const pageBody = await steps.complete({
     system,
     messages: [{ role: "user", content: `Write the ${seed.kind} page titled "${seed.title}".` }],
   });
 
   const now = new Date().toISOString();
-  const existing = await readWikiPageContentOrWarn(
+  const existing = await steps.readPage(
     root, CONCEPTS_DIR, slug, false /* first compile — absence is normal */,
   );
   const existingMeta = existing ? parseFrontmatter(existing).meta : null;
@@ -179,11 +218,11 @@ async function generateSingleSeedPage(
  * never enter the seed prompt or the re-emitted seed body. A related slug that
  * points at no page is silently skipped, as before.
  */
-async function loadSeedRelatedPages(root: string, slugs: string[]): Promise<string> {
+async function loadSeedRelatedPages(steps: SeedPageSteps, root: string, slugs: string[]): Promise<string> {
   if (slugs.length === 0) return "";
   const contents: string[] = [];
   for (const slug of slugs) {
-    const content = await readWikiPageContentOrWarn(
+    const content = await steps.readPage(
       root, CONCEPTS_DIR, slug, false /* related slug may name no page — absence is normal */,
     );
     if (content) contents.push(content);

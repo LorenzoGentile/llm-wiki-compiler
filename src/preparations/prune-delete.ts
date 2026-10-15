@@ -14,14 +14,22 @@
  * mutations in the package were reachable by any caller that imported them, so
  * "prune routes through the driver" would have moved the call sequence and
  * changed nothing about who may touch the bytes.
+ *
+ * ONE ENGINE BODY over {@link PruneUnitLeaves}. `runTwoPhaseVerifiedDeleteWith`
+ * owns the completed-receipt short-circuit, signed-plan reuse on resume, signing,
+ * the receipt verdict (`verifiedPruneReceipt`), the signed-plan index order of the
+ * deletes and the phase order with the same crash seams. Confinement, namespaces,
+ * receipt I/O and the staged verified delete stay in `lifecycle-fs/prune-protocol`
+ * behind the local-disk leaves; every mutation still carries the driver's permit.
  */
 
 import { createHash } from "node:crypto";
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import {
-  assertConfinedPruneUnit, deletePlannedPruneObject, readVerifiedPruneReceipt,
-  writePruneReceiptBytes,
+  assertConfinedPruneUnit, deletePlannedPruneObject, readPruneReceiptLeaf,
+  verifiedPruneReceipt, writePruneReceiptBytes,
 } from "./lifecycle-fs/prune-protocol.js";
+import type { CappedLeafReadBuffer } from "../utils/confined-read.js";
 import type { LifecycleMutationPermitV1 } from "./lifecycle-mutation-permit.js";
 import type { ScopedQuarantineObject } from "./quarantine-move.js";
 import { signPruneReceipt, type PruneReceiptContentV1, type PruneReceiptV1 } from "./receipts.js";
@@ -70,6 +78,38 @@ export function sweepUnitIdFor(objects: readonly ScopedQuarantineObject[]): stri
   return `swp-${createHash("sha256").update(paths).digest("hex").slice(0, 32)}`;
 }
 
+/** What the verified-delete engine asks of one prune unit's storage. No member takes a project root. */
+export interface PruneUnitLeaves {
+  /** Prove the unit is absent or a real confined directory; rejects otherwise. */
+  assertConfinedUnit(unitId: string): Promise<void>;
+  /** One receipt leaf's bytes, read inside a current lifecycle namespace. */
+  readReceiptLeaf(unitId: string, kind: PruneReceiptContentV1["kind"]): Promise<CappedLeafReadBuffer>;
+  /** Create-only durable publication of one signed receipt, under the permit. */
+  publishReceipt(permit: LifecycleMutationPermitV1, unitId: string, kind: PruneReceiptContentV1["kind"], bytes: Buffer): Promise<void>;
+  /** Stage-then-delete one planned leaf by its signed-plan index, idempotently, under the permit. */
+  deleteObject(
+    permit: LifecycleMutationPermitV1, unitId: string, index: number,
+    object: PruneReceiptContentV1["objects"][number], afterStaged?: () => Promise<void>,
+  ): Promise<void>;
+}
+
+/** The local-disk prune unit leaves for one root, built per call. In no package index. */
+export function diskPruneUnitLeaves(root: string): PruneUnitLeaves {
+  return {
+    assertConfinedUnit: (unitId) => assertConfinedPruneUnit(root, unitId),
+    readReceiptLeaf: (unitId, kind) => readPruneReceiptLeaf(root, unitId, kind),
+    publishReceipt: (permit, unitId, kind, bytes) => writePruneReceiptBytes(permit, root, unitId, kind, bytes),
+    deleteObject: (permit, unitId, index, object, afterStaged) => deletePlannedPruneObject(permit, root, unitId, index, object, afterStaged),
+  };
+}
+
+/** One verified receipt of `kind` for this unit and operation, or null when absent. */
+async function readVerifiedReceipt(
+  leaves: PruneUnitLeaves, input: VerifiedDeleteEngineInput, kind: PruneReceiptContentV1["kind"],
+): Promise<PruneReceiptV1 | null> {
+  return verifiedPruneReceipt(await leaves.readReceiptLeaf(input.unitId, kind), input.key, kind, input.unitId, input.operation);
+}
+
 /** Build one signed prune/sweep receipt content minus its integrity field. */
 function pruneReceiptContent(
   kind: PruneReceiptContentV1["kind"], authority: PruneAuthority,
@@ -92,21 +132,21 @@ function pruneAuthority(
 
 /** Durably publish one signed prune receipt create-only with its parent fsync. */
 async function writePruneReceipt(
+  leaves: PruneUnitLeaves,
   input: VerifiedDeleteEngineInput,
   kind: PruneReceiptContentV1["kind"],
   authority: PruneAuthority,
 ): Promise<void> {
   const receipt = signPruneReceipt(input.key, pruneReceiptContent(kind, authority));
-  await writePruneReceiptBytes(
-    input.permit, input.root, input.unitId, kind, canonicalBytes(receipt));
+  await leaves.publishReceipt(input.permit, input.unitId, kind, canonicalBytes(receipt));
 }
 
 /** Phase one: reuse the signed plan on resume, else create/fsync the planned receipt. */
 async function planDelete(
+  leaves: PruneUnitLeaves,
   input: VerifiedDeleteEngineInput,
 ): Promise<{ authority: PruneAuthority }> {
-  const existing = await readVerifiedPruneReceipt(
-    input.root, input.unitId, input.key, "prune-planned", input.operation);
+  const existing = await readVerifiedReceipt(leaves, input, "prune-planned");
   if (existing !== null) {
     const { kind: _kind, integrity: _integrity, ...authority } = existing;
     return { authority };
@@ -117,7 +157,7 @@ async function planDelete(
     }))
     .sort((left, right) => left.logicalPath.localeCompare(right.logicalPath));
   const authority = pruneAuthority(input, objects);
-  await writePruneReceipt(input, "prune-planned", authority);
+  await writePruneReceipt(leaves, input, "prune-planned", authority);
   return { authority };
 }
 
@@ -131,12 +171,12 @@ async function planDelete(
  * stranded: a false success, not a visible failure.
  */
 async function deletePhase(
+  leaves: PruneUnitLeaves,
   input: VerifiedDeleteEngineInput,
   objects: readonly PruneReceiptContentV1["objects"][number][],
 ): Promise<void> {
   for (const [index, object] of objects.entries()) {
-    await deletePlannedPruneObject(
-      input.permit, input.root, input.unitId, index, object, input.faults?.afterStaged);
+    await leaves.deleteObject(input.permit, input.unitId, index, object, input.faults?.afterStaged);
   }
 }
 
@@ -144,18 +184,23 @@ async function deletePhase(
 export async function runTwoPhaseVerifiedDelete(
   input: VerifiedDeleteEngineInput,
 ): Promise<PruneReceiptV1> {
-  await assertConfinedPruneUnit(input.root, input.unitId);
-  const completed = await readVerifiedPruneReceipt(
-    input.root, input.unitId, input.key, "prune-completed", input.operation);
+  return runTwoPhaseVerifiedDeleteWith(diskPruneUnitLeaves(input.root), input);
+}
+
+/** {@link runTwoPhaseVerifiedDelete} over the unit leaves: the one engine body. `input.root` is not read here. */
+export async function runTwoPhaseVerifiedDeleteWith(
+  leaves: PruneUnitLeaves, input: VerifiedDeleteEngineInput,
+): Promise<PruneReceiptV1> {
+  await leaves.assertConfinedUnit(input.unitId);
+  const completed = await readVerifiedReceipt(leaves, input, "prune-completed");
   if (completed !== null) return completed;
-  const plan = await planDelete(input);
+  const plan = await planDelete(leaves, input);
   await input.faults?.afterPlanned?.();
-  await deletePhase(input, plan.authority.objects);
+  await deletePhase(leaves, input, plan.authority.objects);
   await input.faults?.afterDeletes?.();
   await input.faults?.beforeCompleted?.();
   const receipt = signPruneReceipt(
     input.key, pruneReceiptContent("prune-completed", plan.authority));
-  await writePruneReceiptBytes(
-    input.permit, input.root, input.unitId, "prune-completed", canonicalBytes(receipt));
+  await leaves.publishReceipt(input.permit, input.unitId, "prune-completed", canonicalBytes(receipt));
   return receipt;
 }

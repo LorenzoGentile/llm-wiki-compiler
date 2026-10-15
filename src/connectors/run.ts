@@ -7,38 +7,32 @@
  * tighten-only project config, performs the host-mediated fetch, maps exactly one
  * connector draft into a typed staged entity page, and appends an audit event.
  * Candidate-store mutations run under the project lock so supersede and review
- * approval cannot interleave on the same pending candidate.
+ * approval cannot interleave on the same pending candidate. The staging itself,
+ * under that lock, is `stage-draft.ts`.
+ *
+ * THE WHOLE RUN HAS ONE BODY, {@link runConnectorWith}, over
+ * {@link ConnectorRunSteps}, none of which takes a project root: the profile, the
+ * config, the supersedable selection, the audit preflight, the rate interval, the
+ * lock and the locked stage. Every gate, its order (the rate interval is spent
+ * before the fetch; the lock is taken after it), the draft composition and the
+ * public result check are decided there. The registry, the activation env var and
+ * the fetch stay provider/host collaborators. {@link runConnector} hands it the
+ * disk steps, which call the incumbent root forms with their old arguments.
  */
 
 import packageJson from "../../package.json";
 import { buildFrontmatter } from "../utils/markdown.js";
 import { loadNonDefaultProfile } from "../profile/block.js";
 import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
-import { appendEventLocked, preflightEventAppend } from "../events/store.js";
 import { releaseLock } from "../utils/lock.js";
 import { getConnectorDef } from "./registry.js";
-import {
-  appendConnectorEvent,
-  connectorEvent,
-  preflightAuditCapacity,
-  type SupersedableCandidates,
-} from "./audit.js";
+import { preflightAuditCapacity, type SupersedableCandidates } from "./audit.js";
 import { sha256Text } from "./hash.js";
 import { confinedFetch, validateConnectorHeaders, type ConfinedFetchResult, type FetchLimits } from "./confined-fetch.js";
-import { isConnectorActivated, loadConnectorConfig, type ConnectorRuntimeConfig } from "./config.js";
+import { isConnectorActivated, loadConnectorConfig, type ConnectorConfigRead, type ConnectorRuntimeConfig } from "./config.js";
 import { CONNECTOR_BLOCK_KEY } from "./fence.js";
-import {
-  archiveCandidatesWithUndo,
-  canStageFreshConnectorIntent,
-  CONNECTOR_CANDIDATE_STORE_UNAVAILABLE,
-  includesConnectorContentHash,
-  selectConnectorCandidateEntriesForRun,
-  type CandidateMovePort,
-} from "./candidate-supersession.js";
-import {
-  stageConnectorCandidate,
-  type ConnectorCandidateStageResult,
-} from "./stage-candidate.js";
+import { selectConnectorCandidateEntriesForRun, type CandidateMovePort, type ConnectorCandidateEntriesResult } from "./candidate-supersession.js";
+import { stagePreparedDraft, type PreparedDraft } from "./stage-draft.js";
 import { enforceRequestInterval } from "./rate-limit.js";
 import { captureConnectorResult } from "./candidate-batch.js";
 import { captureConnectorInputs } from "./input-validation.js";
@@ -46,16 +40,12 @@ import {
   captureConnectorIdentity,
   INVALID_CONNECTOR_IDENTITY,
   preflightCandidateId,
-  stagedCandidatePreflightId,
   type ConnectorCandidateIdentity,
 } from "./candidate-identity.js";
-import type { ConnectorBindingDef, ConnectorProvenance, ConnectorRequest, DurableConnectorBlock } from "./types.js";
+import type { ConnectorBindingDef, ConnectorRequest, DurableConnectorBlock } from "./types.js";
 import type { LoadedProfile, ProfilePack } from "../profile/types.js";
-import { CandidatePublicationUnavailableError, FreshCandidateIdExhaustedError } from "../compiler/candidates.js";
-import { CandidateCustodyUnavailableError } from "../compiler/candidate-custody.js";
-import { UnsafeCandidateDirError } from "../compiler/candidate-store-paths.js";
 import type { CandidateMutationSelectionHooks } from "../compiler/candidate-selection.js";
-import { StagedWriteOverflowError } from "../trust/staged-change.js";
+import type { CandidateCustodyPolicy } from "../compiler/candidate-custody-limits.js";
 
 const PACKAGE_VERSION = packageJson.version;
 
@@ -82,19 +72,42 @@ export interface RunConnectorDeps {
   candidateSelectionHooksForTest?: CandidateMutationSelectionHooks;
 }
 
-interface PreparedDraft {
-  entityType: string;
-  slug: string;
-  body: string;
-  provenance: ConnectorProvenance;
-  idempotencyKey: string;
-  contentHash: string;
-  draftContentHash: string;
-  finalUrl: string;
+type ConnectorConfigResult = { kind: "ok"; config: ConnectorRuntimeConfig } | RunConnectorResult;
+
+/**
+ * Everything a connector run touches in the project, none taking a project root.
+ * Each is one call; the gates, their order and the result are {@link runConnectorWith}'s.
+ */
+export interface ConnectorRunSteps {
+  loadProfile(): Promise<LoadedProfile | undefined>;
+  loadConfig(connectorId: string, registryHosts: readonly string[], defaultMinIntervalMs: number): Promise<ConnectorConfigRead>;
+  /** The pending candidates a run with this idempotency key could supersede. */
+  selectCandidates(idempotencyKey: string, hooks?: CandidateMutationSelectionHooks): Promise<ConnectorCandidateEntriesResult>;
+  preflightAudit(
+    identity: ConnectorCandidateIdentity, supersedable: SupersedableCandidates, now: (() => Date) | undefined, policy: CandidateCustodyPolicy,
+  ): Promise<RunConnectorResult | null>;
+  /** Check and spend the connector's request interval (a refusal when too soon). */
+  enforceInterval(connectorId: string, config: ConnectorRuntimeConfig, now?: () => Date): Promise<RunConnectorResult | null>;
+  /** Take the project lock quietly (false when another run holds it). */
+  acquireLock(): Promise<boolean>;
+  releaseLock(): Promise<void>;
+  /** Stage the prepared draft under the held lock. */
+  stage(prepared: PreparedDraft, deps: RunConnectorDeps): Promise<RunConnectorResult>;
 }
 
-type ConnectorConfigResult = { kind: "ok"; config: ConnectorRuntimeConfig } | RunConnectorResult;
-type CandidateUnavailable = Extract<RunConnectorResult, { kind: "unavailable" }>;
+/** LOCAL DISK. The run steps for the project at `root`: the incumbent root forms, old arguments. */
+function diskConnectorRunSteps(root: string): ConnectorRunSteps {
+  return {
+    loadProfile: () => loadNonDefaultProfile(root),
+    loadConfig: (connectorId, registryHosts, defaultMinIntervalMs) => loadConnectorConfig(root, connectorId, registryHosts, defaultMinIntervalMs),
+    selectCandidates: (idempotencyKey, hooks) => selectConnectorCandidateEntriesForRun(root, idempotencyKey, hooks),
+    preflightAudit: (identity, supersedable, now, policy) => preflightAuditCapacity(root, identity, supersedable, now, policy),
+    enforceInterval: (connectorId, config, now) => enforceRequestInterval(root, connectorId, config, now),
+    acquireLock: () => acquireMutationLock(root, "ordinary", { quiet: true }),
+    releaseLock: () => releaseLock(root),
+    stage: (prepared, deps) => stagePreparedDraft(root, prepared, deps),
+  };
+}
 
 /** Run one activated connector and stage its mapped draft as a typed review candidate. */
 export async function runConnector(
@@ -103,17 +116,31 @@ export async function runConnector(
   inputs: Record<string, string>,
   deps: RunConnectorDeps = {},
 ): Promise<RunConnectorResult> {
-  const prepared = await prepareConnectorDraft(root, connectorId, inputs, deps);
+  return runConnectorWith(diskConnectorRunSteps(root), connectorId, inputs, deps);
+}
+
+/**
+ * {@link runConnector} over {@link ConnectorRunSteps}: THE ONE BODY. Every
+ * pre-fetch gate, the fetch, the composition, then the lock (taken only after the
+ * fetch) and the locked stage; every result leaves through the public check.
+ */
+export async function runConnectorWith(
+  steps: ConnectorRunSteps,
+  connectorId: string,
+  inputs: Record<string, string>,
+  deps: RunConnectorDeps,
+): Promise<RunConnectorResult> {
+  const prepared = await prepareConnectorDraft(steps, connectorId, inputs, deps);
   if ("kind" in prepared) return checkedPublicResult(prepared);
-  if (!(await acquireMutationLock(root, "ordinary", { quiet: true }))) {
+  if (!(await steps.acquireLock())) {
     return checkedPublicResult({ kind: "unavailable", reason: "connector candidate store locked" });
   }
   try {
     return checkedPublicResult(
-      await stagePreparedDraft(root, prepared, deps),
+      await steps.stage(prepared, deps),
     );
   } finally {
-    await releaseLock(root);
+    await steps.releaseLock();
   }
 }
 
@@ -148,12 +175,12 @@ interface ConnectorRunSetup {
 
 /** Resolve profile/binding/config, fetch external bytes, parse one draft, and compose the candidate body. */
 async function prepareConnectorDraft(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
   inputs: Record<string, string>,
   deps: RunConnectorDeps,
 ): Promise<PreparedDraft | RunConnectorResult> {
-  const gated = await gateConnectorRun(root, connectorId, inputs, deps);
+  const gated = await gateConnectorRun(steps, connectorId, inputs, deps);
   if ("kind" in gated) return gated;
   const fetched = await (deps.fetcher ?? confinedFetch)(gated.request, fetchLimitsFor(gated.request), gated.allowedHosts);
   if (fetched.kind !== "ok") return fetched;
@@ -162,27 +189,27 @@ async function prepareConnectorDraft(
 
 /** Every pre-fetch gate: profile binding, input contract, config floors, headers, audit capacity, rate interval. */
 async function gateConnectorRun(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
   inputs: Record<string, string>,
   deps: RunConnectorDeps,
 ): Promise<GatedConnectorRun | RunConnectorResult> {
-  const setup = await resolveConnectorRunSetup(root, connectorId, inputs);
+  const setup = await resolveConnectorRunSetup(steps, connectorId, inputs);
   if ("kind" in setup) return setup;
   const request = buildConnectorRequest(
     setup.context.def.buildRequest(setup.inputs as Record<string, string>),
     setup.config.contactEmail,
   );
-  return finishConnectorGate(root, connectorId, setup, request, deps);
+  return finishConnectorGate(steps, connectorId, setup, request, deps);
 }
 
 /** Resolve profile binding, input contract, immutable identity, and config. */
 async function resolveConnectorRunSetup(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
   inputs: Record<string, string>,
 ): Promise<ConnectorRunSetup | RunConnectorResult> {
-  const context = await loadConnectorProfile(root, connectorId);
+  const context = await loadConnectorProfile(steps, connectorId);
   if ("kind" in context) return context;
   const inputCapture = captureConnectorInputs(context.def.inputs, inputs);
   if (inputCapture.kind !== "ok") return inputCapture;
@@ -191,14 +218,14 @@ async function resolveConnectorRunSetup(
     inputCapture.inputs as Record<string, string>,
   );
   if (identity === null) return { kind: "refused", reason: INVALID_CONNECTOR_IDENTITY };
-  const config = await loadRunnableConnectorConfig(root, connectorId, context.def);
+  const config = await loadRunnableConnectorConfig(steps, connectorId, context.def);
   if (config.kind !== "ok") return config;
   return { context, identity, config: config.config, inputs: inputCapture.inputs };
 }
 
 /** Complete request, candidate, audit, and rate gates before external fetch. */
 async function finishConnectorGate(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
   setup: ConnectorRunSetup,
   request: ConnectorRequest,
@@ -206,11 +233,11 @@ async function finishConnectorGate(
 ): Promise<GatedConnectorRun | RunConnectorResult> {
   const headers = validateConnectorHeaders(request.headers ?? {});
   if (headers.kind !== "ok") return headers;
-  const supersedable = await supersedableCandidates(root, setup.identity, deps.candidateSelectionHooksForTest);
+  const supersedable = await supersedableCandidates(steps, setup.identity, deps.candidateSelectionHooksForTest);
   if ("kind" in supersedable) return supersedable;
-  const audit = await preflightAuditCapacity(root, setup.identity, supersedable, deps.now, "public");
+  const audit = await steps.preflightAudit(setup.identity, supersedable, deps.now, "public");
   if (audit) return audit;
-  const interval = await enforceRequestInterval(root, connectorId, setup.config, deps.now);
+  const interval = await steps.enforceInterval(connectorId, setup.config, deps.now);
   if (interval) return interval;
   return {
     context: setup.context,
@@ -223,12 +250,12 @@ async function finishConnectorGate(
 
 /** Load runtime connector config and enforce activation/contact floors before any network request. */
 async function loadRunnableConnectorConfig(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
   def: NonNullable<ReturnType<typeof getConnectorDef>>,
 ): Promise<ConnectorConfigResult> {
   if (!isConnectorActivated(connectorId)) return { kind: "refused", reason: "connector is not activated" };
-  const config = await loadConnectorConfig(root, connectorId, def.allowedHosts, def.minRequestIntervalMs ?? 0);
+  const config = await steps.loadConfig(connectorId, def.allowedHosts, def.minRequestIntervalMs ?? 0);
   if (config.kind === "unavailable") return { kind: "unavailable", reason: config.reason };
   if (def.requiresContactEmail && !config.config.contactEmail) {
     return { kind: "refused", reason: "connector requires contactEmail" };
@@ -238,12 +265,12 @@ async function loadRunnableConnectorConfig(
 
 /** Load the active non-default profile and its binding for `connectorId`. */
 async function loadConnectorProfile(
-  root: string,
+  steps: ConnectorRunSteps,
   connectorId: string,
 ): Promise<{ loaded: LoadedProfile; profile: ProfilePack; binding: ConnectorBindingDef; def: NonNullable<ReturnType<typeof getConnectorDef>> } | RunConnectorResult> {
   const def = getConnectorDef(connectorId);
   if (!def) return { kind: "refused", reason: "unknown connector" };
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await steps.loadProfile();
   if (!loaded) return { kind: "refused", reason: "connectors require a non-default profile" };
   const binding = loaded.profile.connectors?.[connectorId];
   if (!binding) return { kind: "refused", reason: "profile does not bind connector" };
@@ -354,77 +381,13 @@ function durableConnectorBlock(
   };
 }
 
-/** Mutate the candidate store under the held project lock and append the audit event. */
-async function stagePreparedDraft(
-  root: string,
-  draft: PreparedDraft,
-  deps: RunConnectorDeps,
-): Promise<RunConnectorResult> {
-  const selection = await selectConnectorCandidateEntriesForRun(root, draft.idempotencyKey,
-    deps.candidateSelectionHooksForTest);
-  if ("kind" in selection) return selection;
-  const existing = selection.entries;
-  const candidateIds = existing.map(({ fileId }) => fileId);
-  if (includesConnectorContentHash(existing, draft.contentHash)) {
-    const event = connectorEvent(draft, [], candidateIds, [], deps.now, "public");
-    await preflightEventAppend(root, event);
-    await appendEventLocked(root, event);
-    return { kind: "noop", candidateIds };
-  }
-  if (!canStageFreshConnectorIntent(selection)) return candidateStoreUnavailable();
-  const loaded = await loadNonDefaultProfile(root);
-  if (!loaded) return { kind: "unavailable", reason: "connector profile unavailable" };
-  const preflightIds = [stagedCandidatePreflightId(draft.slug)];
-  const archivedIds = candidateIds;
-  await preflightEventAppend(root, connectorEvent(draft, preflightIds, [], archivedIds, deps.now, "public"));
-  const archived = await archiveCandidatesWithUndo(root, existing, deps.candidateMoves, "public");
-  if (archived.kind === "recovery-required") return archived;
-  if (archived.kind === "failed-and-restored") {
-    return { kind: "unavailable", reason: "connector could not archive a superseded candidate" };
-  }
-  const staged = await stageReplacement(root, draft, loaded.profile, archived.receipts, deps);
-  if (staged.kind !== "staged") return staged;
-  await appendConnectorEvent(root, draft, [staged.change.id], [], archivedIds, deps.now, "public");
-  return archivedIds.length > 0
-    ? { kind: "superseded", archivedIds, candidateIds: [staged.change.id] }
-    : { kind: "staged", candidateIds: [staged.change.id] };
-}
-
-/** Stage after archive; map only errors whose exact compensation already settled. */
-async function stageReplacement(
-  root: string,
-  draft: PreparedDraft,
-  profile: ProfilePack,
-  receipts: Parameters<typeof stageConnectorCandidate>[3],
-  deps: RunConnectorDeps,
-): Promise<ConnectorCandidateStageResult | CandidateUnavailable> {
-  try {
-    return await stageConnectorCandidate(
-      root, draft, profile, receipts, deps.candidateMoves, deps.now,
-      deps.beforeCandidateStageForTest, "public",
-    );
-  } catch (error) {
-    if (error instanceof StagedWriteOverflowError ||
-        error instanceof FreshCandidateIdExhaustedError ||
-        error instanceof CandidatePublicationUnavailableError ||
-        error instanceof CandidateCustodyUnavailableError ||
-        error instanceof UnsafeCandidateDirError) return candidateStoreUnavailable();
-    throw error;
-  }
-}
-
-/** Build the one fixed normal-run candidate-authority refusal. */
-function candidateStoreUnavailable(): CandidateUnavailable {
-  return { kind: "unavailable", reason: CONNECTOR_CANDIDATE_STORE_UNAVAILABLE };
-}
-
 /** The candidate ids a run with these inputs could touch, resolved before any fetch. */
 async function supersedableCandidates(
-  root: string,
+  steps: ConnectorRunSteps,
   identity: ConnectorCandidateIdentity,
   hooks?: CandidateMutationSelectionHooks,
 ): Promise<SupersedableCandidates | RunConnectorResult> {
-  const selection = await selectConnectorCandidateEntriesForRun(root, identity.idempotencyKey, hooks);
+  const selection = await steps.selectCandidates(identity.idempotencyKey, hooks);
   if ("kind" in selection) return selection;
   return {
     existingIds: selection.entries.map(({ fileId }) => fileId),

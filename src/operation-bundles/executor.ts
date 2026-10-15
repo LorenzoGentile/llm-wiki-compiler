@@ -9,124 +9,37 @@
  * appendOperationTransitionLocked; this module computes the next step only. A
  * conflict, unavailable read, or authority drift parks the run at
  * recovery-required and never fabricates false success.
+ *
+ * ONE BODY. {@link approveAndApplyOperationBundleWith} owns the whole
+ * application ladder over the session's `OperationRunStores` (`run-session.ts`):
+ * every transition, evidence blob, cancellation-advisory read and removal and
+ * pending-embedding marker read and write goes through them, none taking a
+ * project root. {@link approveAndApplyOperationBundleLocked} keeps its signature
+ * and passes the disk stores, which call the incumbent root forms when asked.
+ * The injected runtime (authority provider, adapters, clock, faults) is the
+ * host's; it still receives `session.root` as its compatibility handle.
  */
 
 import { requireOperationAdapter, type OperationRuntime } from "./adapter-registry.js";
 import type { AdapterContext } from "./adapter-types.js";
 import { operationAuditBinding } from "./audit-binding.js";
 import { currentApplyOwner } from "./apply-owner.js";
-import { readCancelRequest, removeCancelRequestLocked } from "./cancel-request.js";
 import type { AuthoritySnapshotRequest, OperationAuthoritySnapshot } from "./authority.js";
-import { writeRunEvidenceCreateOnly } from "./evidence-store.js";
-import type { BundleId, OperationRunId } from "./ids.js";
-import { readOperationKey } from "./key-epoch.js";
-import { operationManifestDigest } from "./manifest-parse.js";
-import { readOperationManifest } from "./manifest-store.js";
 import { canonicalBytes, canonicalDigest } from "../profile/templates/signing/canonical.js";
-import type { OperationPrincipal } from "./principal.js";
-import type { OperationProblem, OperationProblemCode } from "./problems.js";
-import { appendOperationTransitionLocked, readOperationRun } from "./run-store.js";
-import { mergeFreshAttempts, readPendingMarker, writePendingEmbeddingsStrict } from "../utils/pending-embeddings.js";
-import type {
-  OperationEvidenceReference, OperationRun, OperationRunBinding, OperationRunCounters, OperationRunState,
-} from "./run-types.js";
-import { computeTransition, type EffectOutcomeStatus, type OperationTransitionStep } from "./transitions.js";
-import type { OperationBundleManifest, OperationDigest, OperationMutation, ProjectionOperationMutation } from "./types.js";
+import type { OperationProblemCode } from "./problems.js";
+import { mergeFreshAttempts } from "../utils/pending-embeddings.js";
+import type { OperationEvidenceReference, OperationRun } from "./run-types.js";
+import {
+  appendRunStep, diskOperationRunStores, loadApprovedActionWith, runResult,
+  type ApproveOperationBundleRequest, type OperationActionResult, type OperationRunStores, type RunSession,
+} from "./run-session.js";
+import type { EffectOutcomeStatus, OperationTransitionStep } from "./transitions.js";
+import type { OperationDigest, OperationMutation, ProjectionOperationMutation } from "./types.js";
 
-/** The request to approve-and-apply (or resume) one operation bundle. */
-export interface ApproveOperationBundleRequest {
-  workspaceId: string;
-  bundleId: BundleId;
-  manifestDigest: OperationDigest;
-  principal: OperationPrincipal;
-  runtime: OperationRuntime;
-}
-
-/** The bounded outcome of one executor/recovery action. */
-export interface OperationActionResult {
-  bundleId: BundleId;
-  runId?: OperationRunId;
-  state?: OperationRunState;
-  counters?: OperationRunCounters;
-  problems: OperationProblem[];
-}
-
-/** The immutable per-run context shared by every step (the run threads separately). */
-export interface RunSession {
-  root: string;
-  binding: OperationRunBinding;
-  request: ApproveOperationBundleRequest;
-  manifest: OperationBundleManifest;
-}
+export type { ApproveOperationBundleRequest, OperationActionResult } from "./run-session.js";
 
 /** One settlement step's resulting run and whether it parked at recovery-required. */
 interface StepResult { run: OperationRun; parked: boolean }
-
-/** Build a bounded problem-only action result (no run identity resolved). */
-function bundleProblem(request: ApproveOperationBundleRequest, code: OperationProblemCode): OperationActionResult {
-  return { bundleId: request.bundleId, problems: [{ code, message: code }] };
-}
-
-/** Build an action result from a resolved run, optionally noting a problem. */
-export function runResult(run: OperationRun, code?: OperationProblemCode): OperationActionResult {
-  return {
-    bundleId: run.bundleId, runId: run.runId, state: run.state, counters: run.counters,
-    problems: code === undefined ? [] : [{ code, message: code }],
-  };
-}
-
-/** Load the manifest, key epoch, and run for a bundle, or a typed problem. */
-export async function loadRunSession(
-  root: string,
-  request: ApproveOperationBundleRequest,
-): Promise<{ status: "ok"; session: RunSession; run: OperationRun } | { status: "problem"; result: OperationActionResult }> {
-  const manifestRead = await readOperationManifest(root, request.workspaceId, request.bundleId);
-  if (manifestRead.status === "absent") return { status: "problem", result: bundleProblem(request, "review-item-not-found") };
-  if (manifestRead.status !== "ok") return { status: "problem", result: bundleProblem(request, "review-store-unavailable") };
-  const manifest = manifestRead.manifest;
-  if (operationManifestDigest(manifest) !== request.manifestDigest) return { status: "problem", result: bundleProblem(request, "review-digest-mismatch") };
-  const key = await readOperationKey(root);
-  if (key.status === "absent") return { status: "problem", result: bundleProblem(request, "integrity-key-missing") };
-  if (key.status === "unavailable") return { status: "problem", result: bundleProblem(request, "integrity-key-unreadable") };
-  const binding: OperationRunBinding = {
-    runId: manifest.runId, bundleId: manifest.bundleId, manifestDigest: request.manifestDigest,
-    workspaceId: request.workspaceId, keyEpochId: key.keyEpochId,
-  };
-  const runRead = await readOperationRun(root, binding);
-  if (runRead.status === "absent") return { status: "problem", result: bundleProblem(request, "review-item-not-found") };
-  if (runRead.status !== "ok") return { status: "problem", result: bundleProblem(request, runRead.code ?? "review-store-unavailable") };
-  return { status: "ok", session: { root, binding, request, manifest }, run: runRead.run };
-}
-
-/**
- * Load a run, require the approve grant, and require the caller's expected state —
- * the shared preamble for the two operator actions (approve-and-apply, resume). A
- * load fault, missing grant, or wrong state short-circuits to a bounded result;
- * otherwise the session and run are returned.
- */
-export async function loadApprovedAction(
-  root: string,
-  request: ApproveOperationBundleRequest,
-  requiredState: OperationRunState,
-): Promise<{ status: "ok"; session: RunSession; run: OperationRun } | { status: "stop"; result: OperationActionResult }> {
-  const loaded = await loadRunSession(root, request);
-  if (loaded.status === "problem") return { status: "stop", result: loaded.result };
-  if (!request.principal.grants.includes("operation-bundle.approve")) {
-    return { status: "stop", result: runResult(loaded.run, "approval-grant-missing") };
-  }
-  if (loaded.run.state !== requiredState) return { status: "stop", result: runResult(loaded.run) };
-  return { status: "ok", session: loaded.session, run: loaded.run };
-}
-
-/** Append one computed transition through the Foundation writer, with fault seams. */
-export async function appendRunStep(session: RunSession, run: OperationRun, step: OperationTransitionStep): Promise<OperationRun> {
-  const at = session.request.runtime.clock.now().toISOString();
-  const planned = computeTransition(run, session.request.principal, at, step);
-  await session.request.runtime.fault?.beforeTransitionWrite?.(planned.input.type);
-  const next = await appendOperationTransitionLocked(session.root, session.binding, planned.expected, planned.input);
-  await session.request.runtime.fault?.afterTransitionWrite?.(planned.input.type);
-  return next;
-}
 
 /** The adapter-capability identity folded into the recomputed authority snapshot. */
 function adapterCapabilityDigest(runtime: OperationRuntime): OperationDigest {
@@ -161,7 +74,7 @@ export function buildAdapterContext(session: RunSession, snapshot: OperationAuth
 async function outcomeEvidence(session: RunSession, mutation: OperationMutation, status: EffectOutcomeStatus, adapterEvidence?: Buffer): Promise<OperationEvidenceReference> {
   await session.request.runtime.fault?.beforeEvidenceWrite?.(mutation.mutationId);
   const bytes = adapterEvidence ?? canonicalBytes({ mutationId: mutation.mutationId, kind: mutation.kind, status });
-  return writeRunEvidenceCreateOnly(session.root, {
+  return session.stores.writeEvidence({
     workspaceId: session.manifest.workspaceId, runId: session.binding.runId, type: mutation.kind, provenance: "apply",
   }, Buffer.from(bytes));
 }
@@ -204,10 +117,10 @@ async function enqueuePageForEmbedding(session: RunSession, mutation: OperationM
   // STRICT read: an existing marker that cannot be read (or parsed) is NOT an
   // empty one — merging over it would replace every older pending refresh with
   // this single entry. Only an absent or readable marker is merged into.
-  const existing = await readPendingMarker(session.root);
+  const existing = await session.stores.readPendingMarker();
   if (existing.status === "unavailable") return false;
   try {
-    await writePendingEmbeddingsStrict(session.root, mergeFreshAttempts(existing.entries, [pageId]));
+    await session.stores.writePendingMarker(mergeFreshAttempts(existing.entries, [pageId]));
     return true;
   } catch {
     return false;
@@ -322,10 +235,10 @@ async function verifyAndRecordApplied(session: RunSession, run: OperationRun, ad
  * does not re-read a stale request). Returns the parked run, or null when absent.
  */
 async function pollCancellation(session: RunSession, run: OperationRun): Promise<OperationRun | null> {
-  const cancel = await readCancelRequest(session.root, session.manifest.workspaceId, session.binding.runId);
+  const cancel = await session.stores.readCancel(session.manifest.workspaceId, session.binding.runId);
   if (cancel.status === "absent") return null;
   const parked = await appendRunStep(session, run, { kind: "recovery-required", code: "bundle-recovery-required" });
-  await removeCancelRequestLocked(session.root, session.manifest.workspaceId, session.binding.runId);
+  await session.stores.removeCancel(session.manifest.workspaceId, session.binding.runId);
   return parked;
 }
 
@@ -353,14 +266,14 @@ async function cancelSafePoll(session: RunSession, run: OperationRun, mutationId
  * settled/refusal result, or null when no advisory is present and apply may proceed.
  */
 async function settlePreApplyCancellation(session: RunSession, run: OperationRun): Promise<OperationActionResult | null> {
-  const cancel = await readCancelRequest(session.root, session.manifest.workspaceId, session.binding.runId);
+  const cancel = await session.stores.readCancel(session.manifest.workspaceId, session.binding.runId);
   if (cancel.status === "absent") return null;
   if (cancel.status !== "present") {
-    await removeCancelRequestLocked(session.root, session.manifest.workspaceId, session.binding.runId);
+    await session.stores.removeCancel(session.manifest.workspaceId, session.binding.runId);
     return runResult(run, "review-store-unavailable");
   }
   const cancelled = await appendRunStep(session, run, { kind: "cancelled" });
-  await removeCancelRequestLocked(session.root, session.manifest.workspaceId, session.binding.runId);
+  await session.stores.removeCancel(session.manifest.workspaceId, session.binding.runId);
   return runResult(cancelled);
 }
 
@@ -482,13 +395,18 @@ async function finish(session: RunSession, run: OperationRun): Promise<Operation
   const step: OperationTransitionStep = run.completionWarnings.length > 0 ? { kind: "succeeded-with-warnings" } : { kind: "succeeded" };
   const settled = await appendRunStep(session, run, step);
   // Remove a late-arriving advisory so a stale request can never re-trigger.
-  await removeCancelRequestLocked(session.root, session.manifest.workspaceId, session.binding.runId);
+  await session.stores.removeCancel(session.manifest.workspaceId, session.binding.runId);
   return settled;
 }
 
 /** Approve, revalidate, and apply one staged bundle under the held project lock. */
 export async function approveAndApplyOperationBundleLocked(root: string, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
-  const loaded = await loadApprovedAction(root, request, "awaiting-approval");
+  return approveAndApplyOperationBundleWith(diskOperationRunStores(root), request);
+}
+
+/** {@link approveAndApplyOperationBundleLocked} over {@link OperationRunStores}: THE ONE BODY. The caller holds the project lock. */
+export async function approveAndApplyOperationBundleWith(stores: OperationRunStores, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
+  const loaded = await loadApprovedActionWith(stores, request, "awaiting-approval");
   if (loaded.status === "stop") return loaded.result;
   const { session } = loaded;
   let run = loaded.run;

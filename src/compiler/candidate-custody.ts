@@ -7,16 +7,24 @@
  * rename, and accept only exact digest-bound post-states. No copy/unlink fallback
  * exists here: an unavailable path, parent drift, or cross-device rename fails
  * closed and remains subject to the connector compensation adapter.
+ *
+ * THE CUSTODY READS HAVE ONE BODY EACH, over {@link CandidateCustodyReads}:
+ * {@link captureCandidateCustodyFrom} and {@link observeCandidateCustodyFrom}.
+ * The domain stays here: id admission before any store access, the typed
+ * confinement refusal first, the store binding and its re-proof, which
+ * location is read and in what order, what absence, leaf unavailability and
+ * store unavailability each mean, the byte policy, and the receipt. The
+ * bound members are LOCAL PHYSICAL MECHANISMS (a directory binding, leaf
+ * confinement, the guarded read) whose identities are device and inode
+ * numbers; this is not a port for any other backend. The namespace check, the
+ * mutation-access preflight and the candidate move have bound bodies too
+ * ({@link assertCandidateNamespacesHealthyFrom},
+ * {@link assertCandidateMutationAccessFrom}, {@link moveCandidateWithCustodyFrom}).
  */
 
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { access, lstat, mkdir, opendir, realpath, rename } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { archivePath, assertCandidateId, candidatePath } from "./candidate-paths.js";
 import { CANDIDATES_ARCHIVE_DIR, CANDIDATES_DIR } from "../utils/constants.js";
-import { openConfinedLeaf } from "../utils/confined-read.js";
 import { candidateByteLimit, type CandidateCustodyPolicy } from "./candidate-custody-limits.js";
 import {
   captureCandidateCustodyMoveRequest,
@@ -26,6 +34,28 @@ import {
   captureCandidateDirectoryBinding,
   type CandidateDirectoryBinding,
 } from "./candidate-store-paths.js";
+import { diskRecordDirectory } from "../storage/disk-local-record-dirs.js";
+import type { LocalRecordDirectory } from "../storage/legacy-local-record-dirs.js";
+import {
+  createLeafNoReplace,
+  directoryStillBound as diskDirectoryStillBound,
+  ensureDirectory,
+  leafDigest,
+  leafMatches,
+  leafPresent,
+  moveGuardedLeaf,
+  probeDirectory,
+  readGuardedLeaf,
+  removeLeaf,
+  replaceLeafAtomic,
+  sameIdentity,
+  enumerateSuffixedNames,
+  type GuardedLeafMoveRequest,
+  type GuardedLeafRead,
+  type GuardedLeafReadRequest,
+  type LeafCreateRequest,
+  type SuffixedNameEnumeration,
+} from "../storage/disk-guarded-leaves.js";
 
 export { MAX_CANDIDATE_RECORD_BYTES } from "./candidate-custody-limits.js";
 
@@ -80,36 +110,120 @@ export class CandidateLeafUnavailableError extends CandidateCustodyUnavailableEr
 /** Exact observable candidate state used by archive and compensation. */
 export type CandidateCustodyState = "restored" | "archived" | "conflict";
 
-type CandidateLocation = "pending" | "archive";
+/** Which owned namespace a candidate leaf is in. */
+export type CandidateLocation = "pending" | "archive";
 
 export type CandidateStoreBinding = CandidateDirectoryBinding;
 
 type DirectoryBinding = CandidateDirectoryBinding;
 
-type CustodyLeafRead =
-  | { kind: "absent" }
-  | { kind: "unavailable" }
-  | { kind: "ok"; bytes: Buffer; fileIdentity: CandidateFileIdentity };
+type CustodyLeafRead = GuardedLeafRead;
 
 type CandidateLocationBinding =
   | { kind: "absent" }
   | { kind: "unavailable" }
   | { kind: "ok"; binding: DirectoryBinding };
 
-/** Compare stable filesystem identities without coercion. */
-function sameIdentity(left: CandidateFileIdentity, right: CandidateFileIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino;
+/**
+ * The raw custody-read MECHANISMS the capture and observation bodies run over.
+ * Each member rejects with its own error, or returns a refusal value; the
+ * custody body decides what each means.
+ */
+export interface CandidateCustodyReads {
+  /**
+   * MECHANISM (confined directory binding). The canonical binding of the owned
+   * directory `relDir`, or `null` when a component is absent. Rejects with
+   * `UnsafeCandidateDirError` when it escapes, is broken or is not a directory,
+   * and, when `requireLiteral` is true, when any component is an alias.
+   */
+  captureDirectory(relDir: string, requireLiteral?: boolean): Promise<CandidateStoreBinding | null>;
+  /** MECHANISM (leaf confinement). The confined leaf of `fileId` in `location`. Rejects with the store's typed refusal. */
+  leafPath(fileId: string, location: CandidateLocation): Promise<string>;
+  /**
+   * MECHANISM (guarded physical read). The leaf's exact bytes and identity, read
+   * while `store` and `location` stay bound and capped at `maxBytes`. Refusals
+   * are values; it rejects only when the project root cannot be resolved.
+   */
+  readLeaf(request: Omit<GuardedLeafReadRequest, "root">): Promise<GuardedLeafRead>;
 }
 
-/** Hash exact raw bytes for custody comparison. */
-function sha256Bytes(bytes: Buffer): string {
-  return createHash("sha256").update(bytes).digest("hex");
+/** The custody-read mechanisms plus the one the strict whole-store scan needs. */
+export interface CandidateStoreScanReads extends CandidateCustodyReads {
+  /**
+   * MECHANISM (guarded enumeration). The suffixed entry names of one bound
+   * directory, in stream order, under the CALLER's caps, recheck, overflow
+   * error and hooks, run in the mechanism's fixed order. Nothing is caught.
+   */
+  enumerate(binding: CandidateStoreBinding, enumeration: SuffixedNameEnumeration): Promise<string[]>;
 }
 
-/** Lexical candidate directory for one leaf location. */
-function candidateDir(root: string, location: CandidateLocation): string {
-  const relative = location === "pending" ? CANDIDATES_DIR : CANDIDATES_ARCHIVE_DIR;
-  return path.join(root, relative);
+/** The custody-read mechanisms plus the one the tolerant public listing needs. */
+export interface CandidateStoreListReads extends CandidateCustodyReads {
+  /**
+   * RAW (the existing record-directory listing). The tolerant view of an
+   * already-resolved directory: whether it still exists, and its direct
+   * entries with their kinds, in the backend's order. Which entries count, and
+   * what a listing fault means, are the caller's.
+   */
+  recordDirectory(realDir: string): LocalRecordDirectory;
+}
+
+/**
+ * The listing mechanisms plus the raw effects the candidate WRITERS need. Each
+ * member rejects with its own error or returns a refusal value; which leaf,
+ * in what order, and what a fault means stay with the writer.
+ */
+export interface CandidateStoreWriteReads extends CandidateStoreListReads {
+  /** MECHANISM (access probe). Effective `list` or `write` access to one bound directory, re-bound afterward; any failure is `false`. */
+  probeDirectory(binding: CandidateStoreBinding, need: "list" | "write"): Promise<boolean>;
+  /** RAW. Whether anything, a link included, is at `<dir>/<leafName>`; any fault but absence rejects raw. */
+  leafPresent(dir: string, leafName: string): Promise<boolean>;
+  /** MECHANISM (confined, atomic, no-replace create). Never replaces; an occupied leaf or a hook rejection rejects. */
+  createLeaf(leaf: string, text: string, hooks: Pick<LeafCreateRequest, "afterParentCheck" | "afterCommit">): Promise<void>;
+  /** MECHANISM (confined atomic replace). A reader sees the old or the new bytes; it does not check WHICH object is replaced. */
+  replaceLeaf(leaf: string, text: string): Promise<void>;
+  /** RAW. Remove one leaf by path; rejects with the raw fault. */
+  removeLeaf(leaf: string): Promise<void>;
+}
+
+/** The writers' mechanisms plus the three the candidate move needs. */
+export interface CandidateStoreMoveReads extends CandidateStoreWriteReads {
+  /** NO GUARD. Create `relDir` (not recursively), every error ignored; the caller binds it afterward to learn anything. */
+  ensureDirectory(relDir: string): Promise<void>;
+  /** MECHANISM (re-proof). Whether a captured directory still names the same canonical inode; any failure is `false`. */
+  directoryStillBound(binding: CandidateStoreBinding): Promise<boolean>;
+  /**
+   * MECHANISM (guarded move). Rename one leaf between two bound parents while
+   * holding the verified source open; `false` on any physical refusal, else the
+   * result of `afterRename`, which runs with the handle still held. Renames by
+   * path after its last check (no handle-relative rename in Node).
+   */
+  moveLeaf(request: Omit<GuardedLeafMoveRequest, "root">): Promise<boolean>;
+}
+
+/**
+ * LOCAL DISK. The custody-read mechanisms of the project at `root`: the
+ * confined directory binding, the confined candidate paths, the guarded
+ * leaf read, the guarded enumeration, the record-directory listing, the
+ * access probe, the writers' raw effects and the move's mechanisms, all
+ * closed over this `root`. Building it does no I/O. In no package index.
+ */
+export function diskCandidateCustodyReads(root: string): CandidateStoreScanReads & CandidateStoreMoveReads {
+  return {
+    captureDirectory: (relDir, requireLiteral) => captureCandidateDirectoryBinding(root, relDir, requireLiteral),
+    enumerate: enumerateSuffixedNames,
+    recordDirectory: diskRecordDirectory,
+    leafPath: (fileId, location) => candidateLeaf(root, fileId, location),
+    readLeaf: (request) => readGuardedLeaf({ root, ...request }),
+    probeDirectory: (binding, need) => probeDirectory(root, binding, need),
+    leafPresent,
+    createLeaf: (leaf, text, hooks) => createLeafNoReplace({ root, leaf, text, ...hooks }),
+    replaceLeaf: (leaf, text) => replaceLeafAtomic(root, leaf, text),
+    removeLeaf,
+    ensureDirectory: (relDir) => ensureDirectory(root, relDir),
+    directoryStillBound: (binding) => diskDirectoryStillBound(root, binding),
+    moveLeaf: (request) => moveGuardedLeaf({ root, ...request }),
+  };
 }
 
 /** Derive one confined candidate path from root, id, and location. */
@@ -117,29 +231,12 @@ function candidateLeaf(root: string, fileId: string, location: CandidateLocation
   return location === "pending" ? candidatePath(root, fileId) : archivePath(root, fileId);
 }
 
-/** Capture one confined, root-anchored directory identity. */
-async function captureDirectory(root: string, dir: string): Promise<DirectoryBinding | null> {
-  const relative = path.relative(path.resolve(root), path.resolve(dir));
-  return captureCandidateDirectoryBinding(root, relative);
-}
-
-/** Re-prove that a captured directory still names the same canonical inode. */
-async function directoryStillBound(root: string, binding: DirectoryBinding): Promise<boolean> {
-  try {
-    const current = await captureDirectory(root, binding.dir);
-    return current !== null && current.realDir === binding.realDir &&
-      sameIdentity(current.identity, binding.identity);
-  } catch {
-    return false;
-  }
-}
-
 /** Capture the pending candidate-store root, optionally against a receipt. */
-async function captureStore(
-  root: string,
+async function captureStoreFrom(
+  reads: CandidateCustodyReads,
   expected?: CandidateFileIdentity,
 ): Promise<DirectoryBinding | null> {
-  const binding = await captureDirectory(root, candidateDir(root, "pending"));
+  const binding = await reads.captureDirectory(CANDIDATES_DIR);
   if (binding === null || (expected && !sameIdentity(binding.identity, expected))) return null;
   return binding;
 }
@@ -152,59 +249,46 @@ export async function captureCandidateStoreBinding(
   return captureCandidateDirectoryBinding(root, CANDIDATES_DIR, requireLiteral);
 }
 
-/** Prove effective access to one existing directory and rebind it afterward. */
-async function assertDirectoryAccess(
-  root: string,
+/** Prove effective write and search access to one existing directory and rebind it afterward. */
+async function assertDirectoryAccessFrom(
+  reads: CandidateStoreWriteReads,
   binding: DirectoryBinding,
-  mode: number,
 ): Promise<void> {
-  try {
-    await access(binding.realDir, mode);
-    if (!(await directoryStillBound(root, binding))) {
-      throw new CandidateCustodyUnavailableError();
-    }
-  } catch {
-    throw new CandidateCustodyUnavailableError();
-  }
+  if (!(await reads.probeDirectory(binding, "write"))) throw new CandidateCustodyUnavailableError();
 }
 
 /** Prove one existing owned namespace can be searched and enumerated. */
-async function assertDirectoryReadable(
-  root: string,
+async function assertDirectoryReadableFrom(
+  reads: CandidateStoreWriteReads,
   binding: DirectoryBinding,
 ): Promise<void> {
-  let directory: Awaited<ReturnType<typeof opendir>> | undefined;
-  try {
-    await assertDirectoryAccess(root, binding, constants.R_OK | constants.X_OK);
-    directory = await opendir(binding.realDir);
-    await directory.close();
-    directory = undefined;
-    if (!(await directoryStillBound(root, binding))) {
-      throw new CandidateCustodyUnavailableError();
-    }
-  } catch {
-    await directory?.close().catch(() => {});
-    throw new CandidateCustodyUnavailableError();
-  }
+  if (!(await reads.probeDirectory(binding, "list"))) throw new CandidateCustodyUnavailableError();
 }
 
-/** Validate both owned namespaces and reject any shared filesystem identity. */
-export async function assertCandidateNamespacesHealthy(root: string): Promise<void> {
-  const pending = await captureDirectory(root, candidateDir(root, "pending"));
-  if (pending) await assertDirectoryReadable(root, pending);
-  const archive = await captureDirectory(root, candidateDir(root, "archive"));
+/**
+ * Validate both owned namespaces and reject any shared filesystem identity, over
+ * the store mechanisms: THE ONE BODY. Pending first (bound, then readable), then archive; the two must not
+ * share a filesystem identity; then archive readable. A namespace component
+ * that escapes, is broken or is not a directory REJECTS from the directory
+ * capture with `UnsafeCandidateDirError`, which propagates unchanged; a failed
+ * probe or a shared identity is `CandidateCustodyUnavailableError`.
+ */
+export async function assertCandidateNamespacesHealthyFrom(reads: CandidateStoreWriteReads): Promise<void> {
+  const pending = await reads.captureDirectory(CANDIDATES_DIR);
+  if (pending) await assertDirectoryReadableFrom(reads, pending);
+  const archive = await reads.captureDirectory(CANDIDATES_ARCHIVE_DIR);
   if (pending && archive && sameIdentity(pending.identity, archive.identity)) {
     throw new CandidateCustodyUnavailableError();
   }
-  if (archive) await assertDirectoryReadable(root, archive);
+  if (archive) await assertDirectoryReadableFrom(reads, archive);
 }
 
-/** Prove one existing namespace or its literal creation parent can be mutated. */
-async function assertMutationTargetWritable(root: string, target: string): Promise<void> {
-  const existing = await captureDirectory(root, target);
-  const binding = existing ?? await captureDirectory(root, path.dirname(target));
+/** Prove one existing namespace (`relTarget`) or its literal creation parent can be mutated. */
+async function assertMutationTargetWritableFrom(reads: CandidateStoreWriteReads, relTarget: string): Promise<void> {
+  const existing = await reads.captureDirectory(relTarget);
+  const binding = existing ?? await reads.captureDirectory(path.dirname(relTarget));
   if (binding === null) throw new CandidateCustodyUnavailableError();
-  await assertDirectoryAccess(root, binding, constants.W_OK | constants.X_OK);
+  await assertDirectoryAccessFrom(reads, binding);
 }
 
 /** Prove the candidate effects one plan may need before external or live work. */
@@ -212,107 +296,71 @@ export async function assertCandidateMutationAccess(
   root: string,
   requiresArchiveInsert: boolean,
 ): Promise<void> {
-  await assertCandidateNamespacesHealthy(root);
-  await assertMutationTargetWritable(root, candidateDir(root, "pending"));
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return assertCandidateMutationAccessFrom(diskCandidateCustodyReads(root), requiresArchiveInsert);
+}
+
+/**
+ * {@link assertCandidateMutationAccess} over the store mechanisms: THE ONE
+ * BODY. The namespace check, then pending (or its creation parent) writable,
+ * then, only when an archive insert is planned, archive (or its parent).
+ */
+export async function assertCandidateMutationAccessFrom(
+  reads: CandidateStoreWriteReads,
+  requiresArchiveInsert: boolean,
+): Promise<void> {
+  await assertCandidateNamespacesHealthyFrom(reads);
+  await assertMutationTargetWritableFrom(reads, CANDIDATES_DIR);
   if (requiresArchiveInsert) {
-    await assertMutationTargetWritable(root, candidateDir(root, "archive"));
+    await assertMutationTargetWritableFrom(reads, CANDIDATES_ARCHIVE_DIR);
   }
 }
 
-/** Re-prove that the lexical pending store still owns one captured identity. */
-export async function assertCandidateStoreBinding(
-  root: string,
+/**
+ * Re-prove, over the custody-read mechanisms, that the lexical pending store
+ * still owns one captured identity: the same identity, directory and real
+ * directory, or `CandidateCustodyUnavailableError`.
+ */
+export async function assertCandidateStoreBindingFrom(
+  reads: CandidateCustodyReads,
   expected: CandidateStoreBinding,
 ): Promise<void> {
-  const current = await captureStore(root, expected.identity);
+  const current = await captureStoreFrom(reads, expected.identity);
   if (current === null || current.dir !== expected.dir || current.realDir !== expected.realDir) {
     throw new CandidateCustodyUnavailableError();
   }
 }
 
-/** Read exactly the initial bounded handle size without following a growing EOF. */
-async function readExactHandle(handle: FileHandle, size: number): Promise<Buffer | null> {
-  const bytes = Buffer.alloc(size);
-  let offset = 0;
-  while (offset < size) {
-    const read = await handle.read(bytes, offset, size - offset, offset);
-    if (read.bytesRead === 0) return null;
-    offset += read.bytesRead;
-  }
-  const after = await handle.stat();
-  return after.isFile() && after.size === size ? bytes : null;
-}
-
-/** Require the opened handle to remain the exact file at its confined leaf. */
-async function handleStillBound(
-  handle: FileHandle,
-  leaf: string,
-  fileIdentity: CandidateFileIdentity,
-): Promise<boolean> {
-  const [opened, current] = await Promise.all([handle.stat(), lstat(leaf)]);
-  return opened.isFile() && sameIdentity(opened, fileIdentity) &&
-    sameIdentity(current, fileIdentity);
-}
-
 /** Bind the exact pending or archive directory without conflating an alias with absence. */
-async function captureLocationBinding(
-  root: string,
+async function captureLocationBindingFrom(
+  reads: CandidateCustodyReads,
   location: CandidateLocation,
   store: DirectoryBinding,
 ): Promise<CandidateLocationBinding> {
   if (location === "pending") return { kind: "ok", binding: store };
-  const archive = await captureDirectory(root, candidateDir(root, "archive"));
+  const archive = await reads.captureDirectory(CANDIDATES_ARCHIVE_DIR);
   if (archive === null) return { kind: "absent" };
   if (sameIdentity(store.identity, archive.identity)) return { kind: "unavailable" };
   return { kind: "ok", binding: archive };
 }
 
-/** Read and rebind one already confinement-proved candidate handle. */
-async function consumeCustodyHandle(
-  root: string,
-  leaf: string,
-  store: DirectoryBinding,
-  location: DirectoryBinding,
-  opened: Extract<Awaited<ReturnType<typeof openConfinedLeaf>>, { kind: "confirmed" }>,
-): Promise<CustodyLeafRead> {
-  try {
-    const info = await opened.handle.stat();
-    const identity = { dev: info.dev, ino: info.ino };
-    const bytes = await readExactHandle(opened.handle, opened.size);
-    const leafBound = await handleStillBound(opened.handle, leaf, identity).catch(() => false);
-    const parentsBound = await directoryStillBound(root, store) &&
-      await directoryStillBound(root, location);
-    return bytes && leafBound && parentsBound
-      ? { kind: "ok", bytes, fileIdentity: identity }
-      : { kind: "unavailable" };
-  } catch {
-    return { kind: "unavailable" };
-  } finally {
-    await opened.handle.close().catch(() => {});
-  }
-}
-
-/** Open and read one location through the root-anchored no-follow seam. */
-async function readCustodyLeaf(
-  root: string,
+/** Bind one location and resolve its leaf, then read it through the guarded physical read. */
+async function readCustodyLeafFrom(
+  reads: CandidateCustodyReads,
   fileId: string,
   location: CandidateLocation,
   expectedStore?: CandidateFileIdentity,
   policy: CandidateCustodyPolicy = "bounded",
 ): Promise<CustodyLeafRead> {
-  const store = await captureStore(root, expectedStore);
+  const store = await captureStoreFrom(reads, expectedStore);
   if (store === null) return { kind: "unavailable" };
-  const locationBinding = await captureLocationBinding(root, location, store);
+  const locationBinding = await captureLocationBindingFrom(reads, location, store);
   if (locationBinding.kind !== "ok") return locationBinding;
-  const leaf = await candidateLeaf(root, fileId, location).catch(() => null);
+  const leaf = await reads.leafPath(fileId, location).catch(() => null);
   if (leaf === null) return { kind: "unavailable" };
-  const opened = await openConfinedLeaf(await realpath(root), leaf, locationBinding.binding.realDir);
-  if (opened.kind !== "confirmed") return opened;
-  if (opened.size > candidateByteLimit(policy)) {
-    await opened.handle.close().catch(() => {});
-    return { kind: "unavailable" };
-  }
-  return consumeCustodyHandle(root, leaf, store, locationBinding.binding, opened);
+  return reads.readLeaf({
+    leaf, store, location: locationBinding.binding, maxBytes: candidateByteLimit(policy),
+  });
 }
 
 /** Capture exact bounded pending-candidate bytes and receipt evidence. */
@@ -322,11 +370,22 @@ export async function captureCandidateCustody(
   expectedStore?: CandidateStoreBinding,
   policy: CandidateCustodyPolicy = "bounded",
 ): Promise<CandidateCustodyRead | null> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return captureCandidateCustodyFrom(diskCandidateCustodyReads(root), fileId, expectedStore, policy);
+}
+
+/** {@link captureCandidateCustody} over the custody-read mechanisms: THE ONE BODY. */
+export async function captureCandidateCustodyFrom(
+  reads: CandidateCustodyReads,
+  fileId: string,
+  expectedStore?: CandidateStoreBinding,
+  policy: CandidateCustodyPolicy = "bounded",
+): Promise<CandidateCustodyRead | null> {
   assertCandidateId(fileId);
   // Preserve the store's public typed confinement refusal before custody can
   // classify an ordinary direct read as unavailable.
-  await candidatePath(root, fileId);
-  const store = await captureStore(root, expectedStore?.identity);
+  await reads.leafPath(fileId, "pending");
+  const store = await captureStoreFrom(reads, expectedStore?.identity);
   if (store === null) {
     if (expectedStore === undefined) return null;
     throw new CandidateCustodyUnavailableError();
@@ -334,16 +393,16 @@ export async function captureCandidateCustody(
   if (expectedStore && (store.dir !== expectedStore.dir || store.realDir !== expectedStore.realDir)) {
     throw new CandidateCustodyUnavailableError();
   }
-  const read = await readCustodyLeaf(root, fileId, "pending", store.identity, policy);
+  const read = await readCustodyLeafFrom(reads, fileId, "pending", store.identity, policy);
   if (read.kind === "absent") return null;
   if (read.kind !== "ok") {
-    await assertCandidateStoreBinding(root, store);
+    await assertCandidateStoreBindingFrom(reads, store);
     throw new CandidateLeafUnavailableError();
   }
   const receipt = captureCandidateCustodyReceipt({
     fileId,
     byteCount: read.bytes.byteLength,
-    sha256: sha256Bytes(read.bytes),
+    sha256: leafDigest(read.bytes),
     fileIdentity: read.fileIdentity,
     storeIdentity: store.identity,
   }, policy);
@@ -355,9 +414,7 @@ export async function captureCandidateCustody(
 
 /** True when one read proves the exact receipt bytes and inode. */
 function matchesReceipt(read: CustodyLeafRead, receipt: CandidateCustodyReceipt): boolean {
-  return read.kind === "ok" && read.bytes.byteLength === receipt.byteCount &&
-    sameIdentity(read.fileIdentity, receipt.fileIdentity) &&
-    sha256Bytes(read.bytes) === receipt.sha256;
+  return leafMatches(read, receipt);
 }
 
 /** Observe only the two exact successful states admitted by D-048. */
@@ -366,10 +423,20 @@ export async function observeCandidateCustody(
   receipt: CandidateCustodyReceipt,
   policy: CandidateCustodyPolicy = "bounded",
 ): Promise<CandidateCustodyState> {
+  // Never rejects: building the disk mechanisms does no I/O and cannot throw.
+  return observeCandidateCustodyFrom(diskCandidateCustodyReads(root), receipt, policy);
+}
+
+/** {@link observeCandidateCustody} over the custody-read mechanisms: THE ONE BODY. */
+export async function observeCandidateCustodyFrom(
+  reads: CandidateCustodyReads,
+  receipt: CandidateCustodyReceipt,
+  policy: CandidateCustodyPolicy = "bounded",
+): Promise<CandidateCustodyState> {
   try {
     const captured = captureCandidateCustodyReceipt(receipt, policy);
-    const pending = await readCustodyLeaf(root, captured.fileId, "pending", captured.storeIdentity, policy);
-    const archived = await readCustodyLeaf(root, captured.fileId, "archive", captured.storeIdentity, policy);
+    const pending = await readCustodyLeafFrom(reads, captured.fileId, "pending", captured.storeIdentity, policy);
+    const archived = await readCustodyLeafFrom(reads, captured.fileId, "archive", captured.storeIdentity, policy);
     if (matchesReceipt(pending, captured) && archived.kind === "absent") return "restored";
     if (pending.kind === "absent" && matchesReceipt(archived, captured)) return "archived";
     return "conflict";
@@ -379,76 +446,25 @@ export async function observeCandidateCustody(
 }
 
 /** Ensure the archive parent exists and bind both candidate-store parents. */
-async function bindMoveParents(
+async function bindMoveParentsFrom(
+  reads: CandidateStoreMoveReads,
   request: CandidateCustodyMoveRequest,
 ): Promise<{ source: DirectoryBinding; destination: DirectoryBinding } | null> {
-  const store = await captureStore(request.root, request.receipt.storeIdentity);
+  const store = await captureStoreFrom(reads, request.receipt.storeIdentity);
   if (store === null) return null;
-  const archiveDir = candidateDir(request.root, "archive");
-  if (request.direction === "archive") await mkdir(archiveDir).catch(() => {});
-  const archive = await captureDirectory(request.root, archiveDir);
+  if (request.direction === "archive") await reads.ensureDirectory(CANDIDATES_ARCHIVE_DIR);
+  const archive = await reads.captureDirectory(CANDIDATES_ARCHIVE_DIR);
   if (archive === null || sameIdentity(store.identity, archive.identity) ||
-      !(await directoryStillBound(request.root, store))) return null;
+      !(await reads.directoryStillBound(store))) return null;
   return request.direction === "archive"
     ? { source: store, destination: archive }
     : { source: archive, destination: store };
 }
 
-/** Require an exact receipt-bound source while retaining its open handle. */
-async function openMoveSource(
-  request: CandidateCustodyMoveRequest,
-  source: string,
-  sourceDir: string,
-  policy: CandidateCustodyPolicy,
-): Promise<FileHandle | null> {
-  const opened = await openConfinedLeaf(await realpath(request.root), source, sourceDir);
-  if (opened.kind !== "confirmed") return null;
-  if (opened.size > candidateByteLimit(policy)) {
-    await opened.handle.close().catch(() => {});
-    return null;
-  }
-  let accepted = false;
-  try {
-    const info = await opened.handle.stat();
-    const identity = { dev: info.dev, ino: info.ino };
-    const bytes = await readExactHandle(opened.handle, opened.size);
-    const read: CustodyLeafRead = bytes
-      ? { kind: "ok", bytes, fileIdentity: identity }
-      : { kind: "unavailable" };
-    if (!matchesReceipt(read, request.receipt)) return null;
-    if (!(await handleStillBound(opened.handle, source, identity))) return null;
-    accepted = true;
-    return opened.handle;
-  } catch {
-    return null;
-  } finally {
-    if (!accepted) await opened.handle.close().catch(() => {});
-  }
-}
-
-/** True only when a destination leaf is currently absent. */
-async function destinationIsAbsent(destination: string): Promise<boolean> {
-  try {
-    await lstat(destination);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
-}
-
-/** Recheck both parent bindings immediately before the path-based rename. */
-async function parentsStillBound(
-  root: string,
-  parents: { source: DirectoryBinding; destination: DirectoryBinding },
-): Promise<boolean> {
-  return (await directoryStillBound(root, parents.source)) &&
-    (await directoryStillBound(root, parents.destination));
-}
-
 /** Derive source and destination paths for one store-owned move request. */
-async function movePaths(request: CandidateCustodyMoveRequest): Promise<[string, string]> {
-  const pending = await candidatePath(request.root, request.fileId);
-  const archived = await archivePath(request.root, request.fileId);
+async function movePathsFrom(reads: CandidateStoreMoveReads, request: CandidateCustodyMoveRequest): Promise<[string, string]> {
+  const pending = await reads.leafPath(request.fileId, "pending");
+  const archived = await reads.leafPath(request.fileId, "archive");
   return request.direction === "archive" ? [pending, archived] : [archived, pending];
 }
 
@@ -457,27 +473,51 @@ async function movePaths(request: CandidateCustodyMoveRequest): Promise<[string,
  * Pure Node 24 has no renameat/openat or FileHandle rename. The source handle
  * remains open and both parents are rebound immediately before `rename`, but a
  * non-cooperating same-user process can still win the final path-syscall gap.
+ * The physical sequence is the guarded move in `../storage/disk-guarded-leaves.ts`;
+ * the handle it holds stays open through the post-state observation below.
  */
 export async function moveCandidateWithCustody(
   request: CandidateCustodyMoveRequest,
   policy: CandidateCustodyPolicy = "bounded",
 ): Promise<boolean> {
+  // Capture FIRST, before `root` is read: a malformed request still rejects here.
   const captured = captureCandidateCustodyMoveRequest(request, policy);
-  let sourceHandle: FileHandle | null = null;
+  return moveCandidateWithCustodyFrom(diskCandidateCustodyReads(captured.root), captured, policy);
+}
+
+/**
+ * {@link moveCandidateWithCustody} over the store mechanisms: THE ONE BODY. The
+ * request is captured (again, idempotently) outside the `try`, so a malformed
+ * one rejects before any mechanism call. Inside the `try`, every fault is
+ * `false`: the store bound against the receipt, the archive created only for an
+ * archive move, the two parents bound and distinct, the confined paths, and the
+ * guarded move whose post-state is observed with the source handle held.
+ *
+ * The supplied `reads` choose the project. The request's `root` is a validated
+ * legacy field of the move contract only: nothing here derives a mechanism, a
+ * path, access or project identity from it, and it is not an authorization check.
+ */
+export async function moveCandidateWithCustodyFrom(
+  reads: CandidateStoreMoveReads,
+  request: CandidateCustodyMoveRequest,
+  policy: CandidateCustodyPolicy = "bounded",
+): Promise<boolean> {
+  const captured = captureCandidateCustodyMoveRequest(request, policy);
   try {
-    const parents = await bindMoveParents(captured);
+    const parents = await bindMoveParentsFrom(reads, captured);
     if (parents === null) return false;
-    const [source, destination] = await movePaths(captured);
-    sourceHandle = await openMoveSource(captured, source, parents.source.realDir, policy);
-    if (sourceHandle === null || !(await destinationIsAbsent(destination))) return false;
-    if (!(await parentsStillBound(captured.root, parents))) return false;
-    if (!(await handleStillBound(sourceHandle, source, captured.receipt.fileIdentity))) return false;
-    if (!(await destinationIsAbsent(destination))) return false;
-    await rename(source, destination);
-    return await observeCandidateCustody(captured.root, captured.receipt, policy) === captured.direction + "d";
+    const [source, destination] = await movePathsFrom(reads, captured);
+    return await reads.moveLeaf({
+      source,
+      destination,
+      parents,
+      expect: captured.receipt,
+      maxBytes: candidateByteLimit(policy),
+      // Runs inside the guarded move, with the verified source handle still open.
+      afterRename: async () =>
+        await observeCandidateCustodyFrom(reads, captured.receipt, policy) === captured.direction + "d",
+    });
   } catch {
     return false;
-  } finally {
-    await sourceHandle?.close().catch(() => {});
   }
 }

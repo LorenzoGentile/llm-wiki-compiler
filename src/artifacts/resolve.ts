@@ -5,10 +5,30 @@
  * the bytes, and compares bytes↔manifest, ref↔recomputed, and (json) schema-over-bytes.
  * The metadata resolver never returns bodies; the verified reader returns only
  * the exact content whose integrity it checked, for loopback viewer access.
+ *
+ * ONE BODY: {@link readVerifiedArtifact} runs {@link readVerifiedArtifactFrom}
+ * over the local disk. Which leaves are read, in what order and under which
+ * caps, the verdict ladder, and what every outcome means are decided in this
+ * file and in `resolve-members.ts`. The leaves themselves are ASKED FOR through
+ * {@link ArtifactStoreReads}. WHAT ANSWERS ON DISK IS UNCHANGED AND STILL READS
+ * A PROJECT ROOT: the store's confined, no-follow, capped readers and the
+ * bounded directory lister. This file binds the resolver's decisions, not
+ * those reads; nothing here is a hosted store or selects a backend.
+ *
+ * THE METADATA-ONLY RESOLUTION HAS ONE BODY TOO: {@link resolveArtifactRefFrom},
+ * over the same {@link ArtifactStoreReads}. It is the verified read with the
+ * body left out. {@link resolveArtifactRef} runs it over the local disk, and
+ * the artifact health check (`profile/artifact-lint.ts`) runs it over the
+ * store reads it is handed, so that check holds no project root for this.
  */
 import type { ProfilePack, ArtifactTypeDef } from "../profile/types.js";
 import type { ArtifactRef } from "./ref.js";
-import { artifactPaths, hashArtifactBody, readArtifactManifest, readArtifactBody, type ArtifactManifest } from "./store.js";
+import {
+  ARTIFACT_MANIFEST_MAX_BYTES, artifactPaths, hashArtifactBody, manifestReadOf, memberLeafPath, readArtifactBody, readArtifactMemberBytes,
+  type ArtifactBodyRead, type ArtifactManifest, type ArtifactMemberRead,
+} from "./store.js";
+import { listConfinedDirBounded, type ConfinedDirListing } from "../utils/confined-dir.js";
+import { readConfinedLeaf, type CappedLeafRead } from "../utils/confined-read.js";
 import { validateArtifactBody } from "./body-contract.js";
 import { verifyMembers } from "./resolve-members.js";
 
@@ -105,13 +125,71 @@ function manifestIntegrityLie(def: ArtifactTypeDef, ref: ArtifactRef, m: Artifac
   return undefined;
 }
 
+/**
+ * One artifact's leaves, ALREADY LOCATED. OWNED BY THE RESOLVER: a narrow
+ * seam, not `ProjectStore`, not a hosted or access-control contract. Each read
+ * answers with the store's own outcome values and is asked afresh every time;
+ * nothing is remembered between reads, and nothing makes two of them agree.
+ */
+export interface ArtifactLeafReads {
+  /** The sidecar manifest's text within `maxBytes`. A leaf over the cap is `unavailable`. */
+  readManifestText(maxBytes: number): Promise<CappedLeafRead>;
+  /** The body's text within `maxBytes`. A body over the cap is `oversize` with its actual size, and is not read. */
+  readBodyText(maxBytes: number): Promise<ArtifactBodyRead>;
+  /** The artifact directory's entries; more than `maxEntries` is `unavailable`. */
+  listEntries(maxEntries: number): Promise<ConfinedDirListing>;
+  /** One member's bytes within `maxBytes`. THROWS `ArtifactPathError` for an unsafe member name, before any read. */
+  readMemberBytes(fileName: string, maxBytes: number): Promise<ArtifactMemberRead>;
+}
+
+/** Where the resolver asks for an artifact's leaves. Owned by the resolver, like {@link ArtifactLeafReads}. */
+export interface ArtifactStoreReads {
+  /**
+   * The artifact at these coordinates. Does no I/O. THROWS `ArtifactPathError`
+   * for an unsafe type, slug or file name. The resolver asks ONCE before its
+   * reads and ONCE MORE before the member step, each time with the values the
+   * ref and the definition hold at that moment.
+   */
+  artifactAt(artifactType: string, slug: string, fileName: string): ArtifactLeafReads;
+}
+
+/**
+ * LOCAL DISK. The artifact store's reads for the project at `root`. Building
+ * them does no I/O; `artifactAt` validates and joins paths exactly as
+ * `artifactPaths` does, and each read is the store's own confined reader with
+ * the arguments the resolver always passed. Exported for the artifact health
+ * check's disk builder only; in no package index.
+ */
+export function diskArtifactStoreReads(root: string): ArtifactStoreReads {
+  return { artifactAt: (artifactType, slug, fileName) => {
+    const paths = artifactPaths(root, artifactType, slug, fileName);
+    return {
+      readManifestText: (maxBytes) => readConfinedLeaf(root, paths.manifestPath, paths.expectedDir, maxBytes),
+      readBodyText: (maxBytes) => readArtifactBody(root, paths, maxBytes),
+      listEntries: (maxEntries) => listConfinedDirBounded(root, paths.relativeDir, maxEntries),
+      readMemberBytes: (fileName, maxBytes) => readArtifactMemberBytes(root, memberLeafPath(paths.expectedDir, fileName), paths.expectedDir, maxBytes),
+    };
+  } };
+}
+
 /** Verify and return the same bounded content snapshot, never re-opening its path. */
 export async function readVerifiedArtifact(root: string, profile: Pick<ProfilePack, "artifacts">, ref: ArtifactRef): Promise<VerifiedArtifactRead> {
+  // `async` so that a throw while the disk reads are built REJECTS.
+  return readVerifiedArtifactFrom(diskArtifactStoreReads(root), profile, ref);
+}
+
+/**
+ * {@link readVerifiedArtifact} over {@link ArtifactStoreReads}: THE ONE BODY.
+ * The declared-type check; the location; the manifest, then the body ALWAYS,
+ * one after the other; the verdict ladder; then, for a member-bearing type
+ * whose body verified, the location again and the members.
+ */
+export async function readVerifiedArtifactFrom(store: ArtifactStoreReads, profile: Pick<ProfilePack, "artifacts">, ref: ArtifactRef): Promise<VerifiedArtifactRead> {
   const def = declaredArtifact(profile, ref.artifactType);
   if (!def) return { health: "artifact-dangling" }; // undeclared type resolves to dangling on read; no manifest could ever exist
-  const paths = artifactPaths(root, ref.artifactType, ref.slug, def.fileName);
-  const manifest = await readArtifactManifest(root, paths);
-  const body = await readArtifactBody(root, paths, def.maxBytes);
+  const leaves = store.artifactAt(ref.artifactType, ref.slug, def.fileName);
+  const manifest = manifestReadOf(await leaves.readManifestText(ARTIFACT_MANIFEST_MAX_BYTES));
+  const body = await leaves.readBodyText(def.maxBytes);
   // Carry the PARSED manifest on every return below, independent of the overall
   // health verdict (not gated on `health === "ok"`): MCP's `verify_artifact`
   // shows manifest metadata whenever the manifest file itself parses — e.g. a
@@ -139,18 +217,19 @@ export async function readVerifiedArtifact(root: string, profile: Pick<ProfilePa
     // (benign policy — stays a park/warning, not an alarm).
     return { health: body.actualBytes !== m.bytes ? "artifact-bytes-tampered" : "artifact-unreadable", manifest: m };
   }
-  return verifiedContent(root, def, { ref, manifest: m, body: body.body });
+  return verifiedContent(store, def, { ref, manifest: m, body: body.body });
 }
 
 /** Release the captured body only after its contract and any binary members verify. */
-async function verifiedContent(root: string, def: ArtifactTypeDef,
+async function verifiedContent(store: ArtifactStoreReads, def: ArtifactTypeDef,
   captured: { ref: ArtifactRef; manifest: ArtifactManifest; body: string },
 ): Promise<VerifiedArtifactRead> {
   const { ref, manifest, body } = captured;
   const verdict = verifyOkBody(def, ref, manifest, body);
   if (verdict.health === "ok" && def.members !== undefined) {
-    const paths = artifactPaths(root, ref.artifactType, ref.slug, def.fileName);
-    const health = await verifyMembers(root, def, paths, body);
+    // Located AGAIN, from what the ref and the definition hold NOW: the manifest and body above keep the first location.
+    const leaves = store.artifactAt(ref.artifactType, ref.slug, def.fileName);
+    const health = await verifyMembers(leaves, def, body);
     if (health !== null) return { health, manifest };
   }
   return { ...verdict, manifest, ...(verdict.health === "ok" ? { body } : {}) };
@@ -164,6 +243,17 @@ function declaredArtifact(profile: Pick<ProfilePack, "artifacts">, type: string)
 
 /** Metadata-only resolution remains body-free for lint, status and SDK consumers. */
 export async function resolveArtifactRef(root: string, profile: ProfilePack, ref: ArtifactRef): Promise<ArtifactResolution> {
-  const { body: _body, ...resolution } = await readVerifiedArtifact(root, profile, ref);
+  // `async` so that a throw while the disk reads are built REJECTS.
+  return resolveArtifactRefFrom(diskArtifactStoreReads(root), profile, ref);
+}
+
+/**
+ * {@link resolveArtifactRef} over {@link ArtifactStoreReads}: THE ONE BODY of
+ * the metadata-only resolution. It runs {@link readVerifiedArtifactFrom} once
+ * and hands back everything but the body, so the result never has a `body`
+ * key, healthy or not.
+ */
+export async function resolveArtifactRefFrom(store: ArtifactStoreReads, profile: ProfilePack, ref: ArtifactRef): Promise<ArtifactResolution> {
+  const { body: _body, ...resolution } = await readVerifiedArtifactFrom(store, profile, ref);
   return resolution;
 }

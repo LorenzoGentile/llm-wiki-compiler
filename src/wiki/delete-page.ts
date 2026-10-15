@@ -23,13 +23,22 @@
  *
  * PRECONDITION: the caller MUST already hold the project lock. This acquires
  * nothing, so it is safe inside an outer locked region.
+ *
+ * ONE BODY. {@link deleteWikiPagesWith} keeps the replay-first order, the floor
+ * split, the empty no-op, and record → unlink → verify-absent → commit, over
+ * {@link PageDeleteSteps} addressed by slug. {@link deleteWikiPagesLocked} keeps
+ * its signature and passes {@link localPageDeleteSteps}, which map a slug to
+ * `wiki/concepts/<slug>.md` and call the incumbent journal primitives (and the
+ * `unlinkOne` hook, with the same target path) when asked. The hook is read
+ * where it always was: once, just before the batch opens, so an empty or
+ * all-skipped call never touches it.
  */
 
 import path from "path";
-import { lstat } from "fs/promises";
+import { locationKindNoFollow } from "../storage/disk-local-reads.js";
 import { CONCEPTS_DIR } from "../utils/constants.js";
 import { isSafeFilenameComponent } from "../profile/identity.js";
-import { openBatch, recordPreState, commitBatch, replayJournal, confinedUnlink } from "../trust/journal.js";
+import { openBatch, recordPreState, commitBatch, replayJournal, confinedUnlink, type JournalBatch } from "../trust/journal.js";
 
 /** The unlink primitive, injectable so a crash mid-batch is testable. */
 export type UnlinkOne = (targetPath: string) => Promise<void>;
@@ -46,6 +55,43 @@ export interface SkippedDelete {
 export interface DeleteOptions {
   /** Override the unlink primitive (fault injection). Defaults to `confinedUnlink`. */
   unlinkOne?: UnlinkOne;
+}
+
+/** What the page-delete batch asks of the project, by slug. No member takes a project root. */
+export interface PageDeleteSteps {
+  /** Recover any batch a prior crash left pending. */
+  replayJournal(): Promise<void>;
+  /** Open (persist) a new journal batch. */
+  openBatch(): Promise<JournalBatch>;
+  /** Record one page's pre-state into `batch` before it is touched. */
+  recordPreState(batch: JournalBatch, slug: string): Promise<void>;
+  /** Attempt one page's unlink; may swallow a failure (the verify below catches it). */
+  unlink(slug: string): Promise<void>;
+  /** Resolve when anything at all remains at the page, without following a link; reject `ENOENT` when it is gone. */
+  probeNoFollow(slug: string): Promise<void>;
+  /** Commit `batch` once every page is verified gone. */
+  commitBatch(batch: JournalBatch): Promise<void>;
+}
+
+/**
+ * LOCAL DISK: the incumbent journal primitives for one root, built per call. The
+ * `unlinkOne` hook keeps its target-path contract and is selected inside
+ * `openBatch`, immediately before the batch opens, as the incumbent did. In no package index.
+ */
+function localPageDeleteSteps(root: string, opts: DeleteOptions = {}): PageDeleteSteps {
+  const target = (slug: string) => path.join(root, CONCEPTS_DIR, `${slug}.md`);
+  let unlinkOne: UnlinkOne = () => Promise.reject(new Error("internal: unlink before the batch opened"));
+  return {
+    replayJournal: () => replayJournal(root),
+    openBatch: () => {
+      unlinkOne = opts.unlinkOne ?? ((targetPath: string) => confinedUnlink(targetPath, root));
+      return openBatch(root);
+    },
+    recordPreState: (batch, slug) => recordPreState(batch, target(slug)),
+    unlink: (slug) => unlinkOne(target(slug)),
+    probeNoFollow: async (slug) => { await locationKindNoFollow(target(slug)); },
+    commitBatch: (batch) => commitBatch(batch),
+  };
 }
 
 /**
@@ -74,38 +120,41 @@ export async function deleteWikiPagesLocked(
   slugs: string[],
   opts: DeleteOptions = {},
 ): Promise<{ skipped: SkippedDelete[] }> {
+  return deleteWikiPagesWith(localPageDeleteSteps(root, opts), slugs);
+}
+
+/** {@link deleteWikiPagesLocked} over {@link PageDeleteSteps}: THE ONE BODY. The caller holds the project lock. */
+export async function deleteWikiPagesWith(steps: PageDeleteSteps, slugs: string[]): Promise<{ skipped: SkippedDelete[] }> {
   // Replay-before-mutate, under the held lock: recover any batch a prior crash
   // left pending BEFORE opening a new one. Mirrors the executor's dispatch.
-  await replayJournal(root);
+  await steps.replayJournal();
 
   const { allowed, skipped } = partitionBySlugFloor(slugs);
   if (allowed.length === 0) return { skipped };
 
-  const unlinkOne = opts.unlinkOne ?? ((target: string) => confinedUnlink(target, root));
-  const batch = await openBatch(root);
+  const batch = await steps.openBatch();
   for (const slug of allowed) {
-    const target = path.join(root, CONCEPTS_DIR, `${slug}.md`);
-    await recordPreState(batch, target);
-    await unlinkOne(target);
-    await assertUnlinked(target, slug);
+    await steps.recordPreState(batch, slug);
+    await steps.unlink(slug);
+    await assertUnlinked(steps, slug);
   }
-  await commitBatch(batch);
+  await steps.commitBatch(batch);
   return { skipped };
 }
 
 /**
- * Confirm `target` is actually gone after `unlinkOne` returns, so a swallowed
- * unlink failure can never be misreported as a completed delete. `lstat`, not
- * `stat`: a symlink LEAF must still count as present rather than being
- * followed and misread as absent.
+ * Confirm the page is actually gone after its unlink returns, so a swallowed
+ * unlink failure can never be misreported as a completed delete. No-follow
+ * (`lstat` on disk), not `stat`: a symlink LEAF must still count as present
+ * rather than being followed and misread as absent.
  *
- * @param target - Absolute path the batch attempted to unlink.
+ * @param steps - The batch's steps; only the no-follow probe is asked.
  * @param slug - The slug being deleted, named in the thrown error so a caller
  *   can tell which page failed.
  */
-async function assertUnlinked(target: string, slug: string): Promise<void> {
+async function assertUnlinked(steps: PageDeleteSteps, slug: string): Promise<void> {
   try {
-    await lstat(target);
+    await steps.probeNoFollow(slug);
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return; // gone — the delete succeeded
     throw error; // an unexpected lstat fault is a real problem, not "still there"

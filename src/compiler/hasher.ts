@@ -7,21 +7,17 @@
  */
 
 import { createHash } from "node:crypto";
-import { constants as fsConstants } from "fs";
-import { open } from "fs/promises";
 import path from "path";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import { readRegularLocationText } from "../storage/disk-locations.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import { SOURCES_DIR } from "../utils/constants.js";
 import type { WikiState, SourceChange } from "../utils/types.js";
-import { listSelectedSourceFiles } from "../sources/scan.js";
-import { isSourceSelected, loadSourceSelection, type SourceSelection } from "../sources/selection.js";
+import { listSelectedSourceFilesFrom } from "../sources/scan.js";
+import { isSourceSelected, loadSourceSelectionFrom, type SourceSelection } from "../sources/selection.js";
 
-/** Thrown by {@link hashFile} for a path that is not a regular file (a named pipe, directory or device). */
-export class NotRegularFileError extends Error {
-  constructor(filePath: string) {
-    super(`Not a regular file: ${filePath}`);
-    this.name = "NotRegularFileError";
-  }
-}
+// Re-exported where `hashFile` callers have always imported it from.
+export { NotRegularFileError } from "../storage/disk-locations.js";
 
 /**
  * Read a file and compute its SHA-256 hash.
@@ -35,14 +31,31 @@ export class NotRegularFileError extends Error {
  * @throws {NotRegularFileError} When the path is not a regular file.
  */
 export async function hashFile(filePath: string): Promise<string> {
-  const handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
-  try {
-    if (!(await handle.stat()).isFile()) throw new NotRegularFileError(filePath);
-    const content = await handle.readFile("utf-8");
-    return createHash("sha256").update(content).digest("hex");
-  } finally {
-    await handle.close();
-  }
+  const content = await readRegularLocationText(filePath);
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Reads one source's text for HASHING, by its project-relative path
+ * (`sources/<file>`). Kept apart from the generic content reads so the local
+ * disk can hash without blocking (see {@link diskSourceHashText}) while every
+ * other page and configuration read keeps its incumbent behaviour.
+ */
+export type SourceHashText = (relPath: string) => Promise<string>;
+
+/**
+ * LOCAL DISK. Source text for hashing under `root`, through the same
+ * non-blocking regular-file read as {@link hashFile}: a named pipe, directory
+ * or device rejects with {@link NotRegularFileError} instead of hanging.
+ */
+export function diskSourceHashText(root: string): SourceHashText {
+  return (relPath) => readRegularLocationText(path.join(root, relPath));
+}
+
+/** SHA-256 hex of one source's text, read through `readText`. */
+export async function hashSourceFrom(readText: SourceHashText, file: string): Promise<string> {
+  const content = await readText(path.join(SOURCES_DIR, file));
+  return createHash("sha256").update(content).digest("hex");
 }
 
 /**
@@ -52,44 +65,62 @@ export async function hashFile(filePath: string): Promise<string> {
  * @param prevState - The previously persisted WikiState to compare against.
  * @returns Array of SourceChange entries describing each file's status.
  */
-export async function detectChanges(
+export function detectChanges(
   root: string,
   prevState: WikiState,
 ): Promise<SourceChange[]> {
-  const selection = await loadSourceSelection(root);
-  const currentFiles = await listSelectedSourceFiles(root, selection);
-  const changes: SourceChange[] = [];
-
-  for (const file of currentFiles) {
-    const status = await classifyFile(root, file, prevState);
-    changes.push({ file, status });
-  }
-
-  const deletedChanges = findDeletedFiles(currentFiles, prevState, selection);
-  changes.push(...deletedChanges);
-
-  return changes;
+  return detectChangesFrom(diskLocalReads(root), prevState, diskSourceHashText(root));
 }
 
 /**
- * Classify a single source file as new, changed, or unchanged.
- * @param root - Project root directory.
- * @param file - Filename within sources/.
- * @param prevState - Previous compilation state.
- * @returns The change status for this file.
+ * The same classification, with the selection and listing read through
+ * `reads` and each source hashed from `hashText` (by default, `reads` too).
  */
-async function classifyFile(
-  root: string,
-  file: string,
+export async function detectChangesFrom(
+  reads: LegacyLocalReads,
   prevState: WikiState,
-): Promise<SourceChange["status"]> {
-  const filePath = path.join(root, SOURCES_DIR, file);
-  const hash = await hashFile(filePath);
-  const prev = prevState.sources[file];
+  hashText: SourceHashText = (relPath) => reads.readText(relPath),
+): Promise<SourceChange[]> {
+  const selection = await loadSourceSelectionFrom(reads);
+  const currentFiles = await listSelectedSourceFilesFrom(reads, selection);
+  const hashed: HashedSource[] = [];
+  for (const file of currentFiles) {
+    hashed.push({ file, hash: await hashSourceFrom(hashText, file) });
+  }
+  return changesFromHashes(hashed, prevState, selection);
+}
 
-  if (!prev) return "new";
-  if (prev.hash !== hash) return "changed";
-  return "unchanged";
+/** One selected source and the hash of its current text. */
+interface HashedSource {
+  file: string;
+  hash: string;
+}
+
+/**
+ * Classify already-hashed sources against the previous state. Pure: however
+ * the sources were read and hashed, the new/changed/unchanged/deleted
+ * decisions come from this one function.
+ *
+ * @param hashed - Every selected source with its current hash, in listing order.
+ * @param prevState - The previously persisted WikiState to compare against.
+ * @param selection - The selection the listing was made under.
+ */
+function changesFromHashes(
+  hashed: readonly HashedSource[],
+  prevState: WikiState,
+  selection: SourceSelection,
+): SourceChange[] {
+  const changes: SourceChange[] = hashed.map(({ file, hash }) => ({
+    file, status: classifyHash(prevState.sources[file]?.hash, hash),
+  }));
+  changes.push(...findDeletedFiles(hashed.map(({ file }) => file), prevState, selection));
+  return changes;
+}
+
+/** Classify one source as new, changed, or unchanged from its previous hash. */
+function classifyHash(previous: string | undefined, hash: string): SourceChange["status"] {
+  if (previous === undefined) return "new";
+  return previous === hash ? "unchanged" : "changed";
 }
 
 /**

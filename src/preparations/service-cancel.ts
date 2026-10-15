@@ -31,11 +31,18 @@
  * and request DTOs carry no actor identity (D-10-9 / I2) — a caller-presented
  * one would be a self-asserted name on a durable-ish record. It is taken from
  * the host-assigned principal instead, so it says who the host authenticated.
+ *
+ * ONE BODY, {@link cancelPreparationOperationWith}, over {@link CancelSteps}: the
+ * manifest lookup, the run read, the lock-free advisory write and its re-read,
+ * none of which takes a project root. The root form passes {@link diskCancelSteps},
+ * which calls the incumbent root readers and writer when asked;
+ * {@link cancelStepsOver} composes them from each one's own body.
  */
 
 import { randomBytes } from "node:crypto";
 import {
-  isAdmissibleCancelRequester, readPreparationCancel, writePreparationCancelLockFree,
+  isAdmissibleCancelRequester, readPreparationCancel, readPreparationCancelFrom, writePreparationCancelLockFree,
+  writePreparationCancelWith, type PreparationCancelInput, type PreparationCancelLeaves, type PreparationCancelRead,
 } from "./cancellation.js";
 import type { PreparationRunId } from "./ids.js";
 import { preparationRelativeCancelPath } from "./paths.js";
@@ -47,7 +54,10 @@ import {
   CANCEL_HONORABLE_RUN_STATES, handoffOwnsRunSettlement,
 } from "./attempts/cancel-settlement.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
-import { locatePreparationManifest, readPreparationRunForManifest } from "./service-run-lookup.js";
+import {
+  locatePreparationManifest, locatePreparationManifestFrom, readPreparationRunForManifest, readPreparationRunForManifestFrom,
+  type PreparationManifestLookupV1, type PreparationRunLookupReads, type PreparationRunLookupV1,
+} from "./service-run-lookup.js";
 
 /** Request for the `cancel` operation. Carries no actor, surface or grant. */
 export interface CancelRequestV1 {
@@ -67,6 +77,38 @@ export type CancelResultV1 =
 
 /** Advisory nonce width, matching the record's 128-bit lowercase-hex grammar. */
 const CANCEL_NONCE_BYTES = 16;
+
+/** What one cancellation request asks for, in order. No member takes a project root. */
+export interface CancelSteps {
+  /** The manifest of the named run, from one inventory scan. */
+  locateManifest(runId: string): Promise<PreparationManifestLookupV1>;
+  /** The run that manifest binds, authenticated. */
+  readRunForManifest(manifest: PreparationManifestV1): Promise<PreparationRunLookupV1>;
+  /** Publish the advisory, lock-free and create-only. */
+  writeCancel(input: PreparationCancelInput): Promise<"created" | "exists">;
+  /** Re-read the advisory that occupies the run's cancel path. */
+  readCancel(workspaceId: string, runId: PreparationRunId): Promise<PreparationCancelRead>;
+}
+
+/** LOCAL DISK. The incumbent root readers and writer for `root`, each called when asked. */
+function diskCancelSteps(root: string): CancelSteps {
+  return {
+    locateManifest: (runId) => locatePreparationManifest(root, runId),
+    readRunForManifest: (manifest) => readPreparationRunForManifest(root, manifest),
+    writeCancel: (input) => writePreparationCancelLockFree(root, input),
+    readCancel: (workspaceId, runId) => readPreparationCancel(root, workspaceId, runId),
+  };
+}
+
+/** The same steps over the run lookup's reads and the advisory leaves. Building it does no I/O. */
+export function cancelStepsOver(sources: { lookup: PreparationRunLookupReads; advisories: PreparationCancelLeaves }): CancelSteps {
+  return {
+    locateManifest: (runId) => locatePreparationManifestFrom(sources.lookup, runId),
+    readRunForManifest: (manifest) => readPreparationRunForManifestFrom(sources.lookup, manifest),
+    writeCancel: (input) => writePreparationCancelWith(sources.advisories, input),
+    readCancel: (workspaceId, runId) => readPreparationCancelFrom(sources.advisories, workspaceId, runId),
+  };
+}
 
 /**
  * Whether anything could ever honor a cancellation published over this run, and
@@ -127,8 +169,8 @@ function committedHandoffRefusal(run: PreparationRunV1): string {
  * It reads the run through the manifest the caller ALREADY located, so this
  * operation observes the inventory exactly once.
  */
-async function stateRefusal(root: string, manifest: PreparationManifestV1): Promise<string | null> {
-  const resolved = await readPreparationRunForManifest(root, manifest);
+async function stateRefusal(steps: CancelSteps, manifest: PreparationManifestV1): Promise<string | null> {
+  const resolved = await steps.readRunForManifest(manifest);
   return resolved.ok ? unhonorableRefusal(resolved.run) : null;
 }
 
@@ -151,9 +193,9 @@ async function stateRefusal(root: string, manifest: PreparationManifestV1): Prom
  *  - `unavailable` — something IS there and it is not a request.
  */
 async function classifyCollision(
-  root: string, workspaceId: string, runId: PreparationRunId,
+  steps: CancelSteps, workspaceId: string, runId: PreparationRunId,
 ): Promise<CancelResultV1> {
-  const read = await readPreparationCancel(root, workspaceId, runId);
+  const read = await steps.readCancel(workspaceId, runId);
   if (read.status === "present") return { status: "requested", runId, request: "already-pending" };
   if (read.status === "absent") {
     return {
@@ -187,6 +229,14 @@ async function classifyCollision(
 export async function cancelPreparationOperation(
   root: string, principal: PreparationPrincipal, request: CancelRequestV1,
 ): Promise<CancelResultV1> {
+  // Building the disk steps does no I/O and awaits nothing, so the body's capture still runs before the first await.
+  return cancelPreparationOperationWith(diskCancelSteps(root), principal, request);
+}
+
+/** {@link cancelPreparationOperation} over {@link CancelSteps}: THE ONE BODY. */
+export async function cancelPreparationOperationWith(
+  steps: CancelSteps, principal: PreparationPrincipal, request: CancelRequestV1,
+): Promise<CancelResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE (D-10-9), read once and threaded. A
   // field re-read after an await retargets the request at a run the caller never
   // named — the defect `stage` and `fail` both carry the fix for.
@@ -203,19 +253,19 @@ export async function cancelPreparationOperation(
   if (!isAdmissibleCancelRequester(requester)) {
     return { status: "refused", reason: "the host principal's identity is not an admissible requester label" };
   }
-  const located = await locatePreparationManifest(root, runId);
+  const located = await steps.locateManifest(runId);
   if (!located.ok) return { status: "refused", reason: located.reason };
-  const refused = await stateRefusal(root, located.manifest);
+  const refused = await stateRefusal(steps, located.manifest);
   if (refused !== null) return { status: "refused", reason: refused };
   const { workspaceId, runId: manifestRunId } = located.manifest;
   // The MANIFEST's run id, not the caller's string: the id written into the
   // record is the one the located manifest carries, so the path and the record
   // are bound to the same authority the lookup resolved.
-  const outcome = await writePreparationCancelLockFree(root, {
+  const outcome = await steps.writeCancel({
     workspaceId, runId: manifestRunId, requester,
     at: new Date().toISOString(), nonce: randomBytes(CANCEL_NONCE_BYTES).toString("hex"),
   });
   return outcome === "created"
     ? { status: "requested", runId, request: "created" }
-    : classifyCollision(root, workspaceId, manifestRunId);
+    : classifyCollision(steps, workspaceId, manifestRunId);
 }

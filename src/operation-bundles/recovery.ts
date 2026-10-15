@@ -9,13 +9,18 @@
  * state. `resumeOperationRecoveryLocked` is the explicit operator resume: it
  * requires the exact manifest digest, the approve grant, and unchanged recorded
  * authority before it moves a `recovery-required` run back into `applying`.
+ *
+ * ONE BODY EACH over `OperationRunStores` (`run-session.ts`):
+ * {@link recoverOperationRunWith} and {@link resumeOperationRecoveryWith}. The
+ * root forms keep their signatures and pass the disk stores.
  */
 
 import { currentApplyOwner } from "./apply-owner.js";
+import { computeAuthoritySnapshot, settleToTerminal } from "./executor.js";
 import {
-  appendRunStep, computeAuthoritySnapshot, loadApprovedAction, loadRunSession, runResult, settleToTerminal,
-  type ApproveOperationBundleRequest, type OperationActionResult, type RunSession,
-} from "./executor.js";
+  appendRunStep, diskOperationRunStores, loadApprovedActionWith, loadRunSessionWith, runResult,
+  type ApproveOperationBundleRequest, type OperationActionResult, type OperationRunStores, type RunSession,
+} from "./run-session.js";
 import type { OperationRun } from "./run-types.js";
 
 /**
@@ -37,7 +42,12 @@ async function driveRecovery(session: RunSession, run: OperationRun): Promise<Op
  * unchanged. The caller establishes that the prior owner is not live.
  */
 export async function recoverOperationRunLocked(root: string, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
-  const loaded = await loadRunSession(root, request);
+  return recoverOperationRunWith(diskOperationRunStores(root), request);
+}
+
+/** {@link recoverOperationRunLocked} over {@link OperationRunStores}: THE ONE BODY. */
+export async function recoverOperationRunWith(stores: OperationRunStores, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
+  const loaded = await loadRunSessionWith(stores, request);
   if (loaded.status === "problem") return loaded.result;
   const { session, run } = loaded;
   if (run.state !== "applying") return runResult(run);
@@ -50,7 +60,12 @@ export async function recoverOperationRunLocked(root: string, request: ApproveOp
  * through recovery-resumed, then re-drives the same observation coordinator.
  */
 export async function resumeOperationRecoveryLocked(root: string, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
-  const loaded = await loadApprovedAction(root, request, "recovery-required");
+  return resumeOperationRecoveryWith(diskOperationRunStores(root), request);
+}
+
+/** {@link resumeOperationRecoveryLocked} over {@link OperationRunStores}: THE ONE BODY. */
+export async function resumeOperationRecoveryWith(stores: OperationRunStores, request: ApproveOperationBundleRequest): Promise<OperationActionResult> {
+  const loaded = await loadApprovedActionWith(stores, request, "recovery-required");
   if (loaded.status === "stop") return loaded.result;
   const { session } = loaded;
   let run = loaded.run;

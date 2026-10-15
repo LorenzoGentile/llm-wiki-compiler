@@ -18,9 +18,18 @@
  * THE PLAN IS READ-ONLY; {@link executeReset} is the one consumer that
  * destroys, and it consumes THIS plan rather than re-walking the tree.
  * `state` keeps its existing backup-and-remove path untouched.
+ *
+ * ONE BODY EACH. {@link planReset} and {@link executeReset} keep their
+ * signatures and run {@link planResetFrom} and {@link executeResetFrom}. The
+ * bodies decide scope roots, the absent skip, the confinement refusal, dedupe
+ * and order, the vanished-file skip and what a failed unlink means. The local
+ * disk reads and leaves are the incumbent physical mechanisms (realpath, the
+ * no-follow look, the recursive listing, the confined durable unlink), called
+ * when asked and in the same order.
  */
 
-import { readdir, lstat } from "node:fs/promises";
+import { listDirectoryEntriesRecursive } from "../storage/disk-guarded-leaves.js";
+import { locationKindNoFollow } from "../storage/disk-local-reads.js";
 import { unlinkConfinedLeafDurable } from "../utils/confined-delete.js";
 import path from "node:path";
 import { isInsideDir, safeRealpath } from "../utils/path-confine.js";
@@ -59,12 +68,30 @@ function rootsFor(scope: ResetScopeV1): readonly string[] {
   return Object.values(SCOPE_ROOTS).flat();
 }
 
+/** What planning asks of the project: its real root, one target's real path, and the files under a real target. No member takes a root. */
+export interface ResetPlanReads {
+  /** The project's real root, or its resolved spelling when it cannot be resolved. */
+  realRoot(): Promise<string>;
+  /** The real path of `relative` under the project, or `null` when it is absent. */
+  realPathOf(relative: string): Promise<string | null>;
+  /** Every file under the real target, depth-first, relative to the project root. */
+  filesUnder(real: string): Promise<string[]>;
+}
+
+/** What execution asks of the project, by project-relative path. No member takes a root. */
+export interface ResetDeleteLeaves {
+  /** A no-follow look at `relative`; rejects with the raw error (`ENOENT` when it is absent). */
+  kindNoFollow(relative: string): Promise<unknown>;
+  /** Unlink `relative` durably, confined to its own directory; rejects with the raw error. */
+  unlinkConfined(relative: string): Promise<void>;
+}
+
 /** Every file under `target`, depth-first, relative to `root`. */
 async function filesUnder(root: string, target: string): Promise<string[]> {
-  const info = await lstat(target).catch(() => null);
+  const info = await locationKindNoFollow(target).catch(() => null);
   if (info === null) return [];
-  if (!info.isDirectory()) return [path.relative(root, target)];
-  const entries = await readdir(target, { recursive: true, withFileTypes: true });
+  if (info !== "directory") return [path.relative(root, target)];
+  const entries = await listDirectoryEntriesRecursive(target);
   return entries
     .filter((entry) => entry.isFile())
     .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)));
@@ -78,18 +105,31 @@ async function filesUnder(root: string, target: string): Promise<string[]> {
  * @returns The sorted file list, or why the scope could not be planned.
  */
 export async function planReset(root: string, scope: ResetScopeV1): Promise<ResetPlanV1> {
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
+  return planResetFrom(diskResetPlanReads(root), scope);
+}
+
+/** LOCAL DISK. The incumbent realpath and walk for `root`, called when asked. */
+function diskResetPlanReads(root: string): ResetPlanReads {
+  return {
+    realRoot: async () => (await safeRealpath(root)) ?? path.resolve(root),
+    realPathOf: (relative) => safeRealpath(path.join(root, relative)),
+    filesUnder: (real) => filesUnder(root, real),
+  };
+}
+
+/** THE ONE BODY of {@link planReset}: the scope's roots in order, the absent skip, the confinement refusal, then the sorted unique files. */
+export async function planResetFrom(reads: ResetPlanReads, scope: ResetScopeV1): Promise<ResetPlanV1> {
+  const realRoot = await reads.realRoot();
   const files: string[] = [];
   for (const relative of rootsFor(scope)) {
-    const target = path.join(root, relative);
-    const real = await safeRealpath(target);
+    const real = await reads.realPathOf(relative);
     // An absent target contributes nothing; a PRESENT one that resolves outside
     // the project is a confinement refusal, never a silent skip.
     if (real === null) continue;
     if (!isInsideDir(real, realRoot)) {
       return { status: "unavailable", scope, reason: `${relative} resolves outside the project root` };
     }
-    files.push(...await filesUnder(root, real));
+    files.push(...await reads.filesUnder(real));
   }
   return { status: "planned", scope, files: [...new Set(files)].sort() };
 }
@@ -126,16 +166,33 @@ export type ResetExecutionV1 =
 export async function executeReset(
   root: string, scope: ResetScopeV1, plan: ResetPlanV1,
 ): Promise<ResetExecutionV1> {
+  return executeResetFrom(diskResetDeleteLeaves(root), scope, plan);
+}
+
+/** LOCAL DISK. The incumbent no-follow look and confined durable unlink under `root`, called when asked. */
+function diskResetDeleteLeaves(root: string): ResetDeleteLeaves {
+  return {
+    kindNoFollow: (relative) => locationKindNoFollow(path.join(root, relative)),
+    unlinkConfined: (relative) => {
+      const target = path.join(root, relative);
+      return unlinkConfinedLeafDurable(root, target, path.dirname(target));
+    },
+  };
+}
+
+/** THE ONE BODY of {@link executeReset}: a refused plan refuses, a vanished file is skipped, any other failure refuses. */
+export async function executeResetFrom(
+  leaves: ResetDeleteLeaves, scope: ResetScopeV1, plan: ResetPlanV1,
+): Promise<ResetExecutionV1> {
   if (plan.status !== "planned") return { status: "refused", scope, reason: plan.reason };
   const deleted: string[] = [];
   for (const relative of plan.files) {
-    const target = path.join(root, relative);
     try {
-      if (await lstat(target).then(() => false, error => {
+      if (await leaves.kindNoFollow(relative).then(() => false, (error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return true;
         throw error;
       })) continue;
-      await unlinkConfinedLeafDurable(root, target, path.dirname(target));
+      await leaves.unlinkConfined(relative);
       deleted.push(relative);
     } catch (error) {
       // Already gone is the goal state, reached by someone else.

@@ -11,13 +11,18 @@
  * The shape mirrors {@link WikiState} (so `detectChanges` can compare against
  * it directly), with a per-source output language for prompt invalidation.
  * `concepts` is always empty because rule extraction produces candidates, not pages.
+ *
+ * ONE BODY EACH, OVER ONE LEAF. {@link readRuleStateFrom} and
+ * {@link updateRuleSourceStateFrom} decide over {@link RuleStateLeaf}, the
+ * cursor's one leaf; the root forms keep their signatures and pass the local
+ * leaf, built per call, which calls the incumbent presence look, text read and
+ * hardened atomic replacement when asked.
  */
 
-import { readFile } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
+import { replaceLeafAtomicWithin } from "../storage/disk-guarded-leaves.js";
+import { locationExistsSync, readLocationText } from "../storage/disk-locations.js";
 import { RULE_STATE_FILE } from "../utils/constants.js";
-import { atomicWrite } from "../utils/markdown.js";
 import type { WikiState, SourceState } from "../utils/types.js";
 
 /** A source advances only under the language that successfully processed it. */
@@ -29,6 +34,26 @@ interface RuleSourceState extends SourceState {
 /** Independent rule cursor, structurally compatible with source change detection. */
 interface RuleState extends WikiState {
   sources: Record<string, RuleSourceState>;
+}
+
+/** The cursor's one leaf, `.llmwiki/rule-state.json`, as the bodies ask it. No member takes a project root. */
+export interface RuleStateLeaf {
+  /** Whether anything is at the leaf (following links). */
+  present(): Promise<boolean>;
+  /** The leaf's whole text; rejects when it cannot be read. */
+  readText(): Promise<string>;
+  /** Replace the leaf with `text`, atomically. */
+  replace(text: string): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent presence look, read and hardened replacement for `root`'s cursor leaf, each called when asked. */
+function diskRuleStateLeaf(root: string): RuleStateLeaf {
+  const filePath = path.join(root, RULE_STATE_FILE);
+  return {
+    present: async () => locationExistsSync(filePath),
+    readText: () => readLocationText(filePath),
+    replace: (text) => replaceLeafAtomicWithin(root, filePath, text),
+  };
 }
 
 /** A fresh, empty rule-extraction state. */
@@ -43,23 +68,17 @@ function emptyRuleState(): RuleState {
  * @param root - Project root directory.
  */
 export async function readRuleState(root: string): Promise<RuleState> {
-  const filePath = path.join(root, RULE_STATE_FILE);
-  if (!existsSync(filePath)) return emptyRuleState();
+  return readRuleStateFrom(diskRuleStateLeaf(root));
+}
+
+/** {@link readRuleState} over {@link RuleStateLeaf}: THE ONE BODY. Absent, unreadable or unparsable is an empty cursor. */
+export async function readRuleStateFrom(leaf: RuleStateLeaf): Promise<RuleState> {
+  if (!(await leaf.present())) return emptyRuleState();
   try {
-    return JSON.parse(await readFile(filePath, "utf-8")) as RuleState;
+    return JSON.parse(await leaf.readText()) as RuleState;
   } catch {
     return emptyRuleState();
   }
-}
-
-/**
- * Atomically write rule-state.json via the shared hardened {@link atomicWrite}
- * primitive (random O_EXCL temp + rename), so this cursor writer inherits the
- * same leaf-symlink write-escape defenses rather than carrying its own temp+rename.
- */
-async function writeRuleState(root: string, state: WikiState): Promise<void> {
-  const filePath = path.join(root, RULE_STATE_FILE);
-  await atomicWrite(filePath, JSON.stringify(state, null, 2), { confineRoot: root });
 }
 
 /**
@@ -74,7 +93,17 @@ export async function updateRuleSourceState(
   sourceFile: string,
   entry: RuleSourceState,
 ): Promise<void> {
-  const state = await readRuleState(root);
+  return updateRuleSourceStateFrom(diskRuleStateLeaf(root), sourceFile, entry);
+}
+
+/**
+ * {@link updateRuleSourceState} over {@link RuleStateLeaf}: THE ONE BODY. Read the
+ * cursor afresh, set this source's entry, and replace the leaf atomically (on
+ * disk, the shared hardened {@link replaceLeafAtomicWithin}: random O_EXCL temp +
+ * rename, with its leaf-symlink write-escape defenses).
+ */
+export async function updateRuleSourceStateFrom(leaf: RuleStateLeaf, sourceFile: string, entry: RuleSourceState): Promise<void> {
+  const state = await readRuleStateFrom(leaf);
   state.sources[sourceFile] = entry;
-  await writeRuleState(root, state);
+  await leaf.replace(JSON.stringify(state, null, 2));
 }

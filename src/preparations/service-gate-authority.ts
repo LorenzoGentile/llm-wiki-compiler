@@ -22,10 +22,17 @@
  * does-not-qualify; a phase whose upstream output has not been produced yet is a
  * could-not-derive. Collapsing them told an operator their plan was wrong when
  * the truth was that the run had not got there yet.
+ *
+ * ONE DECISION over the one manifest read. {@link resolveGateAuthority} keeps its
+ * signature and asks the incumbent root reader; {@link resolveGateAuthorityFrom}
+ * asks the manifest store's own body over its leaves.
  */
 
 import { preparationManifestDigest } from "./manifest-parse.js";
-import { readPreparationManifest } from "./manifest-store.js";
+import {
+  readPreparationManifest, readPreparationManifestFrom,
+  type PreparationManifestLeafReads, type PreparationManifestRead,
+} from "./manifest-store.js";
 import type {
   NormalizedPhaseV1, NormalizedPreparationPlanV1, PhaseGateContractV1,
 } from "./plan-types.js";
@@ -139,7 +146,20 @@ function bindAuthority(
 export async function resolveGateAuthority(
   root: string, binding: PreparationRunBinding, run: PreparationRunV1, gateId: string,
 ): Promise<GateAuthorityLookupV1> {
-  const read = await readPreparationManifest(root, binding.workspaceId, binding.preparationId);
+  return authorityFromManifest(await readPreparationManifest(root, binding.workspaceId, binding.preparationId), binding, run, gateId);
+}
+
+/** {@link resolveGateAuthority} over the manifest store's leaves: the same decision over the store's one body. In no package index. */
+export async function resolveGateAuthorityFrom(
+  manifests: PreparationManifestLeafReads, binding: PreparationRunBinding, run: PreparationRunV1, gateId: string,
+): Promise<GateAuthorityLookupV1> {
+  return authorityFromManifest(await readPreparationManifestFrom(manifests, binding.workspaceId, binding.preparationId), binding, run, gateId);
+}
+
+/** The bound authority over one manifest read: matched to the binding's digest, then the gate's phase. Pure. */
+function authorityFromManifest(
+  read: PreparationManifestRead, binding: PreparationRunBinding, run: PreparationRunV1, gateId: string,
+): GateAuthorityLookupV1 {
   if (read.status !== "ok") return { ok: false, reason: `the run's manifest is ${read.status}` };
   if (preparationManifestDigest(read.manifest) !== binding.manifestDigest) {
     return { ok: false, reason: "the run's manifest digest changed; this is no longer the plan the run was staged against" };

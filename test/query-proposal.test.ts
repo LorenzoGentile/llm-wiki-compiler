@@ -7,7 +7,7 @@ import { chmod, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { maybeSaveQueryPage } from "../src/commands/query-publication.js";
 import { generateAnswer } from "../src/commands/query.js";
-import { updateEmbeddingsLockedCore } from "../src/utils/embeddings.js";
+import { updateEmbeddingsLockedCore, updateEmbeddingsLockedCoreFrom } from "../src/utils/embeddings.js";
 import { parseFrontmatter } from "../src/utils/markdown.js";
 import { sha256Text } from "../src/connectors/hash.js";
 import { usePublicationRoot, propose, candidateBytes } from "./fixtures/publication-review.js";
@@ -17,6 +17,14 @@ import { callClaude } from "../src/utils/llm.js";
 vi.mock("../src/utils/llm.js", () => ({ callClaude: vi.fn() }));
 
 const root = usePublicationRoot();
+
+/** Nothing was published as a query page, and no embedding refresh ran by either form. */
+async function expectNoQueryPageNorRefresh(): Promise<void> {
+  expect(await readdir(path.join(root.dir, "wiki/queries"))).toEqual([]);
+  expect(updateEmbeddingsLockedCore).not.toHaveBeenCalled();
+  expect(updateEmbeddingsLockedCoreFrom).not.toHaveBeenCalled();
+}
+
 it("returns a candidate ID and preserved answer through generation without extra provider work", async () => {
   vi.mocked(callClaude).mockReset().mockImplementation(async options => options.tools
     ? JSON.stringify({ pages: ["concepts/alpha"], reasoning: "Selected alpha" }) : "[[beta]]");
@@ -48,6 +56,7 @@ it("stages pending citations as separate forced-review answers with exact manife
   expect(await readdir(path.join(root.dir, "wiki/queries"))).toEqual([]);
   expect(await readFile(path.join(root.dir, "wiki/index.md"))).toEqual(before);
   expect(updateEmbeddingsLockedCore).not.toHaveBeenCalled();
+  expect(updateEmbeddingsLockedCoreFrom).not.toHaveBeenCalled();
 });
 
 it("stages in a profile-enabled project without publishing or refreshing", async () => {
@@ -55,8 +64,7 @@ it("stages in a profile-enabled project without publishing or refreshing", async
   const result = await maybeSaveQueryPage({ root: root.dir, question: "Answer", answer: "[[Alpha]]", save: true, review: true });
   expect(result.publicationRefusal).toBeUndefined();
   expect(result.candidateId).toBeTypeOf("string");
-  expect(await readdir(path.join(root.dir, "wiki/queries"))).toEqual([]);
-  expect(updateEmbeddingsLockedCore).not.toHaveBeenCalled();
+  await expectNoQueryPageNorRefresh();
 });
 it.each(["broken", "unavailable"])("refuses %s staging without adding candidates", async (code) => {
   if (code === "unavailable") await chmod(path.join(root.dir, "wiki/concepts/alpha.md"), 0o000);
@@ -65,6 +73,5 @@ it.each(["broken", "unavailable"])("refuses %s staging without adding candidates
   expect(result.publicationRefusal?.code).toBe(code);
   expect(result.candidateId).toBeUndefined();
   expect(await readdir(path.join(root.dir, ".llmwiki/candidates"))).toEqual(before);
-  expect(await readdir(path.join(root.dir, "wiki/queries"))).toEqual([]);
-  expect(updateEmbeddingsLockedCore).not.toHaveBeenCalled();
+  await expectNoQueryPageNorRefresh();
 });

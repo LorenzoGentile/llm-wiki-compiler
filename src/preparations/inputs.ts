@@ -10,6 +10,13 @@
  * copy is proven against an independent second read so a swap between copy and
  * record fails closed. Structured values are canonicalized and stored the same
  * way. Every payload byte stays untrusted even when its digest is valid.
+ *
+ * Caller-file materialization has ONE BODY, {@link materializeCallerFileInputWith},
+ * over {@link CallerFileEvidenceSteps}: the create-only stream into the evidence
+ * CAS and the evidence presence read, neither of which takes a project root.
+ * The caller file's own opens stay in the body: they are the CALLER's file, not
+ * the project. The root form passes the incumbent store calls for its root;
+ * {@link callerFileEvidenceStepsOver} composes them from the store's own bodies.
  */
 
 import { createHash } from "node:crypto";
@@ -21,8 +28,9 @@ import { parseInputId } from "../capability-providers/ids.js";
 import type { InputIdV1 } from "../capability-providers/types.js";
 import { MAX_PREPARATION_EVIDENCE_OBJECT_BYTES } from "./constants.js";
 import {
-  readPreparationEvidence, streamPreparationEvidenceCreateOnly,
-  type EvidenceStreamOutcome, type PreparationEvidenceLocation,
+  readPreparationEvidence, readPreparationEvidenceFrom, streamPreparationEvidenceCreateOnly, streamPreparationEvidenceCreateOnlyWith,
+  type EvidenceStreamOutcome, type PreparationEvidenceLeafReads, type PreparationEvidenceLocation, type PreparationEvidenceRead,
+  type PreparationEvidenceWriteSteps,
 } from "./evidence-store.js";
 import type { EvidenceRefV1, EvidenceSensitivity, Sha256Digest } from "./types.js";
 
@@ -229,17 +237,39 @@ export function prepareStructuredValueInput(source: StructuredValueSourceV1): { 
   return { input: buildDescriptor(source, bare, bytes.byteLength), digest: `${SHA256_PREFIX}${bare}`, bytes };
 }
 
+/** The two project calls one caller-file materialization makes. No member takes a project root. */
+export interface CallerFileEvidenceSteps {
+  /** Stream an opened source into the create-only evidence CAS, verified against `expectedDigest` within `maxBytes`. */
+  streamEvidence(location: PreparationEvidenceLocation, source: FileHandle, expectedDigest: string, maxBytes: number): Promise<EvidenceStreamOutcome>;
+  /** Whether one evidence object is present and verified. */
+  readEvidence(location: PreparationEvidenceLocation, digest: string): Promise<PreparationEvidenceRead>;
+}
+
+/** LOCAL DISK. The incumbent store calls for `root`, each called when asked. */
+function diskCallerFileEvidenceSteps(root: string): CallerFileEvidenceSteps {
+  return {
+    streamEvidence: (location, source, expectedDigest, maxBytes) => streamPreparationEvidenceCreateOnly(root, location, source, expectedDigest, maxBytes),
+    readEvidence: (location, digest) => readPreparationEvidence(root, location, digest),
+  };
+}
+
+/** The same calls over the evidence store's own write and read bodies. Building them does no I/O. */
+export function callerFileEvidenceStepsOver(sources: { writes: PreparationEvidenceWriteSteps; reads: PreparationEvidenceLeafReads }): CallerFileEvidenceSteps {
+  return {
+    streamEvidence: (location, source, expectedDigest, maxBytes) => streamPreparationEvidenceCreateOnlyWith(sources.writes, location, source, expectedDigest, maxBytes),
+    readEvidence: (location, digest) => readPreparationEvidenceFrom(sources.reads, location, digest),
+  };
+}
+
 /** Stream the authorized source bytes into the create-only evidence CAS. */
 async function copyIntoEvidence(
-  root: string, location: PreparationEvidenceLocation, prepared: PreparedCallerFileV1,
+  steps: CallerFileEvidenceSteps, location: PreparationEvidenceLocation, prepared: PreparedCallerFileV1,
 ): Promise<{ status: "unavailable"; code: PreparedInputUnavailableCode } | { status: "copied" }> {
   const open = await openSource(prepared.source);
   if (open.kind !== "confirmed") return { status: "unavailable", code: "second-read-unavailable" };
   try {
     if (!sameIdentity(identityOf(open), prepared.identity)) return { status: "unavailable", code: "changed-metadata" };
-    const streamed = await streamPreparationEvidenceCreateOnly(
-      root, location, open.handle, prepared.digest, MAX_PREPARED_INPUT_OBJECT_BYTES,
-    );
+    const streamed = await steps.streamEvidence(location, open.handle, prepared.digest, MAX_PREPARED_INPUT_OBJECT_BYTES);
     return mapEvidenceStreamOutcome(streamed);
   } finally {
     await open.handle.close().catch(() => {});
@@ -283,12 +313,20 @@ export async function materializeCallerFileInput(
   root: string, location: PreparationEvidenceLocation, prepared: PreparedCallerFileV1,
   faults: MaterializeCallerFileFaultsForTest = {},
 ): Promise<MaterializeCallerFileOutcomeV1> {
-  const copied = await copyIntoEvidence(root, location, prepared);
+  return materializeCallerFileInputWith(diskCallerFileEvidenceSteps(root), location, prepared, faults);
+}
+
+/** {@link materializeCallerFileInput} over {@link CallerFileEvidenceSteps}: THE ONE BODY. */
+export async function materializeCallerFileInputWith(
+  steps: CallerFileEvidenceSteps, location: PreparationEvidenceLocation, prepared: PreparedCallerFileV1,
+  faults: MaterializeCallerFileFaultsForTest = {},
+): Promise<MaterializeCallerFileOutcomeV1> {
+  const copied = await copyIntoEvidence(steps, location, prepared);
   if (copied.status === "unavailable") return copied;
   await faults.beforeRecheck?.();
   const rechecked = await recheckSource(prepared);
   if (rechecked !== null) return { status: "unavailable", code: rechecked.code };
-  const present = await readPreparationEvidence(root, location, prepared.digest);
+  const present = await steps.readEvidence(location, prepared.digest);
   if (present.status !== "ok") return { status: "unavailable", code: "second-read-unavailable" };
   return { status: "materialized" };
 }

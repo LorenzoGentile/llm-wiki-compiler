@@ -4,11 +4,16 @@
  * sealed on a workflow run. Legacy profiles and products without a canonical
  * process definition remain unchanged; a product that opts in must bind one
  * explicit workspace and the active runtime components before any run operation.
+ *
+ * ONE BODY EACH, over {@link ActiveProductSources}: {@link resolveWorkflowProcessAuthorityFrom}
+ * (a new run's authority) and {@link assertCurrentWorkflowProcessAuthorityFrom} (a
+ * sealed run's revalidation). Each root form keeps its signature and passes the
+ * local disk sources; each body resolves the product once per call.
  */
 
 import { canonicalDigest } from "../profile/templates/signing/canonical.js";
 import { assertWorkspaceId } from "../preparations/paths.js";
-import { resolveActiveProduct } from "../products/binding/resolve.js";
+import { diskActiveProductSources, resolveActiveProductFrom, type ActiveProductSources } from "../products/binding/resolve.js";
 import type { ActiveProductBindingV1 } from "../products/binding/types.js";
 import type { Sha256Digest } from "../products/ids.js";
 import type { WorkflowProcessAuthorityV1, WorkflowRun } from "./types.js";
@@ -54,7 +59,14 @@ function fromBinding(
 export async function resolveWorkflowProcessAuthority(
   root: string, workspaceId?: string, required = false,
 ): Promise<WorkflowProcessAuthorityV1 | undefined> {
-  const active = await resolveActiveProduct(root);
+  return resolveWorkflowProcessAuthorityFrom(diskActiveProductSources(root), workspaceId, required);
+}
+
+/** {@link resolveWorkflowProcessAuthority} over {@link ActiveProductSources}: THE ONE BODY. */
+export async function resolveWorkflowProcessAuthorityFrom(
+  sources: ActiveProductSources, workspaceId?: string, required = false,
+): Promise<WorkflowProcessAuthorityV1 | undefined> {
+  const active = await resolveActiveProductFrom(sources);
   if (active.mode !== "product" || active.binding.processDefinitionDigest === undefined) {
     if (required) throw new WorkflowProcessAuthorityError("not-declared");
     return undefined;
@@ -67,7 +79,14 @@ export async function resolveWorkflowProcessAuthority(
 export async function assertCurrentWorkflowProcessAuthority(
   root: string, run: WorkflowRun,
 ): Promise<void> {
-  const active = await resolveActiveProduct(root);
+  return assertCurrentWorkflowProcessAuthorityFrom(diskActiveProductSources(root), run);
+}
+
+/** {@link assertCurrentWorkflowProcessAuthority} over {@link ActiveProductSources}: THE ONE BODY. It resolves the product once per call and remembers nothing. */
+export async function assertCurrentWorkflowProcessAuthorityFrom(
+  sources: ActiveProductSources, run: WorkflowRun,
+): Promise<void> {
+  const active = await resolveActiveProductFrom(sources);
   if (run.processAuthority === undefined) {
     if (active.mode === "product" && active.binding.processDefinitionDigest !== undefined) {
       throw new WorkflowProcessAuthorityError("missing-run-binding");

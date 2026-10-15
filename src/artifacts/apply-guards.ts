@@ -10,8 +10,7 @@
  * journaling.
  */
 import { lstat, realpath } from "fs/promises";
-import { appendEventLocked, appendBoundEventLocked, type AppendEventInput } from "../events/store.js";
-import type { OperationBinding } from "../utils/operation-binding.js";
+import type { AppendEventInput } from "../events/store.js";
 import type { ArtifactOrigin } from "../trust/planner.js";
 import type { TrustDecision } from "../trust/decision.js";
 import { resolveExpectedReal, type ArtifactManifest } from "./store.js";
@@ -128,12 +127,4 @@ export async function assertTargetsRegularOrAbsent(root: string, expectedDir: st
     const st = await lstat(target).catch(() => null);
     if (st !== null && !st.isFile()) throw new ArtifactTargetNotRegularError(target);
   }
-}
-
-/**
- * Emit the derived-only artifact event through the existing public event store.
- */
-export async function emitArtifactEvent(root: string, event: AppendEventInput, binding?: OperationBinding): Promise<void> {
-  if (binding === undefined) await appendEventLocked(root, event);
-  else await appendBoundEventLocked(root, event, binding);
 }

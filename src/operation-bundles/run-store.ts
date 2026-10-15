@@ -3,17 +3,33 @@
  * @description Exact-binding operation-run reads, create-only genesis
  * publication, and authenticated-prefix transition appends. No exported writer
  * accepts a caller-supplied progressed record or re-signs unverifiable history.
+ *
+ * ONE RUN READ, OVER THE READER'S OWN LEAVES. {@link readOperationRunFrom} is the
+ * one body of {@link readOperationRun}: it reads the run leaf FIRST (any throw or
+ * rejection, for an unsafe identity or otherwise, is `identity`), then — only for a
+ * present leaf — a FRESH key read, then parses, binds and AUTHENTICATES here. It
+ * takes {@link OperationRunLeafReads} and no project root. The production default is
+ * {@link diskOperationRunLeafReads}, which calls the incumbent leaf read and
+ * `readOperationKey` at call time.
+ *
+ * ONE BODY PER WRITER, OVER THE WRITERS' OWN STEPS. Genesis creation, the
+ * authenticated append, and the recovered and abandoned control writers each have
+ * one root-free body (`…With`) over {@link OperationRunWriteSteps}: the authenticated
+ * read, a fresh key, one evidence leaf, create-only genesis publication and durable
+ * replacement. The bodies own every proof check, the predecessor-then-fresh-key
+ * order, signing, budget and the exactly-one-transition rule. The root forms keep
+ * their signatures and pass {@link diskOperationRunWriteSteps}, whose closures keep
+ * the confinement, exact-parent, durability and mode flags of the incumbent calls.
  */
 
 import { createHash } from "node:crypto";
 import { canonicalBytes, canonicalDigest } from "../profile/templates/signing/canonical.js";
-import { atomicWrite } from "../utils/atomic-write.js";
-import { authenticatedRunRead, publishRunGenesis } from "../utils/run-store-io.js";
-import { readConfinedLeafBuffer } from "../utils/confined-read.js";
+import { genesisCollisionMessage, publishRunGenesis, readAuthenticatedRunFrom, replaceRunLeaf } from "../utils/run-store-io.js";
+import { readConfinedLeafBuffer, type CappedLeafRead, type CappedLeafReadBuffer } from "../utils/confined-read.js";
 import { MAX_MUTATIONS_PER_BUNDLE, MAX_RUN_BYTES, MAX_RUN_EVIDENCE_BLOB_BYTES } from "./constants.js";
 import { mutationId, type MutationId } from "./ids.js";
 import { readDurableOperationLeaf } from "./durable-leaf.js";
-import { readOperationKey } from "./key-epoch.js";
+import { readOperationKey, type OperationKeyRead } from "./key-epoch.js";
 import { operationPaths } from "./paths.js";
 import type { OperationProblemCode } from "./problems.js";
 import { assertOperationRunWriteBudget, operationRunWriteBudgetClass, projectRunBudget, type RunWriteBudgetClass } from "./run-budget.js";
@@ -73,28 +89,82 @@ export interface AbandonedControlTransition {
 }
 
 /** Read one exact workspace leaf before consulting any project key. */
-async function readRunLeaf(root: string, binding: OperationRunBinding) {
+async function readRunLeaf(root: string, binding: OperationRunBinding, maxBytes: number) {
   const paths = operationPaths(root, binding.workspaceId);
   return readDurableOperationLeaf(
-    root, paths.runFile(binding.runId), paths.runsRoot, MAX_RUN_BYTES,
+    root, paths.runFile(binding.runId), paths.runsRoot, maxBytes,
   );
+}
+
+/**
+ * What the operation run read asks of the store. Owned by the run reader; no read
+ * takes a project root.
+ */
+export interface OperationRunLeafReads {
+  /** One run leaf's text by its binding, within `maxBytes`. May throw or reject, for an unsafe identity or otherwise; the body maps both to `identity`. */
+  readRunLeaf(binding: OperationRunBinding, maxBytes: number): Promise<CappedLeafRead>;
+  /** The operation key WITH ITS BYTES, read fresh on each call (this body authenticates). Local: `readOperationKey(root)`. */
+  readKey(): Promise<OperationKeyRead>;
+}
+
+/** The local-disk run leaves for one project root, built per call: each closure calls the incumbent function when asked. In no package index. */
+export function diskOperationRunLeafReads(root: string): OperationRunLeafReads {
+  return {
+    readRunLeaf: (binding, maxBytes) => readRunLeaf(root, binding, maxBytes),
+    readKey: () => readOperationKey(root),
+  };
 }
 
 /** Read, parse, and authenticate only against all caller-requested identities. */
 export async function readOperationRun(root: string, binding: OperationRunBinding): Promise<OperationRunRead> {
-  let leaf: Awaited<ReturnType<typeof readRunLeaf>>;
-  try {
-    leaf = await readRunLeaf(root, binding);
-  } catch {
-    return { status: "unavailable", detail: "identity" };
-  }
-  if (leaf.kind === "absent") return { status: "absent" };
-  if (leaf.kind === "unavailable") return { status: "unavailable", detail: "run-leaf" };
-  const key = await readOperationKey(root);
-  if (key.status === "absent") return { status: "unavailable", detail: "key-missing", code: "integrity-key-missing" };
-  if (key.status === "unavailable") return { status: "unavailable", detail: "key-unreadable", code: "integrity-key-unreadable" };
-  return authenticatedRunRead(() => parseOperationRun(leaf.body, binding),
-    (run) => verifyOperationRunIntegrity(run, key.key, binding));
+  return readOperationRunFrom(diskOperationRunLeafReads(root), binding);
+}
+
+/**
+ * {@link readOperationRun} over the reader's own leaves: THE ONE BODY. The run leaf
+ * first (a throw is `identity`, with no code), then the key only for a present
+ * leaf, then parse, bind and authenticate. It confines nothing and trusts no leaf it
+ * cannot verify.
+ */
+export async function readOperationRunFrom(leaves: OperationRunLeafReads, binding: OperationRunBinding): Promise<OperationRunRead> {
+  return readAuthenticatedRunFrom<OperationRunBinding, OperationRun, Extract<OperationRunRead, { status: "unavailable" }>>(leaves, binding, {
+    maxBytes: MAX_RUN_BYTES,
+    parse: (body) => parseOperationRun(body, binding),
+    verify: (run, key) => verifyOperationRunIntegrity(run, key, binding),
+    // THE OPERATION TAXONOMY: the identity and run-leaf refusals carry NO code.
+    identity: { status: "unavailable", detail: "identity" },
+    runLeaf: { status: "unavailable", detail: "run-leaf" },
+  });
+}
+
+/** What the run writers ask of the store. No member takes a project root. */
+export interface OperationRunWriteSteps {
+  /** The authenticated exact-binding run read. Local: `readOperationRun(root, binding)`. */
+  readRun(binding: OperationRunBinding): Promise<OperationRunRead>;
+  /** The operation key WITH ITS BYTES, fresh on each call. Local: `readOperationKey(root)`. */
+  readKey(): Promise<OperationKeyRead>;
+  /** One content-addressed run-evidence leaf, single-link and capped; a path it cannot derive rejects. */
+  readEvidenceLeaf(binding: OperationRunBinding, digestHex: string, maxBytes: number): Promise<CappedLeafReadBuffer>;
+  /** Create-only genesis publication; `collisionMessage` is asked only on a genuine create collision. */
+  publishGenesis(binding: OperationRunBinding, serialized: string, collisionMessage: () => Promise<string>): Promise<void>;
+  /** Durable, strictly synced replacement of the run leaf. */
+  replaceRun(binding: OperationRunBinding, serialized: string): Promise<void>;
+}
+
+/** The local-disk run write steps for one root, built per call; each closure calls the incumbent when asked. In no package index. */
+function diskOperationRunWriteSteps(root: string): OperationRunWriteSteps {
+  return {
+    readRun: (binding) => readOperationRun(root, binding),
+    readKey: () => readOperationKey(root),
+    readEvidenceLeaf: (binding, digestHex, maxBytes) => {
+      const paths = operationPaths(root, binding.workspaceId);
+      return readConfinedLeafBuffer(root, paths.evidenceFile(binding.runId, digestHex), paths.evidenceRoot(binding.runId), maxBytes, { requireSingleLink: true });
+    },
+    publishGenesis: (binding, serialized, collisionMessage) =>
+      publishRunGenesis({ root, file: operationPaths(root, binding.workspaceId).runFile(binding.runId) }, serialized, collisionMessage),
+    replaceRun: (binding, serialized) =>
+      replaceRunLeaf({ root, file: operationPaths(root, binding.workspaceId).runFile(binding.runId) }, serialized),
+  };
 }
 
 /** Sign, serialize, parse, and authenticate a candidate before touching disk. */
@@ -123,22 +193,23 @@ function preflightGenesis(input: InitialOperationRunInput): void {
  * project lock and must already have completed manifest/payload preflight.
  */
 export async function createOperationRunLocked(root: string, input: InitialOperationRunInput): Promise<OperationRun> {
+  return createOperationRunWith(diskOperationRunWriteSteps(root), input);
+}
+
+/** {@link createOperationRunLocked} over the writers' own steps: the one genesis body. */
+export async function createOperationRunWith(steps: OperationRunWriteSteps, input: InitialOperationRunInput): Promise<OperationRun> {
   preflightGenesis(input);
-  const key = await requireOperationKey(root);
+  const key = await requireOperationKey(steps);
   if (input.keyEpochId !== key.keyEpochId) throw new Error("operation run key epoch mismatch");
   const content = createInitialOperationRun(input), binding = operationRunBinding(content);
   const prepared = prepareSignedRun(content, key.key, binding, "ordinary");
-  const file = operationPaths(root, binding.workspaceId).runFile(binding.runId);
-  await publishRunGenesis({ root, file }, prepared.serialized, async () => {
-    const collision = await readOperationRun(root, binding);
-    return `operation run genesis already exists: ${collision.status}`;
-  });
+  await steps.publishGenesis(binding, prepared.serialized, genesisCollisionMessage("operation", (asked) => steps.readRun(asked), binding));
   return prepared.parsed;
 }
 
 /** Require one healthy current key without ever creating or replacing it. */
-async function requireOperationKey(root: string) {
-  const key = await readOperationKey(root);
+async function requireOperationKey(steps: Pick<OperationRunWriteSteps, "readKey">) {
+  const key = await steps.readKey();
   if (key.status === "absent") throw new Error("integrity-key-missing");
   if (key.status === "unavailable") throw new Error("integrity-key-unreadable");
   return key;
@@ -162,33 +233,41 @@ export async function appendOperationTransitionLocked(
   expected: OperationRunPredecessor,
   input: AppendOperationTransitionInput,
 ): Promise<OperationRun> {
-  if (input.type === "recovered" || input.type === "abandoned") {
-    throw new Error(`${input.type} requires its evidence-verifying control writer`);
-  }
-  return appendAuthenticatedTransition(root, binding, expected, input);
+  return appendOperationTransitionWith(diskOperationRunWriteSteps(root), binding, expected, input);
 }
 
-/** Append one already-proof-checked transition to an authenticated exact prefix. */
-async function appendAuthenticatedTransition(
-  root: string,
+/** {@link appendOperationTransitionLocked} over the writers' own steps: the one append body. */
+export async function appendOperationTransitionWith(
+  steps: OperationRunWriteSteps,
   binding: OperationRunBinding,
   expected: OperationRunPredecessor,
   input: AppendOperationTransitionInput,
 ): Promise<OperationRun> {
-  const read = await readOperationRun(root, binding);
+  if (input.type === "recovered" || input.type === "abandoned") {
+    throw new Error(`${input.type} requires its evidence-verifying control writer`);
+  }
+  return appendAuthenticatedTransition(steps, binding, expected, input);
+}
+
+/** Append one already-proof-checked transition to an authenticated exact prefix. */
+async function appendAuthenticatedTransition(
+  steps: OperationRunWriteSteps,
+  binding: OperationRunBinding,
+  expected: OperationRunPredecessor,
+  input: AppendOperationTransitionInput,
+): Promise<OperationRun> {
+  const read = await steps.readRun(binding);
   if (read.status !== "ok") throw new Error(`operation run unavailable: ${read.status === "unavailable" ? read.detail : read.status}`);
   assertExpectedPredecessor(read.run, expected);
   if (!operationRunBindingMatches(read.run, binding)) throw new Error("operation run binding mismatch");
-  const key = await requireOperationKey(root);
+  const key = await requireOperationKey(steps);
   if (key.keyEpochId !== binding.keyEpochId) throw new Error("operation run key epoch changed");
   const next = appendOperationTransition(read.run, input);
   if (next.stateVersion !== expected.stateVersion + 1 || next.transitions.length !== read.run.transitions.length + 1) {
     throw new Error("operation run append did not produce exactly one next state version");
   }
   const prepared = prepareSignedRun(next, key.key, binding, operationRunWriteBudgetClass(input.type));
-  await atomicWrite(operationPaths(root, binding.workspaceId).runFile(binding.runId), prepared.serialized, {
-    confineRoot: root, exactParent: true, durable: true, strictDurability: true, mode: 0o600,
-  });
+  await steps.replaceRun(binding, prepared.serialized);
   return prepared.parsed;
 }
 
@@ -212,6 +291,16 @@ export async function appendRecoveredTransitionLocked(
   expected: OperationRunPredecessor,
   input: RecoveredControlTransition,
 ): Promise<OperationRun> {
+  return appendRecoveredTransitionWith(diskOperationRunWriteSteps(root), binding, expected, input);
+}
+
+/** {@link appendRecoveredTransitionLocked} over the writers' own steps: every proof before the append. */
+export async function appendRecoveredTransitionWith(
+  steps: OperationRunWriteSteps,
+  binding: OperationRunBinding,
+  expected: OperationRunPredecessor,
+  input: RecoveredControlTransition,
+): Promise<OperationRun> {
   if (input.recoveryBinding.workspaceId !== binding.workspaceId || input.recoveryBinding.keyEpochId !== binding.keyEpochId
     || input.recoveryBinding.bundleId === binding.bundleId || input.recoveryBinding.runId === binding.runId) {
     throw new Error("recovery run binding does not settle this workspace epoch");
@@ -222,13 +311,13 @@ export async function appendRecoveredTransitionLocked(
     || canonicalDigest(manifest) !== input.recoveryBinding.manifestDigest) {
     throw new Error("recovery manifest is not bound to the original bundle");
   }
-  const recovery = await readOperationRun(root, input.recoveryBinding);
+  const recovery = await steps.readRun(input.recoveryBinding);
   if (recovery.status !== "ok") throw new Error("recovery run is unavailable");
   assertExpectedPredecessor(recovery.run, input.recoveryExpected);
   if (recovery.run.state !== "succeeded" && recovery.run.state !== "succeeded-with-warnings" && recovery.run.state !== "compensated") {
     throw new Error("recovery run has not reached successful terminal settlement");
   }
-  return appendAuthenticatedTransition(root, binding, expected, {
+  return appendAuthenticatedTransition(steps, binding, expected, {
     type: "recovered", stateAfter: "recovered", actor: input.actor, at: input.at,
     payload: { kind: "recovery", bundleId: recovery.run.bundleId, runId: recovery.run.runId,
       manifestDigest: recovery.run.manifestDigest, terminalState: recovery.run.state,
@@ -272,17 +361,12 @@ function buildResidualFindings(
 }
 
 /** Verify one claimed evidence reference against exact confined raw bytes. */
-async function verifyResidualEvidence(root: string, binding: OperationRunBinding, evidence: RunEvidenceRef): Promise<void> {
+async function verifyResidualEvidence(steps: OperationRunWriteSteps, binding: OperationRunBinding, evidence: RunEvidenceRef): Promise<void> {
   const match = /^sha256:([0-9a-f]{64})$/.exec(evidence.digest);
   if (match === null || !Number.isSafeInteger(evidence.byteCount) || evidence.byteCount > MAX_RUN_EVIDENCE_BLOB_BYTES) {
     throw new Error("run evidence reference is invalid");
   }
-  const paths = operationPaths(root, binding.workspaceId);
-  const read = await readConfinedLeafBuffer(
-    root, paths.evidenceFile(binding.runId, match[1]!),
-    paths.evidenceRoot(binding.runId), MAX_RUN_EVIDENCE_BLOB_BYTES,
-    { requireSingleLink: true },
-  );
+  const read = await steps.readEvidenceLeaf(binding, match[1]!, MAX_RUN_EVIDENCE_BLOB_BYTES);
   if (read.kind !== "ok") throw new Error(`run evidence is ${read.kind}`);
   const digest = `sha256:${createHash("sha256").update(read.body).digest("hex")}`;
   if (read.body.byteLength !== evidence.byteCount || digest !== evidence.digest) {
@@ -297,12 +381,22 @@ export async function appendAbandonedTransitionLocked(
   expected: OperationRunPredecessor,
   input: AbandonedControlTransition,
 ): Promise<OperationRun> {
+  return appendAbandonedTransitionWith(diskOperationRunWriteSteps(root), binding, expected, input);
+}
+
+/** {@link appendAbandonedTransitionLocked} over the writers' own steps: every proof, evidence bytes included, before the append. */
+async function appendAbandonedTransitionWith(
+  steps: OperationRunWriteSteps,
+  binding: OperationRunBinding,
+  expected: OperationRunPredecessor,
+  input: AbandonedControlTransition,
+): Promise<OperationRun> {
   if (!input.actor.grants.includes("operation-bundle.abandon")) throw new Error("operation-bundle.abandon grant is required");
   if (input.confirmResidualState !== true) throw new Error("residual-state confirmation is required");
   if (input.observations.length > MAX_MUTATIONS_PER_BUNDLE) {
     throw new Error(`abandonment observations exceed the ${MAX_MUTATIONS_PER_BUNDLE}-mutation launch bound`);
   }
-  const read = await readOperationRun(root, binding);
+  const read = await steps.readRun(binding);
   if (read.status !== "ok") throw new Error("operation run is unavailable for abandonment");
   assertExpectedPredecessor(read.run, expected);
   const unresolved = unresolvedResidualIds(read.run);
@@ -310,8 +404,8 @@ export async function appendAbandonedTransitionLocked(
   const observations = input.observations.map(parseAbandonmentObservation);
   assertAbandonmentManifest(binding, input.manifest);
   const findings = buildResidualFindings(unresolved, input.manifest, observations);
-  for (const finding of findings) await verifyResidualEvidence(root, binding, finding.evidence!);
-  return appendAuthenticatedTransition(root, binding, expected, {
+  for (const finding of findings) await verifyResidualEvidence(steps, binding, finding.evidence!);
+  return appendAuthenticatedTransition(steps, binding, expected, {
     type: "abandoned", stateAfter: "abandoned", actor: input.actor, at: input.at,
     residualFindings: findings,
     payload: {

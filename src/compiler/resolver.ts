@@ -8,14 +8,20 @@
  *
  * Complexity: O(changed * total) per incremental compile.
  * Full recompile degrades to O(total^2).
+ *
+ * STORAGE. The planner has ONE BODY, {@link resolveLinksFrom}, over the raw
+ * legacy-local reads ({@link LegacyLocalReads}) it lists and reads pages
+ * through; {@link resolveLinks} hands it the local disk's. Applying the planned
+ * writes ({@link resolveAndApplyLinks}) stays root-bound under the caller's lock.
+ * The reads are the internal legacy-local contract: not `ProjectStore`, not a
+ * hosted or access-controlled store, and not public API.
  */
 
-import { readdir } from "fs/promises";
-import path from "path";
-import { existsSync } from "fs";
 import { parseFrontmatter } from "../utils/markdown.js";
-import { readWikiPageContentOrWarn } from "./confined-wiki-read.js";
-import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import { readWikiPageContentOrWarnFrom } from "./confined-wiki-read.js";
+import { CONCEPTS_DIR } from "../utils/constants.js";
 import { applyCompilePageWritesWithIdsLocked } from "./compile-write-ids.js";
 import { isLiteralMarkdown } from "./link-repair-code.js";
 import { insertsOnlyALink } from "../wiki/wikilink-insertion.js";
@@ -23,46 +29,54 @@ import type { PageId } from "../utils/page-id.js";
 import type { CompilePageNamespace, CompilePageWrite } from "./compile-write.js";
 import * as output from "../utils/output.js";
 
-interface PageInfo {
-  /** Project root, carried so per-page reads/writes stay confined to `wiki/concepts`. */
-  root: string;
+/**
+ * The namespace of every planned write. The title index is listed from
+ * {@link CONCEPTS_DIR} only, and the namespace was derived from a page's path
+ * inside that directory, which always named `concepts`: the directory's last
+ * segment is `concepts`, and a listed file name holds no separator. So the
+ * constant is that derivation, with no project root or absolute path involved.
+ */
+const TITLE_INDEX_NAMESPACE: CompilePageNamespace = "concepts";
+
+/** A concept page that can be linked to, by slug and title. */
+export interface LinkableTitle {
   slug: string;
   title: string;
-  filePath: string;
 }
 
 /**
- * Build an index of all wiki page titles from the concepts directory. Each page
- * is read through the confined helper, so a symlinked entry whose target escapes
- * `wiki/concepts` is dropped (warned, skipped) and never enters the title index
- * (so its bytes can never be re-emitted into a rewritten page).
+ * Every linkable concept title, with the listing and each page read through
+ * `reads`. Each page is read through the confined helper, so an entry whose
+ * target escapes `wiki/concepts` is dropped (warned, skipped) and never enters
+ * the title index, so its bytes can never be re-emitted into a rewritten page.
  */
-export async function buildTitleIndex(root: string): Promise<PageInfo[]> {
-  const conceptsDir = path.join(root, CONCEPTS_DIR);
-  if (!existsSync(conceptsDir)) return [];
+export async function listLinkableTitlesFrom(reads: LegacyLocalReads): Promise<LinkableTitle[]> {
+  if (!(await reads.exists(CONCEPTS_DIR))) return [];
 
-  const files = await readdir(conceptsDir);
-  const pages: PageInfo[] = [];
+  const files = await reads.listNames(CONCEPTS_DIR);
+  const titles: LinkableTitle[] = [];
 
   for (const file of files) {
     if (!file.endsWith(".md")) continue;
 
     const slug = file.replace(/\.md$/, "");
-    const content = await readWikiPageContentOrWarn(root, CONCEPTS_DIR, slug);
-    if (!content) continue;
-    const { meta } = parseFrontmatter(content);
-
-    if (meta.title && typeof meta.title === "string" && !meta.orphaned) {
-      pages.push({
-        root,
-        slug,
-        title: meta.title,
-        filePath: path.join(conceptsDir, file),
-      });
-    }
+    const content = await readWikiPageContentOrWarnFrom(reads, CONCEPTS_DIR, slug);
+    const title = linkableTitleOf(content);
+    if (title !== null) titles.push({ slug, title });
   }
 
-  return pages;
+  return titles;
+}
+
+/**
+ * The title a page can be linked by, or `null` when it has none or is orphaned.
+ * Pure, so a title index built from a store that is not a directory admits
+ * exactly the pages this one does.
+ */
+function linkableTitleOf(content: string): string | null {
+  if (!content) return null;
+  const { meta } = parseFrontmatter(content);
+  return meta.title && typeof meta.title === "string" && !meta.orphaned ? meta.title : null;
 }
 
 /** Check if a position is inside an existing [[wikilink]]. */
@@ -143,7 +157,7 @@ function cachedLiteralRegions(): (text: string) => (offset: number) => boolean {
  * the renderer would not read a link: Markdown link URLs and text, autolinks,
  * image alt text and reference definitions.
  */
-function addWikilinks(body: string, titles: PageInfo[], selfTitle: string): string {
+function addWikilinks(body: string, titles: LinkableTitle[], selfTitle: string): string {
   let result = body;
   const literalRegions = cachedLiteralRegions();
   const selfLower = selfTitle.toLowerCase();
@@ -179,7 +193,8 @@ function addWikilinks(body: string, titles: PageInfo[], selfTitle: string): stri
  *
  * Two passes:
  * 1. Outbound: changed pages get [[wikilinks]] for any title they mention.
- * 2. Inbound: ALL pages get scanned for mentions of newly created titles.
+ * 2. Inbound: every indexed page except the new ones gets scanned for mentions
+ *    of newly created titles.
  *    This ensures existing pages link to new concepts without a full recompile.
  *
  * Complexity: O(changed * total) for outbound, O(newTitles * total) for inbound.
@@ -190,17 +205,38 @@ export async function resolveLinks(
   changedSlugs: string[],
   newSlugs: string[],
 ): Promise<CompilePageWrite[]> {
-  const titleIndex = await buildTitleIndex(root);
+  // `async` so that a throw while the disk reads are built REJECTS.
+  return resolveLinksFrom(diskLocalReads(root), changedSlugs, newSlugs);
+}
+
+/**
+ * {@link resolveLinks} over {@link LegacyLocalReads}: THE ONE BODY. The title
+ * index is listed first (none means nothing to plan), then the outbound pass
+ * over the changed pages, then the inbound pass, which scans every indexed
+ * page EXCEPT the new ones (as it always has) for the new titles. A page
+ * planned by both passes keeps its first position with the inbound body.
+ *
+ * @param reads - The raw legacy-local reads the listing and every page read go through.
+ * @param changedSlugs - Slugs whose pages get outbound links re-resolved.
+ * @param newSlugs - Newly-created slugs other pages get scanned for (inbound).
+ * @returns The rewritten pages (one per page whose body actually changed).
+ */
+export async function resolveLinksFrom(
+  reads: LegacyLocalReads,
+  changedSlugs: string[],
+  newSlugs: string[],
+): Promise<CompilePageWrite[]> {
+  const titleIndex = await listLinkableTitlesFrom(reads);
   if (titleIndex.length === 0) return [];
 
   // Pass 1 (outbound) on changed pages, then Pass 2 (inbound) on all pages,
   // de-duplicated by slug so a page changed in both passes is written once with
   // the latest body (inbound supersedes outbound for the same page).
   const writes = new Map<string, CompilePageWrite>();
-  for (const write of await resolveOutboundLinks(titleIndex, changedSlugs)) {
+  for (const write of await resolveOutboundLinks(reads, titleIndex, changedSlugs)) {
     writes.set(write.slug, write);
   }
-  for (const write of await resolveInboundLinks(titleIndex, newSlugs)) {
+  for (const write of await resolveInboundLinks(reads, titleIndex, newSlugs)) {
     writes.set(write.slug, write);
   }
 
@@ -236,17 +272,8 @@ export async function resolveAndApplyLinks(
   return applyCompilePageWritesWithIdsLocked(root, await resolveLinks(root, changedSlugs, newSlugs), beforeApply);
 }
 
-/** Derive the compile namespace from a page's absolute file path. */
-function namespaceForPath(filePath: string): CompilePageNamespace {
-  const dir = path.dirname(filePath);
-  if (dir.endsWith(QUERIES_DIR) || path.basename(dir) === path.basename(QUERIES_DIR)) {
-    return "queries";
-  }
-  return "concepts";
-}
-
 /**
- * Build the rewritten-page write for a PageInfo, or null when its body is unchanged.
+ * Build the rewritten-page write for an indexed page, or null when its body is unchanged.
  *
  * The replacement is a FUNCTION, not the string itself. `String.replace`
  * interprets `$&`, `` $` ``, `$'` and `$$` in a string replacement even when the
@@ -256,10 +283,10 @@ function namespaceForPath(filePath: string): CompilePageNamespace {
  * function suppresses that substitution entirely, so the rewritten body is
  * inserted verbatim.
  */
-function rewritePage(page: PageInfo, content: string, linked: string, body: string): CompilePageWrite | null {
+function rewritePage(page: LinkableTitle, content: string, linked: string, body: string): CompilePageWrite | null {
   if (linked === body) return null;
   return {
-    namespace: namespaceForPath(page.filePath),
+    namespace: TITLE_INDEX_NAMESPACE,
     slug: page.slug,
     body: content.replace(body, () => linked),
   };
@@ -267,21 +294,23 @@ function rewritePage(page: PageInfo, content: string, linked: string, body: stri
 
 /** Compute outbound [[wikilink]] rewrites for changed pages. */
 async function resolveOutboundLinks(
-  titleIndex: PageInfo[],
+  reads: LegacyLocalReads,
+  titleIndex: LinkableTitle[],
   changedSlugs: string[],
 ): Promise<CompilePageWrite[]> {
   const writes: CompilePageWrite[] = [];
   for (const page of titleIndex) {
     if (!changedSlugs.includes(page.slug)) continue;
-    const write = await linkPage(page, titleIndex);
+    const write = await linkPage(reads, page, titleIndex);
     if (write) writes.push(write);
   }
   return writes;
 }
 
-/** Compute inbound [[wikilink]] rewrites: scan ALL pages for new concept titles. */
+/** Compute inbound [[wikilink]] rewrites: scan every indexed page except the new ones for new concept titles. */
 async function resolveInboundLinks(
-  titleIndex: PageInfo[],
+  reads: LegacyLocalReads,
+  titleIndex: LinkableTitle[],
   newSlugs: string[],
 ): Promise<CompilePageWrite[]> {
   if (newSlugs.length === 0) return [];
@@ -290,9 +319,10 @@ async function resolveInboundLinks(
 
   const writes: CompilePageWrite[] = [];
   for (const page of titleIndex) {
-    // Skip pages already processed in the outbound pass.
+    // Skip the new pages themselves (not every changed page: an older changed
+    // page is still scanned here, and its inbound body replaces its outbound one).
     if (newSlugs.includes(page.slug)) continue;
-    const content = await readWikiPageContentOrWarn(page.root, CONCEPTS_DIR, page.slug);
+    const content = await readWikiPageContentOrWarnFrom(reads, CONCEPTS_DIR, page.slug);
     if (!content) continue;
     const { body } = parseFrontmatter(content);
     const write = rewritePage(page, content, addWikilinks(body, newTitles, page.title), body);
@@ -302,8 +332,8 @@ async function resolveInboundLinks(
 }
 
 /** Compute the wikilink rewrite for a single page, or null when unchanged. */
-async function linkPage(page: PageInfo, titleIndex: PageInfo[]): Promise<CompilePageWrite | null> {
-  const content = await readWikiPageContentOrWarn(page.root, CONCEPTS_DIR, page.slug);
+async function linkPage(reads: LegacyLocalReads, page: LinkableTitle, titleIndex: LinkableTitle[]): Promise<CompilePageWrite | null> {
+  const content = await readWikiPageContentOrWarnFrom(reads, CONCEPTS_DIR, page.slug);
   if (!content) return null;
   const { body } = parseFrontmatter(content);
   return rewritePage(page, content, addWikilinks(body, titleIndex, page.title), body);

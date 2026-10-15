@@ -4,8 +4,8 @@
  * compatibility exports for wiki page utilities.
  */
 
-import { readFile } from "fs/promises";
 import yaml from "js-yaml";
+import { readLocationText } from "../storage/disk-locations.js";
 import type {
   ClaimCitation,
   ContradictionRef,
@@ -306,7 +306,7 @@ function rangeAlreadyTracked(
 /** Read a file, returning empty string if it doesn't exist. */
 export async function safeReadFile(filePath: string): Promise<string> {
   try {
-    return await readFile(filePath, "utf-8");
+    return await readLocationText(filePath);
   } catch {
     return "";
   }

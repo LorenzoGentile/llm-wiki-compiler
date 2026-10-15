@@ -8,6 +8,19 @@
  * After compilation, reconciliation candidates and extraction-frozen slugs
  * are checked against the updated state. Any that lost ALL owners are orphaned
  * as a cleanup pass.
+ *
+ * ONE BODY PER PASS, THREE DOMAIN COLLABORATORS. {@link markOrphanedWith} and
+ * {@link orphanUnownedFrozenPagesWith} are the bodies. They are handed
+ * {@link OrphanPassSteps}: the confined page read, the dropped-read warning
+ * (with its own presence decision) and the compile page write, each the whole
+ * semantics of its existing owner and NOT a storage port. The root forms keep
+ * their signatures and pass {@link localOrphanPassSteps}, which call
+ * `readConfinedWikiPage`, `warnDroppedWikiReadIfPresent` and
+ * `applyCompilePageWritesLocked` at call time with exactly the arguments they
+ * always got, so their module spies still see every call. Every decision —
+ * shared, unsafe, dropped, already orphaned, the rewrite, the status lines and
+ * when the draft forgets the source — stays here. Status lines still go to the
+ * incumbent `output.status`.
  */
 
 import path from "path";
@@ -15,6 +28,7 @@ import { parseFrontmatter } from "../utils/markdown.js";
 import {
   readConfinedWikiPage,
   warnDroppedWikiReadIfPresent,
+  type ConfinedReadResult,
 } from "./confined-wiki-read.js";
 import { findSharedConcepts } from "./deps.js";
 import * as output from "../utils/output.js";
@@ -22,6 +36,26 @@ import { CONCEPTS_DIR } from "../utils/constants.js";
 import { isSafeFilenameComponent } from "../profile/identity.js";
 import { applyCompilePageWritesLocked, type CompilePageWrite } from "./compile-write.js";
 import type { CompileStateDraft } from "./compile-state-draft.js";
+
+/** The draft members an orphan pass uses: the in-memory state and forgetting a source. */
+export type OrphanDraft = Pick<CompileStateDraft, "read" | "removeSource">;
+
+/** The three DOMAIN steps an orphan pass composes; none is storage. */
+export interface OrphanPassSteps {
+  /** Read one page confined to `relDir`. Local: `readConfinedWikiPage(root, relDir, slug)`. */
+  readPage(root: string, relDir: string, slug: string): Promise<ConfinedReadResult>;
+  /** Warn about a dropped page only if something is at `absPath`. Local: `warnDroppedWikiReadIfPresent(absPath, relPath, reason)`. */
+  warnDropped(absPath: string, relPath: string, reason: string): Promise<void>;
+  /** Apply one orphan batch (possibly empty). Local: `applyCompilePageWritesLocked(root, writes)`. */
+  writePages(root: string, writes: CompilePageWrite[]): Promise<unknown>;
+}
+
+/** LOCAL. The incumbent read, warning and compile page write, called at call time with their usual arguments; frozen. */
+const localOrphanPassSteps: OrphanPassSteps = Object.freeze({
+  readPage: (root: string, relDir: string, slug: string) => readConfinedWikiPage(root, relDir, slug),
+  warnDropped: (absPath: string, relPath: string, reason: string) => warnDroppedWikiReadIfPresent(absPath, relPath, reason),
+  writePages: (root: string, writes: CompilePageWrite[]) => applyCompilePageWritesLocked(root, writes),
+});
 
 /**
  * Mark wiki pages as orphaned when their source is deleted.
@@ -38,6 +72,16 @@ export async function markOrphaned(
   sourceFile: string,
   draft: CompileStateDraft,
 ): Promise<void> {
+  return markOrphanedWith(localOrphanPassSteps, root, sourceFile, draft);
+}
+
+/** THE ONE BODY of {@link markOrphaned}: the draft forgets the source only AFTER its batch was applied. */
+export async function markOrphanedWith(
+  steps: OrphanPassSteps,
+  root: string,
+  sourceFile: string,
+  draft: OrphanDraft,
+): Promise<void> {
   const state = draft.read();
   const sourceEntry = state.sources[sourceFile];
   if (!sourceEntry) return;
@@ -53,10 +97,10 @@ export async function markOrphaned(
       output.status("i", output.dim(`Kept: ${slug}.md (shared with other sources)`));
       continue;
     }
-    const write = await orphanPage(root, slug, "source deleted");
+    const write = await orphanPage(steps, root, slug, "source deleted");
     if (write) writes.push(write);
   }
-  await applyCompilePageWritesLocked(root, writes);
+  await steps.writePages(root, writes);
 
   draft.removeSource(sourceFile);
 }
@@ -76,6 +120,16 @@ export async function orphanUnownedFrozenPages(
   draft: CompileStateDraft,
   frozenSlugs: Set<string>,
 ): Promise<void> {
+  return orphanUnownedFrozenPagesWith(localOrphanPassSteps, root, draft, frozenSlugs);
+}
+
+/** THE ONE BODY of {@link orphanUnownedFrozenPages}. */
+export async function orphanUnownedFrozenPagesWith(
+  steps: OrphanPassSteps,
+  root: string,
+  draft: Pick<OrphanDraft, "read">,
+  frozenSlugs: Set<string>,
+): Promise<void> {
   // Read-after-write: reflects the compiled markers set earlier this run via
   // the same draft, so a slug re-claimed by a just-compiled source is NOT
   // orphaned. Reading disk here would miss those un-flushed markers.
@@ -89,10 +143,10 @@ export async function orphanUnownedFrozenPages(
   const writes: CompilePageWrite[] = [];
   for (const slug of frozenSlugs) {
     if (ownedSlugs.has(slug)) continue;
-    const write = await orphanPage(root, slug, "no remaining sources");
+    const write = await orphanPage(steps, root, slug, "no remaining sources");
     if (write) writes.push(write);
   }
-  await applyCompilePageWritesLocked(root, writes);
+  await steps.writePages(root, writes);
 }
 
 /**
@@ -109,17 +163,23 @@ export async function orphanUnownedFrozenPages(
  *     read and NOT re-emitted; an absent page is a silent no-op.
  *  3. ALREADY orphaned (`meta.orphaned === true`) — idempotent re-orphan no-op.
  *
+ * @param steps - The page read and the dropped-read warning (the write is not asked here).
  * @param root - Project root directory.
  * @param slug - Concept slug to orphan.
  * @param reason - Human-readable reason for the log message.
  * @returns The page write to apply, or `null` when any guard skips it.
  */
-async function orphanPage(root: string, slug: string, reason: string): Promise<CompilePageWrite | null> {
+async function orphanPage(
+  steps: Pick<OrphanPassSteps, "readPage" | "warnDropped">,
+  root: string,
+  slug: string,
+  reason: string,
+): Promise<CompilePageWrite | null> {
   if (!isSafeFilenameComponent(slug)) return null;
   const pagePath = path.join(root, CONCEPTS_DIR, `${slug}.md`);
-  const read = await readConfinedWikiPage(root, CONCEPTS_DIR, slug);
+  const read = await steps.readPage(root, CONCEPTS_DIR, slug);
   if (!("content" in read)) {
-    await warnDroppedWikiReadIfPresent(
+    await steps.warnDropped(
       pagePath,
       path.join(CONCEPTS_DIR, `${slug}.md`),
       read.dropped,

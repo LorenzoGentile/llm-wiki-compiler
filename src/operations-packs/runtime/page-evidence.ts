@@ -14,19 +14,19 @@
  * rewritten artifact, a re-pointed relation, or a vanished run REFUSES with a
  * named reason; the provider is never fed values under seals they no longer
  * satisfy. The bytes then materialized are the freshly re-verified reads.
+ *
+ * ONE BODY. {@link buildPageEvidenceSpecs} keeps its signature and runs
+ * {@link buildPageEvidenceSpecsFrom} over `diskPageEvidenceReads`, the same
+ * reads the host-side capture takes, each the incumbent root reader called when
+ * asked.
  */
 
 import { createHash } from "node:crypto";
-import { loadNonDefaultProfile } from "../../profile/block.js";
-import { readConfinedEntityFrontmatter } from "../../profile/lifecycle-read.js";
 import {
-  captureArtifactDeref, capturePageField, captureRelationTarget, captureRunBinding,
-  type FormCaptureV1,
+  captureArtifactDerefFrom, capturePageField, captureRelationTargetFrom, captureRunBindingFrom, diskPageEvidenceReads,
+  type FormCaptureV1, type PageEvidenceReads,
 } from "../../products/page-evidence-forms.js";
 import { parseArtifactRef } from "../../artifacts/ref.js";
-import { artifactPaths, readArtifactBody } from "../../artifacts/store.js";
-import { locatePreparationManifest, resolvePreparationRun } from "../../preparations/service-run-lookup.js";
-import { readPreparationEvidenceBytes } from "../../preparations/evidence-store.js";
 import type { PlanPageEvidenceDescriptorV1 } from "../../preparations/plan-types.js";
 import type { PageEvidenceCaptureV2, PageEvidenceExposureV2 } from "../recipe-types.js";
 import type { ProviderInputSpecV1 } from "../../capability-providers/runtime/inputs.js";
@@ -40,7 +40,7 @@ export type PageEvidenceOutcomeV1 =
 
 /** Dispatch ONE capture re-run against the live sources (form-selected). */
 async function rerunCapture(
-  root: string, loaded: LoadedProfile, descriptor: PlanPageEvidenceDescriptorV1,
+  reads: PageEvidenceReads, loaded: LoadedProfile, descriptor: PlanPageEvidenceDescriptorV1,
   capture: PageEvidenceCaptureV2, meta: Readonly<Record<string, unknown>>, slug: string,
   frozen: Readonly<Record<string, unknown>>,
 ): Promise<FormCaptureV1> {
@@ -48,20 +48,20 @@ async function rerunCapture(
   const fields = loaded.profile.entities[descriptor.target.entityType]?.fields as
     Readonly<Record<string, unknown>> | undefined;
   if (capture.form === "page-field") return capturePageField(meta, capture, pageLabel, fields);
-  if (capture.form === "artifact-deref") return captureArtifactDeref(root, loaded, meta, capture, pageLabel, fields);
-  if (capture.form === "relation-target") return captureRelationTarget(root, loaded, pageLabel, capture);
+  if (capture.form === "artifact-deref") return captureArtifactDerefFrom(reads, loaded, meta, capture, pageLabel, fields);
+  if (capture.form === "relation-target") return captureRelationTargetFrom(reads, loaded, pageLabel, capture);
   const runId = frozen[`${capture.captureId}-run`];
   if (typeof runId !== "string") return { refused: `page-evidence-${capture.captureId}-run-unsealed` };
-  return captureRunBinding(root, capture, runId, slug);
+  return captureRunBindingFrom(reads, capture, runId, slug);
 }
 
 /** Re-run one capture form and refuse unless every sealed key matches frozen. */
 async function reverifiedSeal(
-  root: string, loaded: LoadedProfile, descriptor: PlanPageEvidenceDescriptorV1,
+  reads: PageEvidenceReads, loaded: LoadedProfile, descriptor: PlanPageEvidenceDescriptorV1,
   capture: PageEvidenceCaptureV2, meta: Readonly<Record<string, unknown>>, slug: string,
   frozen: Readonly<Record<string, unknown>>,
 ): Promise<{ seal: Readonly<Record<string, string>> } | { reason: string }> {
-  const outcome = await rerunCapture(root, loaded, descriptor, capture, meta, slug, frozen);
+  const outcome = await rerunCapture(reads, loaded, descriptor, capture, meta, slug, frozen);
   if ("refused" in outcome) return { reason: `page-evidence-reverify: ${outcome.refused}` };
   for (const [key, value] of Object.entries(outcome.seal)) {
     if (frozen[key] !== value) return { reason: `page-evidence-drift: ${key} no longer matches its seal` };
@@ -79,7 +79,7 @@ function scalarSpec(exposure: PageEvidenceExposureV2, captureId: string, seal: R
 
 /** Materialize an artifact-deref capture by re-reading its verified body. */
 async function artifactSpec(
-  root: string, loaded: LoadedProfile,
+  reads: PageEvidenceReads, loaded: LoadedProfile,
   capture: Extract<PageEvidenceCaptureV2, { form: "artifact-deref" }>,
   seal: Readonly<Record<string, string>>,
 ): Promise<ProviderInputSpecV1 | { reason: string }> {
@@ -87,7 +87,7 @@ async function artifactSpec(
   if (ref === null) return { reason: `page-evidence-${capture.captureId}-ref-unparseable` };
   const def = loaded.profile.artifacts?.[ref.artifactType];
   if (def === undefined) return { reason: `page-evidence-${capture.captureId}-type-undeclared` };
-  const body = await readArtifactBody(root, artifactPaths(root, ref.artifactType, ref.slug, def.fileName), capture.maxBytes);
+  const body = await reads.readBody(ref.artifactType, ref.slug, def.fileName, capture.maxBytes);
   if (body.kind !== "ok") return { reason: `page-evidence-${capture.captureId}-body-${body.kind}` };
   const digest = createHash("sha256").update(body.body, "utf8").digest("hex");
   if (digest !== seal[`${capture.captureId}-sha256`]) return { reason: `page-evidence-${capture.captureId}-digest-drift` };
@@ -99,16 +99,16 @@ async function artifactSpec(
 
 /** Materialize a run output by reading its evidence bytes under the seal. */
 async function runOutputSpec(
-  root: string, runId: string,
+  reads: PageEvidenceReads, runId: string,
   output: PageEvidenceExposureV2 & { captureId: string; logicalPhaseId: string },
   seal: Readonly<Record<string, string>>,
 ): Promise<ProviderInputSpecV1 | { reason: string }> {
-  const located = await locatePreparationManifest(root, runId);
+  const located = await reads.locateManifest(runId);
   if (!located.ok) return { reason: `page-evidence-${output.captureId}-run-missing` };
   const digest = seal[`${output.captureId}-sha256`];
   const byteCount = Number(seal[`${output.captureId}-byte-count`]);
   if (digest === undefined || !Number.isFinite(byteCount)) return { reason: `page-evidence-${output.captureId}-seal-incomplete` };
-  const read = await readPreparationEvidenceBytes(root, located.manifest, digest, output.maxBytes);
+  const read = await reads.evidenceBytes(located.manifest, digest, output.maxBytes);
   if (read.status !== "ok") return { reason: `page-evidence-${output.captureId}-evidence-${read.status}` };
   if (read.bytes.byteLength !== byteCount) return { reason: `page-evidence-${output.captureId}-bytecount-drift` };
   return {
@@ -119,7 +119,7 @@ async function runOutputSpec(
 
 /** Push one capture's specs (post-verification) onto the outputs. */
 async function materializeCapture(
-  root: string, loaded: LoadedProfile, capture: PageEvidenceCaptureV2,
+  reads: PageEvidenceReads, loaded: LoadedProfile, capture: PageEvidenceCaptureV2,
   seal: Readonly<Record<string, string>>, specs: ProviderInputSpecV1[],
   pathTable: Record<string, string>,
 ): Promise<{ reason: string } | null> {
@@ -129,7 +129,7 @@ async function materializeCapture(
   };
   if (capture.form === "page-field") add(scalarSpec(capture, capture.captureId, seal), capture.captureId);
   else if (capture.form === "artifact-deref") {
-    const spec = await artifactSpec(root, loaded, capture, seal);
+    const spec = await artifactSpec(reads, loaded, capture, seal);
     if ("reason" in spec) return spec;
     add(spec, capture.captureId);
   } else if (capture.form === "relation-target") {
@@ -137,7 +137,7 @@ async function materializeCapture(
   } else {
     for (const field of capture.frozenFields) add(scalarSpec(field, field.captureId, seal), field.captureId);
     for (const output of capture.outputs) {
-      const spec = await runOutputSpec(root, String(seal[`${capture.captureId}-run`]), output, seal);
+      const spec = await runOutputSpec(reads, String(seal[`${capture.captureId}-run`]), output, seal);
       if ("reason" in spec) return spec;
       add(spec, output.captureId);
     }
@@ -156,13 +156,24 @@ async function materializeCapture(
 export async function buildPageEvidenceSpecs(
   root: string, descriptor: PlanPageEvidenceDescriptorV1, value: Readonly<Record<string, unknown>>,
 ): Promise<PageEvidenceOutcomeV1> {
+  return buildPageEvidenceSpecsFrom(diskPageEvidenceReads(root), descriptor, value);
+}
+
+/**
+ * THE ONE BODY of {@link buildPageEvidenceSpecs}: the sealed slug, the profile,
+ * the declared entity and the target page, then per capture the re-run, the
+ * sealed-key equality, and the materialized specs, then the identity spec.
+ */
+export async function buildPageEvidenceSpecsFrom(
+  reads: PageEvidenceReads, descriptor: PlanPageEvidenceDescriptorV1, value: Readonly<Record<string, unknown>>,
+): Promise<PageEvidenceOutcomeV1> {
   const slug = value[descriptor.target.slugField];
   if (typeof slug !== "string" || slug.length === 0) return { status: "unavailable", reason: "page-evidence-slug-unsealed" };
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await reads.nonDefaultProfile();
   if (!loaded) return { status: "unavailable", reason: "page-evidence-no-profile" };
   const def = loaded.profile.entities[descriptor.target.entityType];
   if (def === undefined) return { status: "unavailable", reason: "page-evidence-entity-undeclared" };
-  const read = await readConfinedEntityFrontmatter(root, def, slug);
+  const read = await reads.entityFrontmatter(def, slug);
   if (read.kind !== "frontmatter") return { status: "unavailable", reason: `page-evidence-target-${read.kind}` };
   const specs: ProviderInputSpecV1[] = [];
   const pathTable: Record<string, string> = {};
@@ -171,9 +182,9 @@ export async function buildPageEvidenceSpecs(
   const captureIdentity: Record<string, string> = {};
   const identity = { target: `${descriptor.target.entityType}/${slug}`, captures: captureIdentity };
   for (const capture of descriptor.captures) {
-    const verified = await reverifiedSeal(root, loaded, descriptor, capture, read.meta, slug, value);
+    const verified = await reverifiedSeal(reads, loaded, descriptor, capture, read.meta, slug, value);
     if ("reason" in verified) return { status: "unavailable", reason: verified.reason };
-    const failed = await materializeCapture(root, loaded, capture, verified.seal, specs, pathTable);
+    const failed = await materializeCapture(reads, loaded, capture, verified.seal, specs, pathTable);
     if (failed !== null) return { status: "unavailable", reason: failed.reason };
     recordCaptureIdentity(captureIdentity, capture, verified.seal);
   }

@@ -6,12 +6,21 @@
  * without draining unrelated embedding backlog or other interrupted batches.
  * Rejecting a snapshot hands the work it keys to the embedding retry queue first.
  * Callers hold the project lock; malformed/oversize/unwritable intent fails closed.
+ *
+ * Each consumer has ONE BODY over {@link ReviewEmbeddingIntentStorage}
+ * ({@link openReviewEmbeddingIntentFrom}, {@link releaseRejectedIntentFrom}); the
+ * root forms are thin delegates over the local disk's mechanisms. The domain
+ * stays here: the snapshot keys, entry selection and merge, the byte cap, the
+ * schema, what absent and unavailable mean, the order of hand-off and
+ * persistence, and when the public page-id set changes. `handOff` is the
+ * caller's existing hook; the embedding retry queue and the caller's lock are
+ * not bound by this.
  */
 import path from "node:path";
 import { z } from "zod";
 import { sha256Text } from "../connectors/hash.js";
-import { readConfinedLeaf } from "../utils/confined-read.js";
-import { atomicWrite } from "../utils/markdown.js";
+import { readConfinedLeafText, replaceLeafAtomicWithin } from "../storage/disk-guarded-leaves.js";
+import type { CappedLeafRead } from "../utils/confined-read.js";
 import { parseQualifiedPageId, type PageId } from "../utils/page-id.js";
 import { resolveConfinedPrivateDir } from "../utils/private-dir.js";
 import type { ReviewCandidate } from "../utils/types.js";
@@ -36,11 +45,43 @@ export interface ReviewEmbeddingIntent {
   clear(): Promise<void>;
 }
 
+/**
+ * The PHYSICAL mechanisms the intent bodies run over. Each member rejects with
+ * its own error or returns a refusal value; what each outcome means is decided
+ * by the bodies. Naming them selects no backend.
+ */
+export interface ReviewEmbeddingIntentStorage {
+  /** MECHANISM. The private directory, created when missing and confined; its locator. Rejects with the resolver's error. */
+  privateDirectory(): Promise<string>;
+  /** MECHANISM. The bounded, handle-bound read of `file` inside `directory`: `absent`, `unavailable` (link, non-regular, over `maxBytes`), or its text. */
+  readLeafText(directory: string, file: string, maxBytes: number): Promise<CappedLeafRead>;
+  /** MECHANISM. Atomic replacement of `file` inside `directory`: a reader sees the old or the new body. Rejects raw. */
+  replaceLeaf(directory: string, file: string, body: string): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent private-dir resolver, confined read and atomic replace, with their exact arguments. Building it does no I/O. */
+function diskReviewEmbeddingIntentStorage(root: string): ReviewEmbeddingIntentStorage {
+  return {
+    privateDirectory: () => resolveConfinedPrivateDir(root),
+    readLeafText: (directory, file, maxBytes) => readConfinedLeafText(path.dirname(directory), file, directory, maxBytes),
+    replaceLeaf: (directory, file, body) => replaceLeafAtomicWithin(path.dirname(directory), file, body),
+  };
+}
+
 /** Open only work owned by these exact candidate snapshots; preserve all other entries. */
 export async function openReviewEmbeddingIntent(root: string, candidates: ReviewCandidate[]): Promise<ReviewEmbeddingIntent> {
-  const directory = await resolveConfinedPrivateDir(root);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return openReviewEmbeddingIntentFrom(diskReviewEmbeddingIntentStorage(root), candidates);
+}
+
+/** {@link openReviewEmbeddingIntent} over the storage mechanisms: THE ONE BODY, including `record` and `clear`. */
+export async function openReviewEmbeddingIntentFrom(
+  storage: ReviewEmbeddingIntentStorage,
+  candidates: ReviewCandidate[],
+): Promise<ReviewEmbeddingIntent> {
+  const directory = await storage.privateDirectory();
   const file = path.join(directory, INTENT_FILE);
-  const entries = await readIntent(directory, file);
+  const entries = await readIntent(storage, directory, file);
   const keys = candidates.map(snapshotKey);
   const selected = entries.filter(entry => entry.candidates.some(key => keys.includes(key)));
   const untouched = entries.filter(entry => !selected.includes(entry));
@@ -54,12 +95,12 @@ export async function openReviewEmbeddingIntent(root: string, candidates: Review
     /** Record before mutations, propagating failures rather than losing retry intent. */
     async record(additionalIds: PageId[]): Promise<void> {
       owned.pageIds = [...new Set([...owned.pageIds, ...additionalIds])];
-      await persistIntent(directory, file, [...untouched, owned]);
+      await persistIntent(storage, directory, file, [...untouched, owned]);
       for (const id of additionalIds) pageIds.add(id);
     },
     /** Retire only this work after handing it to the normal embedding retry lifecycle. */
     async clear(): Promise<void> {
-      await persistIntent(directory, file, untouched);
+      await persistIntent(storage, directory, file, untouched);
     },
   };
 }
@@ -76,18 +117,28 @@ export async function releaseRejectedIntent(
   recordBytes: Buffer,
   handOff: (pageIds: PageId[]) => Promise<void>,
 ): Promise<void> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return releaseRejectedIntentFrom(diskReviewEmbeddingIntentStorage(root), recordBytes, handOff);
+}
+
+/** {@link releaseRejectedIntent} over the storage mechanisms: THE ONE BODY. An unkeyable record touches no storage. */
+export async function releaseRejectedIntentFrom(
+  storage: ReviewEmbeddingIntentStorage,
+  recordBytes: Buffer,
+  handOff: (pageIds: PageId[]) => Promise<void>,
+): Promise<void> {
   const key = rawSnapshotKey(recordBytes);
   if (key === null) return;
-  const directory = await resolveConfinedPrivateDir(root);
+  const directory = await storage.privateDirectory();
   const file = path.join(directory, INTENT_FILE);
-  const entries = await readIntent(directory, file);
+  const entries = await readIntent(storage, directory, file);
   const owning = entries.filter(entry => entry.candidates.includes(key));
   if (owning.length === 0) return;
   await handOff([...new Set(owning.flatMap(entry => entry.pageIds))]);
   const remaining = entries
     .map(entry => owning.includes(entry) ? { ...entry, candidates: entry.candidates.filter(k => k !== key) } : entry)
     .filter(entry => entry.candidates.length > 0);
-  await persistIntent(directory, file, remaining);
+  await persistIntent(storage, directory, file, remaining);
 }
 
 /** Identify a candidate by the exact snapshot a batch promoted, so edits never inherit its work. */
@@ -111,8 +162,8 @@ function rawSnapshotKey(bytes: Buffer): string | null {
 }
 
 /** Read a bounded, handle-bound regular leaf; never treat corrupt recovery data as empty. */
-async function readIntent(directory: string, file: string): Promise<IntentEntry[]> {
-  const read = await readConfinedLeaf(path.dirname(directory), file, directory, MAX_INTENT_BYTES);
+async function readIntent(storage: ReviewEmbeddingIntentStorage, directory: string, file: string): Promise<IntentEntry[]> {
+  const read = await storage.readLeafText(directory, file, MAX_INTENT_BYTES);
   if (read.kind === "absent") return [];
   if (read.kind !== "ok") throw new Error("Review embedding intent unavailable; retry after repairing its storage.");
   const parsed = intentSchema.safeParse(parseJson(read.body));
@@ -130,10 +181,12 @@ function parseJson(body: string): unknown {
 }
 
 /** Bound writes symmetrically with reads and leave the last durable intent intact on failure. */
-async function persistIntent(directory: string, file: string, entries: IntentEntry[]): Promise<void> {
+async function persistIntent(
+  storage: ReviewEmbeddingIntentStorage, directory: string, file: string, entries: IntentEntry[],
+): Promise<void> {
   const body = JSON.stringify({ schemaVersion: 1, entries });
   if (Buffer.byteLength(body, "utf8") > MAX_INTENT_BYTES) {
     throw new Error("Review embedding intent exceeds 1 MiB; finish interrupted batches before continuing.");
   }
-  await atomicWrite(file, body, { confineRoot: path.dirname(directory) });
+  await storage.replaceLeaf(directory, file, body);
 }

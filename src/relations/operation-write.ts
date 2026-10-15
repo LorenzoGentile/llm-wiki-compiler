@@ -6,17 +6,56 @@
  * emits the operation child audit event carrying the same binding. Content
  * identity stays distinct from operation identity: an exact pre-existing relation
  * is a valid post-state and is never duplicated solely to attach a mutation id.
+ *
+ * ONE BODY: {@link appendRelationForOperationLocked} runs
+ * {@link appendRelationForOperationLockedFrom} over local-disk
+ * {@link RelationOperationSources} — this store's graph (read and append), its
+ * DURABLE whole-store replacement for the header upgrade, and the audit store's
+ * bound-append sources (which carry their own durable replacement). The lookup,
+ * the dedup, the promised-id refusal, the order upgrade-then-precondition-then-
+ * record-then-event, and every conflict detail stay here; the sources only
+ * answer. No lock is taken: the caller holds it.
  */
 
 import { operationBindingEquals, type OperationBinding } from "../utils/operation-binding.js";
-import { appendOperationEventLocked } from "../events/operation-events.js";
-import { prepareEventStoreForAppend } from "../events/store-read.js";
+import { appendOperationEventLockedFrom } from "../events/operation-events.js";
+import { diskEventBoundWriteSources, type EventBoundWriteSources } from "../events/store.js";
+import { prepareEventStoreForAppendFrom } from "../events/store-read.js";
 import type { EventRecord } from "../events/types.js";
 import type { ProfilePack } from "../profile/types.js";
-import { appendLine, buildRelationRef, type AppendRelationInput } from "./store.js";
-import { readRelationRecords, type BoundRelationRecord } from "./store-read.js";
-import { ensureRelationOperationVersionLocked } from "./store-version.js";
+import {
+  appendRelationLineFrom, buildRelationRef, diskRelationGraphStore, type AppendRelationInput, type RelationGraphStore,
+} from "./store.js";
+import { readRelationRecordsFrom, type BoundRelationRecord } from "./store-read.js";
+import { diskRelationUpgradeSources, ensureRelationOperationVersionLockedFrom, type RelationUpgradeSources } from "./store-version.js";
 import type { RelationRef } from "./types.js";
+
+/**
+ * Everything {@link appendRelationForOperationLockedFrom} reads and writes: this
+ * store's graph and its durable replacement (the upgrade's), and the audit
+ * store's bound-append sources. Owned by the relation store; not `ProjectStore`,
+ * not hosted, and it selects no backend.
+ */
+export interface RelationOperationSources extends RelationUpgradeSources {
+  /** The relation store's read and append. */
+  graph: RelationGraphStore;
+  /** The audit store's read, repair, append, seal and durable replacement. */
+  events: EventBoundWriteSources;
+}
+
+/**
+ * LOCAL DISK. The sources for the project at `root`: this store's graph
+ * (`./store.ts`), its durable replacement (`./store-version.ts`, through
+ * `../utils/atomic-write.js`) and the event store's bound-append sources.
+ * Building them does no I/O. In no package index.
+ */
+function diskRelationOperationSources(root: string): RelationOperationSources {
+  return {
+    graph: diskRelationGraphStore(root),
+    replaceStoreDurable: diskRelationUpgradeSources(root).replaceStoreDurable,
+    events: diskEventBoundWriteSources(root),
+  };
+}
 
 /**
  * The outcome of applying one relation mutation through the operation seam. A
@@ -64,11 +103,11 @@ function liveContentMatch(records: readonly BoundRelationRecord[], contentHash: 
 
 /** Append the relation-create child audit event carrying the operation binding. */
 async function emitRelationOperationEvent(
-  root: string,
+  events: EventBoundWriteSources,
   ref: RelationRef,
   binding: OperationBinding,
 ): Promise<EventRecord> {
-  const result = await appendOperationEventLocked(root, {
+  const result = await appendOperationEventLockedFrom(events, {
     type: "relation-create", origin: "sdk",
     payload: { id: ref.id, relType: ref.type, from: ref.from, to: ref.to },
     at: new Date().toISOString(),
@@ -95,8 +134,23 @@ export async function appendRelationForOperationLocked(
   binding: OperationBinding,
   promisedId?: RelationRef["id"],
 ): Promise<RelationOperationApply> {
+  return appendRelationForOperationLockedFrom(diskRelationOperationSources(root), profile, input, binding, promisedId);
+}
+
+/**
+ * {@link appendRelationForOperationLocked} over {@link RelationOperationSources}:
+ * THE ONE BODY, in the incumbent order. Only the create path upgrades this
+ * store's header, and it does so BEFORE the audit store's precondition.
+ */
+export async function appendRelationForOperationLockedFrom(
+  sources: RelationOperationSources,
+  profile: ProfilePack,
+  input: AppendRelationInput,
+  binding: OperationBinding,
+  promisedId?: RelationRef["id"],
+): Promise<RelationOperationApply> {
   const ref = buildRelationRef(profile, input, promisedId); // canonical + profile-validated content
-  const { records, problems } = await readRelationRecords(root);
+  const { records, problems } = await readRelationRecordsFrom(sources.graph);
   if (problems.length > 0) return { status: "conflict", detail: "relation store has an uncommitted tail" };
   const lookup = lookupByMutation(records, binding, ref.contentHash);
   if (lookup.status === "conflict") return lookup;
@@ -105,14 +159,14 @@ export async function appendRelationForOperationLocked(
     // missing child audit event (a crash between the record and its event). The
     // emit is idempotent — it appends nothing when the bound event already exists.
     // The record is bound to this mutation, so a crash recovery records applied.
-    await emitRelationOperationEvent(root, lookup.ref, binding);
+    await emitRelationOperationEvent(sources.events, lookup.ref, binding);
     return { status: "skipped-idempotent", ref: lookup.ref, bound: true };
   }
   const live = liveContentMatch(records, ref.contentHash);
   if (live !== undefined) {
     // A pre-existing relation deduped by content: this run did not produce it, so
     // the skip is unbound (it must never enter the compensation applied-set).
-    await emitRelationOperationEvent(root, live, binding);
+    await emitRelationOperationEvent(sources.events, live, binding);
     return { status: "skipped-idempotent", ref: live, bound: false };
   }
   if (promisedId !== undefined && records.some((record) => record.ref.id === promisedId)) {
@@ -122,8 +176,8 @@ export async function appendRelationForOperationLocked(
     // is a conflict, never an append.
     return { status: "conflict", detail: "promised relation id is already live with different content" };
   }
-  await ensureRelationOperationVersionLocked(root);
-  await prepareEventStoreForAppend(root); // fail closed on a tampered/symlinked audit store
-  await appendLine(root, ref, binding);
-  return { status: "created", ref, event: await emitRelationOperationEvent(root, ref, binding) };
+  await ensureRelationOperationVersionLockedFrom(sources);
+  await prepareEventStoreForAppendFrom(sources.events); // fail closed on a tampered/symlinked audit store
+  await appendRelationLineFrom(sources.graph, ref, binding);
+  return { status: "created", ref, event: await emitRelationOperationEvent(sources.events, ref, binding) };
 }

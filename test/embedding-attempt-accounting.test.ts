@@ -3,17 +3,27 @@
  * to the content that was sent. Only the provider (and, for one witness, the
  * store write) is stubbed. With a batch size of one, every page is its own
  * provider request, so each case can tell sent, failed and unsent pages apart.
+ *
+ * The failing store write is injected at the PHYSICAL seam: the exported
+ * `replaceLeafAtomicWithin`, which the store writer's disk binding calls
+ * across modules. Only the project's own embedding store leaves (JSON or
+ * binary, compared as native paths) are refused; every other replacement,
+ * including the retry markers, goes to the real primitive. The writer reaches
+ * the store through its bound body, not the root `writeEmbeddingStore`, so a
+ * spy on that facade would no longer see the write.
  */
+import path from "node:path";
 import { beforeEach, expect, it, vi } from "vitest";
 import { OpenAIProvider } from "../src/providers/openai.js";
-import { MAX_PENDING_EMBEDDING_ATTEMPTS as MAX, QUARANTINED_EMBEDDINGS_FILE } from "../src/utils/constants.js";
-import * as store from "../src/utils/embeddings-store.js";
-import * as markers from "../src/utils/pending-embeddings.js";
+import * as guarded from "../src/storage/disk-guarded-leaves.js";
+import {
+  EMBEDDINGS_FILE, LLMWIKI_DIR, MAX_PENDING_EMBEDDING_ATTEMPTS as MAX, PENDING_EMBEDDINGS_FILE, QUARANTINED_EMBEDDINGS_FILE,
+} from "../src/utils/constants.js";
 import { loadPendingEmbeddings } from "../src/utils/pending-embeddings.js";
 import { useCompileProject } from "./fixtures/compile-project.js";
 import { expectChunksCurrent, liveContentHash } from "./fixtures/embedding-chunks.js";
 import { useEmbeddingRefreshEnvironment, writeEmbeddingTestPage } from "./fixtures/embedding-refresh.js";
-import { drainUnderLock } from "./fixtures/embedding-retry-state.js";
+import { drainUnderLock, swallowMarkerWrites } from "./fixtures/embedding-retry-state.js";
 
 const ctx = useCompileProject({ dirSuffix: "attempt-accounting" });
 const PAGES = ["a-healthy", "b-poison", "c-later"];
@@ -88,14 +98,28 @@ it("charges nobody when the run fails before any provider request, and still rep
 // write always fails. Sent pages must stay charged, so paid work stops.
 it("stops paying for work that can never be persisted", async () => {
   const provider = vi.spyOn(OpenAIProvider.prototype, "embedBatch").mockImplementation(async texts => texts.map(() => [0.5, 0.5]));
-  vi.spyOn(store, "writeEmbeddingStore").mockRejectedValue(new Error("disk full"));
+  const refused = refuseStorePublication(new Error("disk full"));
   for (let round = 0; round < MAX; round++) await refresh();
+  expect(refused.length).toBeGreaterThan(0);
   expect(Object.keys(await attempts(QUARANTINED_EMBEDDINGS_FILE)).sort()).toEqual(PAGES);
   const paid = provider.mock.calls.length;
   await refresh();
   await refresh();
   expect(provider).toHaveBeenCalledTimes(paid);
 });
+
+/** Refuse every atomic replacement of this project's embedding store leaves with `error`, delegating all others; returns the refused leaves. */
+function refuseStorePublication(error: Error): string[] {
+  const real = guarded.replaceLeafAtomicWithin;
+  const storeLeaves = new Set([EMBEDDINGS_FILE, `${LLMWIKI_DIR}/embeddings.bin`].map(rel => path.join(ctx.dir, rel)));
+  const refused: string[] = [];
+  vi.spyOn(guarded, "replaceLeafAtomicWithin").mockImplementation(async (confineRoot, leaf, content) => {
+    if (!storeLeaves.has(path.normalize(leaf))) return real(confineRoot, leaf, content);
+    refused.push(leaf);
+    throw error;
+  });
+  return refused;
+}
 
 it("refunds a healthy page aborted by another page's failure, then persists it once the poison is quarantined", async () => {
   failRequestsFor("b-poison");
@@ -131,10 +155,8 @@ it("charges the content that was sent, so an edit during the request starts a fr
 
 it("settles once: a failed settlement write is reported, never followed by a second settlement", async () => {
   vi.spyOn(OpenAIProvider.prototype, "embedBatch").mockImplementation(async texts => texts.map(() => [0.5, 0.5]));
-  const write = markers.writePendingEmbeddings;
-  // A successful run settles by clearing the pending file; swallow exactly that write.
-  vi.spyOn(markers, "writePendingEmbeddings").mockImplementation(async (root, entries, file) =>
-    entries.length === 0 ? undefined : write(root, entries, file));
+  // A successful run settles by clearing the pending file; refuse exactly that unlink. The pre-charges still persist.
+  swallowMarkerWrites(PENDING_EMBEDDINGS_FILE, ["remove"]);
   vi.stubEnv("LLMWIKI_EMBED_STRICT", "on");
   await expect(refresh()).rejects.toThrow(/could not be settled/);
   expect(Object.values(await attempts())).toEqual([1, 1, 1]);

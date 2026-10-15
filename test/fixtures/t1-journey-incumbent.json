@@ -1,0 +1,208 @@
+{
+ "cli-journey": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n+ \u001b[32malpha.md [new]\u001b[0m\n+ \u001b[32mbeta.md [new]\u001b[0m\n* \u001b[34mExtracting: alpha.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n* \u001b[34mExtracting: beta.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n? \u001b[34mCandidate ready: existing-topic-<ID> (existing-topic)\u001b[0m\n\n\u001b[1mCompilation complete\u001b[0m\n\u001b[2m────────────────────────\u001b[0m\n✓ \u001b[32m2 compiled, 0 skipped, 0 deleted\u001b[0m\n? \u001b[34m1 candidate(s) awaiting review — run `llmwiki review list`\u001b[0m\n",
+    "stderr": ""
+   },
+   {
+    "step": "review list",
+    "code": 0,
+    "stdout": "\n\u001b[1mPending review candidates\u001b[0m\n\u001b[2m─────────────────────────────\u001b[0m\n? \u001b[34mexisting-topic-<ID>\u001b[0m → existing-topic \u001b[2m<TIME> | forced: manual-review-requested | sources: alpha.md, beta.md\u001b[0m\n→ \u001b[2mUse `llmwiki review show <id>` to inspect a candidate.\u001b[0m\n",
+    "stderr": ""
+   },
+   {
+    "step": "review show <candidate>",
+    "code": 0,
+    "stdout": "\n\u001b[1mCandidate existing-topic-<ID>\u001b[0m\n\u001b[2m─────────────────────────────────────\u001b[0m\ni \u001b[2mtitle:      Existing Topic\u001b[0m\ni \u001b[2mslug:       existing-topic\u001b[0m\ni \u001b[2msummary:    Concept emitted by aimock for Existing Topic.\u001b[0m\ni \u001b[2msources:    alpha.md, beta.md\u001b[0m\ni \u001b[2mgenerated:  <TIME>\u001b[0m\ni \u001b[2mreview:    forced\u001b[0m\ni \u001b[2mreasons:   manual-review-requested\u001b[0m\ni \u001b[2mconfidence: 0.9\u001b[0m\ni \u001b[2mcontradicted: false\u001b[0m\n\n---\ntitle: Existing Topic\nsummary: Concept emitted by aimock for Existing Topic.\nsources:\n  - alpha.md\n  - beta.md\nkind: concept\ncreatedAt: \"<TIME>\"\nupdatedAt: \"<TIME>\"\ntags:\n  - canned\naliases:\n  - existing-topic\nconfidence: 0.9\nprovenanceState: merged\nmodelId: gpt-4o\npromptVersion: v7\n---\n\nPage body produced for Existing Topic. The event of 2026-01-01T01:02:03.000Z is filed as existing-topic-12345678.\n\n",
+    "stderr": ""
+   },
+   {
+    "step": "review approve <candidate>",
+    "code": 0,
+    "stdout": "+ \u001b[32mApproved → \u001b[36m<BASE>/project/wiki/concepts/existing-topic.md\u001b[0m\u001b[0m\n* \u001b[34mGenerating index...\u001b[0m\n+ \u001b[32mIndex updated with 2 pages.\u001b[0m\n* \u001b[2mEmbeddings: 2 page(s), 2 chunk(s) embedded (2 batched requests).\u001b[0m\n✓ \u001b[2mCandidate existing-topic-<ID> cleared.\u001b[0m\n",
+    "stderr": ""
+   },
+   {
+    "step": "status",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki status\u001b[0m\n\u001b[2m──────────────────\u001b[0m\ni \u001b[34mPages: 2 concept(s), 0 quer(y/ies) — 2 total\u001b[0m\ni \u001b[34mSources: 2\u001b[0m\ni \u001b[2mLast compiled: <TIME>\u001b[0m\n✓ \u001b[32mFresh: no stale or orphaned pages\u001b[0m\n✓ \u001b[32mState: ok\u001b[0m\n",
+    "stderr": ""
+   },
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n✓ \u001b[32mNothing to compile — all sources up to date.\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   ".llmwiki/embeddings.json": "acb855a545ffb41d278f068e61933a0a4118b5edc74e7c84f7f1f8148e52aa34",
+   ".llmwiki/state.json": "cc458cc9b7b028eb3f7eac34b81d150fd1c8df2e3e3afadfa62fceb254dd2aff",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/MOC.md": "9ae235e73ba892515927ba8cf2b7063d696efd402aeb96ea98502101ad93bc95",
+   "wiki/concepts/existing-topic.md": "28d7d913aaa6d98917a01c52e882071e2929abadd1577df2da10eed79f460c5f",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "a4a0e556cc6e48e6834bdf4c624859755b7d94be853062bf84a1a12a59139f0d"
+  },
+  "requests": [
+   "6125c7f6fce87d0453241b3f9b5dc50b6de3b6efbf11551e8da07db44e67c46d",
+   "b743e53ed5828b99aea93e77c49ca63dbc916fc36678e523190d0ada91463f76",
+   "9c9b7cfbc89047e499a0c3b95cf0ad036ccb98b88b830eb18738015f8420bac7",
+   "25ec92981f2d4fc23dabcae6b4b8bbd007785fa35f902c0fdd0139f77d78e683",
+   "067fa2b8c097917218c3d5fb29abd50281550685eeb24fde5e84b5e51da4363c"
+  ],
+  "requestsCarryingHandEdit": 1
+ },
+ "sdk-review-compile": {
+  "steps": [
+   {
+    "step": "sdk compile({review:true})",
+    "code": 0,
+    "stdout": "{\"compiled\":2,\"skipped\":0,\"deleted\":0,\"concepts\":[\"Existing Topic\"],\"pages\":[],\"errors\":[],\"candidates\":[\"existing-topic-<ID>\"],\"review\":{\"held\":[],\"forced\":[{\"id\":\"existing-topic-<ID>\",\"slug\":\"existing-topic\",\"reasons\":[\"manual-review-requested\"]}]}}\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/candidates/existing-topic-<ID>.json": "8113a506fc19b948f40354cf6630f34fa8bc3a5075990b040bcaaacdbde03fa4",
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [
+   "6125c7f6fce87d0453241b3f9b5dc50b6de3b6efbf11551e8da07db44e67c46d",
+   "b743e53ed5828b99aea93e77c49ca63dbc916fc36678e523190d0ada91463f76",
+   "9c9b7cfbc89047e499a0c3b95cf0ad036ccb98b88b830eb18738015f8420bac7"
+  ],
+  "requestsCarryingHandEdit": 1
+ },
+ "lock-held": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n! \u001b[33mAnother compilation is running.\u001b[0m\n! \u001b[31mCould not acquire lock. Try again later.\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   ".llmwiki/lock": "d9c3e12413d109d2df28407c66e1c50f7aeefa86a48e07822bfc63c90cbe4daa",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [],
+  "requestsCarryingHandEdit": 0
+ },
+ "pending-journal": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n+ \u001b[32malpha.md [new]\u001b[0m\n+ \u001b[32mbeta.md [new]\u001b[0m\n* \u001b[34mExtracting: alpha.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n* \u001b[34mExtracting: beta.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n? \u001b[34mCandidate ready: existing-topic-<ID> (existing-topic)\u001b[0m\n\n\u001b[1mCompilation complete\u001b[0m\n\u001b[2m────────────────────────\u001b[0m\n✓ \u001b[32m2 compiled, 0 skipped, 0 deleted\u001b[0m\n? \u001b[34m1 candidate(s) awaiting review — run `llmwiki review list`\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/candidates/existing-topic-<ID>.json": "8113a506fc19b948f40354cf6630f34fa8bc3a5075990b040bcaaacdbde03fa4",
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [
+   "6125c7f6fce87d0453241b3f9b5dc50b6de3b6efbf11551e8da07db44e67c46d",
+   "b743e53ed5828b99aea93e77c49ca63dbc916fc36678e523190d0ada91463f76",
+   "9c9b7cfbc89047e499a0c3b95cf0ad036ccb98b88b830eb18738015f8420bac7"
+  ],
+  "requestsCarryingHandEdit": 1
+ },
+ "escaping-page-link": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n+ \u001b[32malpha.md [new]\u001b[0m\n+ \u001b[32mbeta.md [new]\u001b[0m\n* \u001b[34mExtracting: alpha.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n* \u001b[34mExtracting: beta.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n! \u001b[33mDropped wiki read (escapes-dir): wiki/concepts/escape.md — its content does not resolve under the project root and was NOT read or re-emitted.\u001b[0m\n! \u001b[33mDropped wiki read (escapes-dir): wiki/concepts/escape.md — its content does not resolve under the project root and was NOT read or re-emitted.\u001b[0m\n? \u001b[34mCandidate ready: existing-topic-<ID> (existing-topic)\u001b[0m\n\n\u001b[1mCompilation complete\u001b[0m\n\u001b[2m────────────────────────\u001b[0m\n✓ \u001b[32m2 compiled, 0 skipped, 0 deleted\u001b[0m\n? \u001b[34m1 candidate(s) awaiting review — run `llmwiki review list`\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/candidates/existing-topic-<ID>.json": "8113a506fc19b948f40354cf6630f34fa8bc3a5075990b040bcaaacdbde03fa4",
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/concepts/escape.md": "link:<BASE>/outside/secret.md",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [
+   "6125c7f6fce87d0453241b3f9b5dc50b6de3b6efbf11551e8da07db44e67c46d",
+   "b743e53ed5828b99aea93e77c49ca63dbc916fc36678e523190d0ada91463f76",
+   "9c9b7cfbc89047e499a0c3b95cf0ad036ccb98b88b830eb18738015f8420bac7"
+  ],
+  "requestsCarryingHandEdit": 1
+ },
+ "linked-sources": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n✓ \u001b[32mNothing to compile — all sources up to date.\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   "sources": "link:<BASE>/outside",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [],
+  "requestsCarryingHandEdit": 0
+ },
+ "linked-root": {
+  "steps": [
+   {
+    "step": "compile --review --concurrency 1",
+    "code": 0,
+    "stdout": "\n\u001b[1mllmwiki compile\u001b[0m\n\u001b[2m───────────────────\u001b[0m\n+ \u001b[32malpha.md [new]\u001b[0m\n+ \u001b[32mbeta.md [new]\u001b[0m\n* \u001b[34mExtracting: alpha.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n* \u001b[34mExtracting: beta.md\u001b[0m\n* \u001b[2m  Found 1 concepts: Existing Topic\u001b[0m\n? \u001b[34mCandidate ready: existing-topic-<ID> (existing-topic)\u001b[0m\n\n\u001b[1mCompilation complete\u001b[0m\n\u001b[2m────────────────────────\u001b[0m\n✓ \u001b[32m2 compiled, 0 skipped, 0 deleted\u001b[0m\n? \u001b[34m1 candidate(s) awaiting review — run `llmwiki review list`\u001b[0m\n",
+    "stderr": ""
+   }
+  ],
+  "files": {
+   ".llmwiki/candidates/existing-topic-<ID>.json": "8113a506fc19b948f40354cf6630f34fa8bc3a5075990b040bcaaacdbde03fa4",
+   ".llmwiki/config.json": "ef2ad1c93181691c278c3248793ea697c1eb27697ef39274aa286a90fcc9db06",
+   "sources/alpha.md": "0d2bf1da8d70ed6fcaaabd74e481cf39aa9f389a36fe65aa90fa0bb33589a852",
+   "sources/beta.md": "a037c386c8003169da1dca75e76ec51cbf1421369870528f92f97847fda46d40",
+   "sources/skip.md": "1db059f37e482db41b8876f3f3407ae5ce75e2c854b001a3229a15e14299af67",
+   "wiki/concepts/existing-topic.md": "e0150f18a04ce84b847f6bdc6acfd20b81129b451116dfdd313f8e4e2cf535fe",
+   "wiki/concepts/untouched-page.md": "ac2e86893db1a94f83073123d00f2ecd6769ce3c384e9187b4698c59d6bc2884",
+   "wiki/index.md": "7d4f4d3791df24a5c7e3414573d5d84590025aabcaed1e92f46241222192fc73"
+  },
+  "requests": [
+   "6125c7f6fce87d0453241b3f9b5dc50b6de3b6efbf11551e8da07db44e67c46d",
+   "b743e53ed5828b99aea93e77c49ca63dbc916fc36678e523190d0ada91463f76",
+   "9c9b7cfbc89047e499a0c3b95cf0ad036ccb98b88b830eb18738015f8420bac7"
+  ],
+  "requestsCarryingHandEdit": 1
+ }
+}

@@ -8,12 +8,33 @@
  * the wiki (`collectAllPages`, `readMarkdownFiles`, `findMatchesInContent`) live
  * here so the family modules can import them WITHOUT importing `rules.ts` — which
  * re-exports the families and would otherwise close an import cycle.
+ *
+ * `collectAllPagesFrom` is THE ONE BODY of the page collection and holds no
+ * project root: it reaches the project only through {@link LintPageSources}.
+ * `collectAllPages(root)` is a delegate over a private binding built per call.
+ * The sources answer FACTS (whether a path resolves, a directory's names or
+ * typed entries, a file's text, where a path is); the body owns both scopes,
+ * the filters, the depth, the failure rules and the order. Naming the sources
+ * selects no backend and rules on no mechanism: every member of the local
+ * binding is still an UNCONFINED local-disk call, exactly as before.
+ *
+ * {@link LintLinkSources} adds the pending candidate records for the two
+ * consumers that ask for them, the broken-wikilink rule and the fix plan. The
+ * two disk factories are exported for the sibling rule modules ONLY, so the
+ * disk wiring is written once; no package entry re-exports this module.
+ *
+ * NOT MIGRATED HERE: the citation rule family, the lint orchestrator, source
+ * removal and the eval collectors still take a root and call
+ * `collectAllPages(root)`.
  */
 
-import { readdir, readFile } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
+import { listDirectoryEntries } from "../storage/disk-guarded-leaves.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import { diskLocalRecordDirs } from "../storage/disk-local-record-dirs.js";
+import type { LegacyLocalRecordDirs } from "../storage/legacy-local-record-dirs.js";
+import type { LocalEntry } from "../storage/legacy-local-reads.js";
 
 /** Pattern matching ^[filename.md] citation markers in markdown content. */
 export const CITATION_PATTERN = /\^\[([^\]]+)\]/g;
@@ -41,22 +62,75 @@ export function findMatchesInContent(content: string, pattern: RegExp): LineMatc
 }
 
 /**
+ * Everything the page collection asks of the project. Every path is
+ * project-relative. Each member is ONE incumbent primitive with its own link
+ * behaviour and raw errors; none confines, caps, sorts or normalizes.
+ */
+export interface LintPageSources {
+  /** Whether the path resolves, following links. Never rejects. */
+  exists(relPath: string): Promise<boolean>;
+  /** Entry names of a directory, in the backend's listing order. Rejects raw when it cannot be listed. */
+  listNames(relDir: string): Promise<string[]>;
+  /** Entries of a directory with what each one IS, no link followed, in the backend's listing order. Returns a promise that rejects raw when it cannot be listed. */
+  listEntries(relDir: string): Promise<LocalEntry[]>;
+  /** A file's whole text as UTF-8, following links. Rejects raw, for a directory too. */
+  readText(relPath: string): Promise<string>;
+  /** The path a page is reported under. On local disk, `path.join(root, relPath)`. */
+  locate(relPath: string): string;
+}
+
+/**
+ * LOCAL DISK. The sources for the project at `root`, built per call by each
+ * root-taking rule and held by none. Building them does no I/O. Four members are the
+ * ordinary local read binding's own; the typed listing is the unguarded
+ * `readdir(..., { withFileTypes: true })`, called at once, with each entry's
+ * kind named.
+ */
+export function diskLintPageSources(root: string): LintPageSources {
+  const { exists, listNames, readText, locate } = diskLocalReads(root);
+  return {
+    exists, listNames, readText, locate,
+    listEntries: (relDir) => listDirectoryEntries(locate(relDir)).then((entries) => entries.map((entry): LocalEntry => ({
+      name: entry.name,
+      kind: entry.isFile() ? "file" : entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "link" : "other",
+    }))),
+  };
+}
+
+/**
+ * What the broken-wikilink rule and the fix plan ask of the project, in the
+ * order they ask: the pages, then the pending candidate records. Both read the
+ * SAME two things so they cannot disagree about a link.
+ */
+export interface LintLinkSources {
+  /** The page collection's sources. */
+  pages: LintPageSources;
+  /** The pending candidate records, read through the tolerant candidate list after the pages. */
+  candidates: LegacyLocalRecordDirs;
+}
+
+/** LOCAL DISK. The link sources for the project at `root`, built per call. Building them does no I/O. */
+export function diskLintLinkSources(root: string): LintLinkSources {
+  return { pages: diskLintPageSources(root), candidates: diskLocalRecordDirs(root) };
+}
+
+/**
  * Read all .md files from a directory, returning their paths and parsed content.
  * Returns an empty array if the directory does not exist.
  */
 async function readMarkdownFiles(
-  dirPath: string,
+  sources: LintPageSources, relDir: string,
 ): Promise<Array<{ filePath: string; content: string }>> {
-  if (!existsSync(dirPath)) return [];
+  if (!(await sources.exists(relDir))) return [];
 
-  const entries = await readdir(dirPath);
+  const entries = await sources.listNames(relDir);
   const mdFiles = entries.filter((f) => f.endsWith(".md"));
 
   const results = await Promise.all(
     mdFiles.map(async (fileName) => {
-      const filePath = path.join(dirPath, fileName);
-      const content = await readFile(filePath, "utf-8");
-      return { filePath, content };
+      const relPath = path.join(relDir, fileName);
+      const content = await sources.readText(relPath);
+      return { filePath: sources.locate(relPath), content };
     }),
   );
 
@@ -88,38 +162,45 @@ export type PageScope = "generic" | "wiki-wide";
 export async function collectAllPages(
   root: string, scope: PageScope = "generic",
 ): Promise<Array<{ filePath: string; content: string }>> {
+  return collectAllPagesFrom(diskLintPageSources(root), scope);
+}
+
+/** {@link collectAllPages} through `sources`: THE ONE BODY, for both scopes. */
+export async function collectAllPagesFrom(
+  sources: LintPageSources, scope: PageScope = "generic",
+): Promise<Array<{ filePath: string; content: string }>> {
   if (scope === "generic") {
-    const conceptPages = await readMarkdownFiles(path.join(root, CONCEPTS_DIR));
-    const queryPages = await readMarkdownFiles(path.join(root, QUERIES_DIR));
+    const conceptPages = await readMarkdownFiles(sources, CONCEPTS_DIR);
+    const queryPages = await readMarkdownFiles(sources, QUERIES_DIR);
     return [...conceptPages, ...queryPages];
   }
-  const wikiRoot = path.join(root, "wiki");
-  if (!existsSync(wikiRoot)) return [];
+  const wikiRoot = "wiki";
+  if (!(await sources.exists(wikiRoot))) return [];
   // RECURSIVE, because a profile may validly declare nested entity directories
   // (wiki/research/papers) — a one-level walk silently returned no pages for
   // them, which is the exact partial-coverage failure this widening replaced.
   // Bounded by depth so a symlink cycle cannot walk forever; dot-directories
   // (.obsidian) are artifacts, not pages.
-  const pages = await walkMarkdown(wikiRoot, MAX_WIKI_WALK_DEPTH);
+  const pages = await walkMarkdown(sources, wikiRoot, MAX_WIKI_WALK_DEPTH);
   return pages.sort((left, right) => left.filePath.localeCompare(right.filePath));
 }
 
 /** The deepest nesting a profile's entity directories may reasonably reach. */
 const MAX_WIKI_WALK_DEPTH = 6;
 
-/** Every markdown page under `dir`, to the given remaining depth. */
+/** Every markdown page under `relDir`, to the given remaining depth. A link is neither a directory nor a file here, so it is skipped. */
 async function walkMarkdown(
-  dir: string, depth: number,
+  sources: LintPageSources, relDir: string, depth: number,
 ): Promise<Array<{ filePath: string; content: string }>> {
   if (depth === 0) return [];
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const entries = await sources.listEntries(relDir).catch((): LocalEntry[] => []);
   const results = await Promise.all(entries
     .filter((entry) => !entry.name.startsWith("."))
     .map(async (entry) => {
-      if (entry.isDirectory()) return walkMarkdown(path.join(dir, entry.name), depth - 1);
-      if (!entry.isFile() || !entry.name.endsWith(".md")) return [];
-      const filePath = path.join(dir, entry.name);
-      return [{ filePath, content: await readFile(filePath, "utf-8") }];
+      const relPath = path.join(relDir, entry.name);
+      if (entry.kind === "directory") return walkMarkdown(sources, relPath, depth - 1);
+      if (entry.kind !== "file" || !entry.name.endsWith(".md")) return [];
+      return [{ filePath: sources.locate(relPath), content: await sources.readText(relPath) }];
     }));
   return results.flat();
 }

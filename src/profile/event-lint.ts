@@ -28,7 +28,7 @@
  * no problems, so this yields no findings and lint output stays byte-identical.
  */
 
-import { readEvents } from "../events/store-read.js";
+import { diskEventReadSources, readEventsFrom, type EventReadSources } from "../events/store-read.js";
 import {
   EventStoreCorruptError,
   EventStoreTooNewError,
@@ -121,9 +121,14 @@ function problemToFinding(problem: string): LintResult {
  * @returns All event-store findings (possibly empty). Never throws a store error.
  */
 export async function checkEventChain(root: string): Promise<LintResult[]> {
+  return checkEventChainFrom(diskEventReadSources(root));
+}
+
+/** {@link checkEventChain} over the event store's read sources: THE ONE BODY. It holds no project root. */
+export async function checkEventChainFrom(sources: EventReadSources): Promise<LintResult[]> {
   let read;
   try {
-    read = await readEvents(root);
+    read = await readEventsFrom(sources);
   } catch (error) {
     const finding = readErrorFinding(error);
     if (finding) return [finding];

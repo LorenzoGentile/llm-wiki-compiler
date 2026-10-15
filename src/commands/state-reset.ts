@@ -20,18 +20,36 @@
  * state file whose parent escapes root) fails CLOSED and nothing outside root is
  * moved or clobbered. A confinement refusal is a FAILURE (exit code 1), distinct
  * from a benign ABSENT `.llmwiki` (nothing to reset → exit 0).
+ *
+ * ONE BODY EACH for the state path. {@link previewStateResetWith} (the dry run)
+ * and {@link resetStateFileWith} (the confirmed reset) decide presence, the
+ * escape and busy refusals, the backup-destination gate and the rename over
+ * {@link StateResetSteps}. The containment decision (is `.llmwiki`'s realpath
+ * inside the root's realpath?) is the body's; the two realpath observations, the
+ * no-follow look, the raw rename and the lock stay the incumbent disk and host
+ * mechanisms in `localStateResetSteps`. Every line the command prints is a
+ * {@link StateResetNotice} reported at exactly the point it was printed before,
+ * so no line moves relative to the lock.
+ *
+ * ONE BODY for every OTHER scope too. {@link runScopedResetWith} owns the
+ * non-state controller (the scope check, the plan and its unavailable refusal,
+ * the announcement, then — only with `--yes` — the lock, the executor handed the
+ * PRINTED plan, its refusal and the exact deleted count, and the release) over
+ * {@link ScopedResetSteps}, none of which takes a project root. The command
+ * passes the local steps, which call the incumbent planner, lock and executor.
  */
 
-import { rename, realpath, lstat } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
+import { renameLeafUnguarded } from "../storage/disk-guarded-leaves.js";
+import { locationKindNoFollow } from "../storage/disk-local-reads.js";
+import { locationExistsSync } from "../storage/disk-locations.js";
 import { LLMWIKI_DIR, STATE_FILE } from "../utils/constants.js";
 import { releaseLock } from "../utils/lock.js";
 import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
 import { safeRealpath, isInsideDir, confineUnderRoot } from "../utils/path-confine.js";
 import * as output from "../utils/output.js";
 import {
-  executeReset, planReset, RESET_SCOPES, type ResetPlanV1, type ResetScopeV1,
+  executeReset, planReset, RESET_SCOPES, type ResetExecutionV1, type ResetPlanV1, type ResetScopeV1,
 } from "./reset-plan.js";
 
 /** Options for {@link stateResetCommand}. */
@@ -46,14 +64,36 @@ export interface StateResetOptions {
   scope?: string;
 }
 
-/** Validate a non-state scope, report its plan, and destroy it only on --yes. */
-async function runNonStateScope(root: string, scope: string, apply: boolean): Promise<void> {
+/** What a scoped (non-state) reset asks of the project. No member takes a project root. */
+export interface ScopedResetSteps {
+  /** The deletion plan for `scope`. */
+  plan(scope: ResetScopeV1): Promise<ResetPlanV1>;
+  /** Take the project lock at `ordinary` intent without blocking: false when busy. */
+  acquireLock(): Promise<boolean>;
+  /** Release the project lock. */
+  releaseLock(): Promise<void>;
+  /** Delete exactly `plan`'s files; the caller holds the lock. */
+  execute(scope: ResetScopeV1, plan: ResetPlanV1): Promise<ResetExecutionV1>;
+}
+
+/** LOCAL DISK. The incumbent planner, lock and executor for `root`, each called when asked. */
+function localScopedResetSteps(root: string): ScopedResetSteps {
+  return {
+    plan: (scope) => planReset(root, scope),
+    acquireLock: () => acquireMutationLock(root, "ordinary"),
+    releaseLock: () => releaseLock(root),
+    execute: (scope, plan) => executeReset(root, scope, plan),
+  };
+}
+
+/** Validate a non-state scope, report its plan, and destroy it only on --yes: THE ONE BODY. */
+export async function runScopedResetWith(steps: ScopedResetSteps, scope: string, apply: boolean): Promise<void> {
   if (!RESET_SCOPES.includes(scope as ResetScopeV1)) {
     output.status("!", output.warn(`unknown scope ${scope}; expected one of ${RESET_SCOPES.join("|")}`));
     process.exitCode = 1;
     return;
   }
-  await reportScopedPlan(root, scope as ResetScopeV1, apply);
+  await reportScopedPlan(steps, scope as ResetScopeV1, apply);
 }
 
 /**
@@ -64,8 +104,8 @@ async function runNonStateScope(root: string, scope: string, apply: boolean): Pr
  * passed `--yes` from memory still deserves the list in their scrollback when
  * they realise the scope was wrong.
  */
-async function reportScopedPlan(root: string, scope: ResetScopeV1, apply: boolean): Promise<void> {
-  const plan = await planReset(root, scope);
+async function reportScopedPlan(steps: ScopedResetSteps, scope: ResetScopeV1, apply: boolean): Promise<void> {
+  const plan = await steps.plan(scope);
   if (plan.status === "unavailable") {
     output.status("!", output.warn(`cannot plan ${scope}: ${plan.reason}`));
     process.exitCode = 1;
@@ -74,7 +114,7 @@ async function reportScopedPlan(root: string, scope: ResetScopeV1, apply: boolea
   announcePlan(plan.files, scope, apply);
   // The PRINTED plan is handed to the executor: re-planning under the lock would
   // let a file created in between be deleted without ever being shown.
-  if (apply) await destroyScope(root, scope, plan);
+  if (apply) await destroyScope(steps, scope, plan);
 }
 
 /** Name every file the scope covers, before anything is destroyed. */
@@ -93,15 +133,15 @@ function announcePlan(files: readonly string[], scope: ResetScopeV1, apply: bool
  * one intended. A held lock REFUSES rather than waiting, and refusing is
  * non-zero so the caller never reads "reset" when nothing was reset.
  */
-async function destroyScope(root: string, scope: ResetScopeV1, plan: ResetPlanV1): Promise<void> {
-  const acquired = await acquireMutationLock(root, "ordinary");
+async function destroyScope(steps: ScopedResetSteps, scope: ResetScopeV1, plan: ResetPlanV1): Promise<void> {
+  const acquired = await steps.acquireLock();
   if (!acquired) {
     output.status("!", output.warn("Another llmwiki process is using this project; not resetting."));
     process.exitCode = 1;
     return;
   }
   try {
-    const outcome = await executeReset(root, scope, plan);
+    const outcome = await steps.execute(scope, plan);
     if (outcome.status === "refused") {
       output.status("!", output.warn(`reset refused: ${outcome.reason}`));
       process.exitCode = 1;
@@ -111,153 +151,129 @@ async function destroyScope(root: string, scope: ResetScopeV1, plan: ResetPlanV1
     // which would report files that turned out to be already gone as deleted.
     output.status("✓", output.success(`Deleted ${outcome.deleted.length} file(s) under scope ${scope}.`));
   } finally {
-    await releaseLock(root);
+    await steps.releaseLock();
+  }
+}
+
+/** Every line the state path reports; the failures also set exit code 1. */
+export type StateResetNotice = "no-state" | "plan" | "escape" | "busy" | "bak-not-regular" | "reset";
+
+/** What the state reset asks of the project and its host. No member takes a project root. */
+export interface StateResetSteps {
+  /** The dry run's presence look at the state file (synchronous). */
+  statePresent(): boolean;
+  /** The real path of `.llmwiki`, or `null` when it is absent (an observation; no decision). */
+  realLlmwikiDir(): Promise<string | null>;
+  /** The project root's real path, or its resolved spelling when it cannot be resolved. */
+  realRoot(): Promise<string>;
+  /** The project lock (host). */
+  acquireLock(): Promise<boolean>;
+  /** Release the project lock (host). */
+  releaseLock(): Promise<void>;
+  /** Whether a location exists (synchronous). */
+  exists(location: string): boolean;
+  /** The state path confined under the project root (it need not exist). */
+  confineUnderRoot(location: string): Promise<string>;
+  /** A no-follow look at a location; rejects when it cannot be looked at. */
+  kindNoFollow(location: string): Promise<string>;
+  /** The raw rename: no parse, no validation. */
+  rename(from: string, to: string): Promise<void>;
+  /** Report one line, at the point the command prints it. */
+  notice(code: StateResetNotice): void;
+}
+
+/** The command's lines, verbatim; each failure also sets exit code 1 after its line. */
+function printStateResetNotice(code: StateResetNotice): void {
+  if (code === "no-state") output.status("✓", output.success("No state file to reset."));
+  else if (code === "reset") output.status("✓", output.success(`Reset ${STATE_FILE}. Backup saved to ${STATE_FILE}.bak.`));
+  else if (code === "plan") {
+    output.status("→", `Will back up ${STATE_FILE} to ${STATE_FILE}.bak and remove it`);
+    output.status("→", "so the next compile starts fresh.");
+    output.status("→", output.dim("Re-run with `--yes` to confirm."));
+  } else {
+    if (code === "escape") output.status("!", output.warn(`${LLMWIKI_DIR} escapes the project root — refusing to reset (tampering).`));
+    if (code === "busy") output.status("!", output.warn("Another llmwiki process is using this project; not resetting."));
+    if (code === "bak-not-regular") {
+      output.status("!", output.warn(`cannot back up: ${STATE_FILE}.bak exists and is not a regular file; remove it and retry`));
+    }
+    process.exitCode = 1;
   }
 }
 
 /**
- * The outcome of confining the `.llmwiki` directory under the project root:
- *  - `ok`     — a REAL in-root directory; carries the confined real `dir`.
- *  - `absent` — no `.llmwiki` directory at all (nothing to reset; a no-op success).
- *  - `escape` — `.llmwiki` exists but its realpath escapes root (filesystem
- *               tampering); a confinement REFUSAL, which must exit non-zero.
- *
- * Distinguishing `absent` from `escape` is what lets the caller exit 0 for the
- * benign no-op yet exit 1 for the tampering refusal — collapsing both to `null`
- * (the prior behavior) made a refusal masquerade as success.
+ * LOCAL DISK AND HOST. The incumbent mechanisms for `root`, each called when
+ * asked: the realpaths of `.llmwiki` and of the root (the observations behind the
+ * journal-dir trust boundary), the existence and no-follow looks,
+ * `confineUnderRoot`, the raw rename, the project lock, and the command's own
+ * output.
  */
-type LlmwikiDirResolution =
-  | { kind: "ok"; dir: string }
-  | { kind: "absent" }
-  | { kind: "escape" };
+function localStateResetSteps(root: string): StateResetSteps {
+  return {
+    statePresent: () => locationExistsSync(path.join(root, STATE_FILE)),
+    realLlmwikiDir: () => safeRealpath(path.join(root, LLMWIKI_DIR)),
+    realRoot: async () => (await safeRealpath(root)) ?? path.resolve(root),
+    acquireLock: () => acquireMutationLock(root, "ordinary"),
+    releaseLock: () => releaseLock(root),
+    exists: (location) => locationExistsSync(location),
+    confineUnderRoot: (location) => confineUnderRoot(location, root, { mustExist: false }),
+    kindNoFollow: (location) => locationKindNoFollow(location),
+    rename: (from, to) => renameLeafUnguarded(from, to),
+    notice: printStateResetNotice,
+  };
+}
 
-/**
- * Resolve the confined `.llmwiki` directory for `root`, mirroring the journal-dir
- * trust boundary: its realpath must be a REAL directory that stays inside the
- * project root's realpath. Returns a tagged {@link LlmwikiDirResolution} so the
- * caller can tell a benign ABSENT dir (no-op, exit 0) apart from an ESCAPING one
- * (tampering refusal, exit non-zero). An escape is announced here.
- *
- * @param root - Absolute project root directory.
- * @returns The tagged resolution: `ok` (with the real dir), `absent`, or `escape`.
- */
-async function resolveConfinedLlmwikiDir(root: string): Promise<LlmwikiDirResolution> {
-  const realDir = await safeRealpath(path.join(root, LLMWIKI_DIR));
-  if (realDir === null) return { kind: "absent" }; // absent → nothing to reset
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
-  if (!isInsideDir(realDir, realRoot)) {
-    output.status("!", output.warn(`${LLMWIKI_DIR} escapes the project root — refusing to reset (tampering).`));
-    return { kind: "escape" };
-  }
-  return { kind: "ok", dir: realDir };
+/** THE DRY-RUN BODY: no state file is the no-op line; otherwise the plan and how to confirm. Changes nothing. */
+export function previewStateResetWith(steps: StateResetSteps): void {
+  steps.notice(steps.statePresent() ? "plan" : "no-state");
 }
 
 /**
- * Dry-run path (no `--yes`): report the no-op when there is no state file, else
- * print the plan and how to confirm. Changes nothing.
- *
- * @param root - Absolute project root directory.
+ * THE CONFIRMED-RESET BODY: an ABSENT `.llmwiki` is the benign no-op (the root is
+ * not looked at) and one whose realpath ESCAPES the root's realpath (the
+ * journal-dir trust boundary) a refusal, both before any lock; a held lock
+ * refuses; otherwise the state is backed up under the lock, which is always
+ * released.
  */
-function reportResetPlan(root: string): void {
-  if (!existsSync(path.join(root, STATE_FILE))) {
-    output.status("✓", output.success("No state file to reset."));
-    return;
-  }
-  output.status("→", `Will back up ${STATE_FILE} to ${STATE_FILE}.bak and remove it`);
-  output.status("→", "so the next compile starts fresh.");
-  output.status("→", output.dim("Re-run with `--yes` to confirm."));
-}
-
-/**
- * Confirmed path (`--yes`): validate `.llmwiki` is a real in-root directory FIRST
- * (a read-only realpath check) so a symlinked-escaping `.llmwiki` is rejected
- * before `acquireLock` would itself create a lock file through the symlink; only
- * then acquire the lock (refusing cleanly if held), back up the raw state file,
- * and always release the lock.
- *
- * @param root - Absolute project root directory.
- */
-async function runConfirmedReset(root: string): Promise<void> {
-  const resolution = await resolveConfinedLlmwikiDir(root);
-  if (resolution.kind === "absent") {
-    output.status("✓", output.success("No state file to reset."));
-    return; // benign no-op → exit 0, no lock created
-  }
-  if (resolution.kind === "escape") {
-    process.exitCode = 1; // confinement refusal is a FAILURE
-    return; // warning already announced, no lock created
-  }
-  const acquired = await acquireMutationLock(root, "ordinary");
-  if (!acquired) {
-    output.status("!", output.warn("Another llmwiki process is using this project; not resetting."));
-    process.exitCode = 1; // requested reset did NOT happen → non-zero exit (no false success)
-    return;
-  }
+export async function resetStateFileWith(steps: StateResetSteps): Promise<void> {
+  const realDir = await steps.realLlmwikiDir();
+  if (realDir === null) return steps.notice("no-state");
+  if (!isInsideDir(realDir, await steps.realRoot())) return steps.notice("escape");
+  if (!(await steps.acquireLock())) return steps.notice("busy");
   try {
-    await backupStateFile(root, resolution.dir);
+    await backupStateWith(steps, realDir);
   } finally {
-    await releaseLock(root);
+    await steps.releaseLock();
   }
 }
 
 /**
- * True when the backup destination is safe to overwrite via `rename`.
- *
- * Clobbering a REGULAR-FILE `.bak` is intended (a prior backup), and an absent
- * `.bak` is fine. But a DIRECTORY `.bak` makes `rename` throw a raw, unactionable
- * `EISDIR` (→ exit 1 with `Error: EISDIR`); any other non-regular type is equally
- * unwriteable. We detect those up front with `lstat` (no symlink follow — a
- * symlink `.bak` is replaced, not written through, so it stays allowed) and
- * refuse cleanly instead. Returns false (with an actionable message emitted) when
- * the path exists and is not a regular file.
- *
- * @param bakPath - The `state.json.bak` destination path.
- * @returns True if the rename may proceed; false if it must be refused.
+ * True when the backup destination is safe to overwrite via `rename`: absent
+ * (any failed look counts as absent) or a regular file (a prior backup, an
+ * intended clobber). Any other kind refuses cleanly instead of a raw `EISDIR`.
  */
-async function backupDestinationIsWriteable(bakPath: string): Promise<boolean> {
-  let st;
+async function backupDestinationIsWriteableWith(steps: StateResetSteps, bakPath: string): Promise<boolean> {
+  let kind: string;
   try {
-    st = await lstat(bakPath);
+    kind = await steps.kindNoFollow(bakPath);
   } catch {
     return true; // absent → safe to create
   }
-  if (st.isFile()) return true; // a prior backup → intended clobber
-  output.status(
-    "!",
-    output.warn(
-      `cannot back up: ${STATE_FILE}.bak exists and is not a regular file; remove it and retry`,
-    ),
-  );
-  return false;
+  return kind === "file";
 }
 
 /**
- * Back up and remove the confined state file. Resolves the state path UNDER the
- * confined `.llmwiki` dir (so a symlinked parent cannot redirect the rename) and
- * renames the RAW bytes to `state.json.bak` without reading or validating them,
- * so recovery works on a too-new or corrupt state.
- *
- * Refuses CLEANLY (exit 1, no crash) when `state.json.bak` exists and is not a
- * regular file (e.g. a directory), instead of letting `rename` throw a raw
- * `EISDIR`. The state file is left untouched in that case.
- *
- * @param root - Absolute project root directory.
- * @param confinedDir - The validated `.llmwiki` real directory.
+ * Back up and remove the confined state file: the state path resolved UNDER the
+ * confined `.llmwiki` dir, then the RAW bytes renamed to `state.json.bak` without
+ * being read or validated, so recovery works on a too-new or corrupt state.
  */
-async function backupStateFile(root: string, confinedDir: string): Promise<void> {
+async function backupStateWith(steps: StateResetSteps, confinedDir: string): Promise<void> {
   const statePath = path.join(confinedDir, path.basename(STATE_FILE));
-  if (!existsSync(statePath)) {
-    output.status("✓", output.success("No state file to reset."));
-    return;
-  }
-  const confinedState = await confineUnderRoot(statePath, root, { mustExist: false });
+  if (!steps.exists(statePath)) return steps.notice("no-state");
+  const confinedState = await steps.confineUnderRoot(statePath);
   const bakPath = `${confinedState}.bak`;
-  if (!(await backupDestinationIsWriteable(bakPath))) {
-    process.exitCode = 1; // clean actionable refusal, not a raw EISDIR crash
-    return;
-  }
-  await rename(confinedState, bakPath);
-  output.status("✓", output.success(`Reset ${STATE_FILE}. Backup saved to ${STATE_FILE}.bak.`));
+  if (!(await backupDestinationIsWriteableWith(steps, bakPath))) return steps.notice("bak-not-regular");
+  await steps.rename(confinedState, bakPath);
+  steps.notice("reset");
 }
 
 /**
@@ -279,10 +295,10 @@ export async function stateResetCommand(opts: StateResetOptions = {}): Promise<v
   // when a caller named a different scope would destroy something they did not
   // ask about while reporting success — the worst failure this surface has.
   const scope = opts.scope ?? "state";
-  if (scope !== "state") return runNonStateScope(root, scope, opts.yes === true);
+  if (scope !== "state") return runScopedResetWith(localScopedResetSteps(root), scope, opts.yes === true);
   if (!opts.yes) {
-    reportResetPlan(root);
+    previewStateResetWith(localStateResetSteps(root));
     return;
   }
-  await runConfirmedReset(root);
+  await resetStateFileWith(localStateResetSteps(root));
 }

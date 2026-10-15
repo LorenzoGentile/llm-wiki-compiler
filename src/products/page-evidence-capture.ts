@@ -14,13 +14,16 @@
  * would turn immutability back into fake authority — the defect this seam
  * exists to close. The runtime sibling re-verifies every sealed source before
  * the provider phase consumes it.
+ *
+ * ONE BODY. {@link capturePageEvidenceInput} keeps its signature and runs
+ * {@link capturePageEvidenceInputFrom} over `diskPageEvidenceReads`, the
+ * incumbent root readers called when asked; the forms take the same reads.
  */
 
-import { loadNonDefaultProfile } from "../profile/block.js";
-import { readConfinedEntityFrontmatter } from "../profile/lifecycle-read.js";
 import { declaredProviderPhaseValues } from "./source-evidence-capture.js";
 import {
-  captureArtifactDeref, capturePageField, captureRelationTarget, captureRunBinding,
+  captureArtifactDerefFrom, capturePageField, captureRelationTargetFrom, captureRunBindingFrom, diskPageEvidenceReads,
+  type PageEvidenceReads,
 } from "./page-evidence-forms.js";
 import type { PackActionInputValueV2, WorkspaceOperationsPackV2 } from "../operations-packs/types.js";
 import type { PageEvidenceCaptureV2, PageEvidenceDescriptorV2 } from "../operations-packs/recipe-types.js";
@@ -68,7 +71,7 @@ function ownedPrefixes(capture: PageEvidenceCaptureV2): string[] {
 
 /** Run one declared capture against the resolved target page. */
 async function runCapture(
-  root: string, loaded: LoadedProfile, descriptor: PageEvidenceDescriptorV2,
+  reads: PageEvidenceReads, loaded: LoadedProfile, descriptor: PageEvidenceDescriptorV2,
   capture: PageEvidenceCaptureV2, meta: Readonly<Record<string, unknown>>, slug: string,
   input: Readonly<Record<string, PackActionInputValueV2>>,
 ): Promise<{ seal: Readonly<Record<string, string>> } | { refused: string }> {
@@ -79,15 +82,15 @@ async function runCapture(
   }
   if (capture.form === "artifact-deref") {
     const def = loaded.profile.entities[descriptor.target.entityType];
-    return captureArtifactDeref(root, loaded, meta, capture, pageLabel,
+    return captureArtifactDerefFrom(reads, loaded, meta, capture, pageLabel,
       def?.fields as Readonly<Record<string, unknown>> | undefined);
   }
-  if (capture.form === "relation-target") return captureRelationTarget(root, loaded, pageLabel, capture);
+  if (capture.form === "relation-target") return captureRelationTargetFrom(reads, loaded, pageLabel, capture);
   const runId = input[capture.runIdFrom];
   if (typeof runId !== "string" || runId.length === 0) {
     return { refused: `capture ${capture.captureId}: the input carries no run id under ${JSON.stringify(capture.runIdFrom)}` };
   }
-  return captureRunBinding(root, capture, runId, slug);
+  return captureRunBindingFrom(reads, capture, runId, slug);
 }
 
 /**
@@ -105,6 +108,18 @@ export async function capturePageEvidenceInput(
   root: string, pack: WorkspaceOperationsPackV2, actionId: string,
   input: Readonly<Record<string, PackActionInputValueV2>>,
 ): Promise<PageEvidenceCaptureOutcomeV1> {
+  return capturePageEvidenceInputFrom(diskPageEvidenceReads(root), pack, actionId, input);
+}
+
+/**
+ * THE ONE BODY of {@link capturePageEvidenceInput}: the descriptor, the caller
+ * collision, the slug, the profile, the declared entity, the target page's
+ * frontmatter, then each declared capture in order, the first refusal winning.
+ */
+export async function capturePageEvidenceInputFrom(
+  reads: PageEvidenceReads, pack: WorkspaceOperationsPackV2, actionId: string,
+  input: Readonly<Record<string, PackActionInputValueV2>>,
+): Promise<PageEvidenceCaptureOutcomeV1> {
   const descriptor = descriptorFor(pack, actionId);
   if (descriptor === undefined) return { input };
   if ("refused" in descriptor) return descriptor;
@@ -114,17 +129,17 @@ export async function capturePageEvidenceInput(
   if (typeof slug !== "string" || slug.length === 0) {
     return { refused: `page-evidence input carries no target slug under ${descriptor.target.slugField}` };
   }
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await reads.nonDefaultProfile();
   if (!loaded) return { refused: "page evidence requires an active profile" };
   const def = loaded.profile.entities[descriptor.target.entityType];
   if (def === undefined) return { refused: `entity type ${descriptor.target.entityType} is not declared by the active profile` };
-  const read = await readConfinedEntityFrontmatter(root, def, slug);
+  const read = await reads.entityFrontmatter(def, slug);
   if (read.kind !== "frontmatter") {
     return { refused: `the targeted page ${descriptor.target.entityType}/${slug} is ${read.kind}` };
   }
   let sealed: Record<string, PackActionInputValueV2> = { ...input };
   for (const capture of descriptor.captures) {
-    const outcome = await runCapture(root, loaded, descriptor, capture, read.meta, slug, input);
+    const outcome = await runCapture(reads, loaded, descriptor, capture, read.meta, slug, input);
     if ("refused" in outcome) return outcome;
     sealed = { ...sealed, ...outcome.seal };
   }

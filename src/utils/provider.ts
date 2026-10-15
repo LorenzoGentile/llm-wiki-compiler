@@ -6,6 +6,7 @@
  * appropriate backend.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   DEFAULT_PROVIDER,
   PROVIDER_MODELS,
@@ -132,7 +133,39 @@ export function buildProvider(providerName: string): LLMProvider {
  * `getEmbeddingProvider` from `./embedding-provider.js` instead.
  */
 export function getProvider(): LLMProvider {
-  return buildProvider(getProviderName());
+  return providerOverride.getStore()?.provider ?? buildProvider(getProviderName());
+}
+
+/** A provider bound to one async call tree instead of the process environment. */
+export interface ProviderOverride {
+  /** The provider every chat, tool and embedding call in the scope uses. */
+  provider: LLMProvider;
+  /**
+   * The provider name reported for the scope. Identity travels with the
+   * provider: a draft generated under an override must never be stamped with
+   * whatever `LLMWIKI_PROVIDER` happens to name in the environment.
+   */
+  providerName: string;
+  /** The model id stamped into page provenance for the scope. */
+  modelId: string;
+}
+
+/**
+ * The override for the current async call tree, if any. `AsyncLocalStorage`
+ * for the same reason as the run system policy: two hosts in one process may
+ * run different models at once, and a module variable would leak between them.
+ */
+const providerOverride = new AsyncLocalStorage<ProviderOverride>();
+
+/**
+ * Run `fn` with `override` answering every model call it makes.
+ *
+ * This exists for a host that configures its model itself (the portable host's
+ * deterministic fixture) and must not depend on `LLMWIKI_PROVIDER` or any
+ * credential in the environment. Outside such a scope nothing changes.
+ */
+export function runWithProviderOverride<T>(override: ProviderOverride, fn: () => T): T {
+  return providerOverride.run(override, fn);
 }
 
 function readOptionalEnv(name: string): string | undefined {
@@ -230,7 +263,7 @@ function getProviderName(): string {
 
 /** Expose the resolved provider name for callers that need model lookup. */
 export function getActiveProviderName(): string {
-  return getProviderName();
+  return providerOverride.getStore()?.providerName ?? getProviderName();
 }
 
 /**
@@ -243,6 +276,8 @@ export function getActiveProviderName(): string {
  * matches what an actual compile call would use.
  */
 export function resolveActiveModelId(): string {
+  const scoped = providerOverride.getStore();
+  if (scoped) return scoped.modelId;
   const providerName = getProviderName();
   if (providerName === "converse") return resolveConverseModel();
   if (providerName === "offline") return PROVIDER_MODELS.offline;

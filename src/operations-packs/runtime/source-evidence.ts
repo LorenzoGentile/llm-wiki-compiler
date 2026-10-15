@@ -19,17 +19,16 @@
  * hardened confined reader. The retention store is flat today; a path carrying
  * a separator or a dot-segment is refused rather than resolved, because a
  * traversal that "worked" would read outside the store the operator approved.
+ *
+ * ONE BODY. {@link buildSourceEvidenceSpecs} keeps its signature and runs
+ * {@link buildSourceEvidenceSpecsFrom} over the shared source read
+ * (`diskSourceLeafReads`, the same confined read under `sources/`).
  */
 
-import path from "node:path";
-import { isFlatSourceLeaf as isFlatLeaf } from "../../utils/flat-source-leaf.js";
+import { diskSourceLeafReads, isFlatSourceLeaf as isFlatLeaf, type SourceLeafReads } from "../../utils/flat-source-leaf.js";
 import { createHash } from "node:crypto";
-import { readConfinedLeafBuffer } from "../../utils/confined-read.js";
 import type { PlanSourceEvidenceDescriptorV1 } from "../../preparations/plan-types.js";
 import type { ProviderInputSpecV1 } from "../../capability-providers/runtime/inputs.js";
-
-/** The retention directory the descriptor's paths are relative to. */
-const SOURCES_DIR = "sources";
 
 /** The built specs plus the inputId→relative-path table the provider reads. */
 export interface SourceEvidenceSpecsV1 {
@@ -68,20 +67,32 @@ export async function buildSourceEvidenceSpecs(
   descriptor: PlanSourceEvidenceDescriptorV1,
   value: Readonly<Record<string, unknown>>,
 ): Promise<SourceEvidenceOutcomeV1> {
+  return buildSourceEvidenceSpecsFrom(diskSourceLeafReads(root), descriptor, value);
+}
+
+/**
+ * THE ONE BODY of {@link buildSourceEvidenceSpecs}: the sealed columns and the
+ * item cap, then per path IN ORDER the flat-leaf refusal before any read, the
+ * read's verdict, the running byte cap, the digest and byte-count drift checks,
+ * and the spec.
+ */
+export async function buildSourceEvidenceSpecsFrom(
+  reads: SourceLeafReads,
+  descriptor: PlanSourceEvidenceDescriptorV1,
+  value: Readonly<Record<string, unknown>>,
+): Promise<SourceEvidenceOutcomeV1> {
   const columns = columnsOf(descriptor, value);
   if (columns === null) return { status: "unavailable", reason: "source-evidence-columns-invalid" };
   if (columns.paths.length > descriptor.maxItems) {
     return { status: "unavailable", reason: "source-evidence-over-item-cap" };
   }
-  const sourcesRoot = path.join(root, SOURCES_DIR);
   const specs: ProviderInputSpecV1[] = [];
   const pathTable: Record<string, string> = {};
   let totalBytes = 0;
   for (let index = 0; index < columns.paths.length; index += 1) {
     const relative = columns.paths[index]!;
     if (!isFlatLeaf(relative)) return { status: "unavailable", reason: "source-evidence-path-unconfined" };
-    const read = await readConfinedLeafBuffer(
-      sourcesRoot, path.join(sourcesRoot, relative), sourcesRoot, descriptor.maxBytes);
+    const read = await reads.readSourceLeaf(relative, descriptor.maxBytes);
     if (read.kind !== "ok") return { status: "unavailable", reason: `source-evidence-read-${read.kind}` };
     totalBytes += read.body.length;
     if (totalBytes > descriptor.maxBytes) return { status: "unavailable", reason: "source-evidence-over-byte-cap" };

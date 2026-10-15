@@ -23,7 +23,7 @@
  * as clean primary evidence.
  */
 
-import { resolveNonDefaultProfile, type PreloadedProfile } from "../profile/block.js";
+import type { PreloadedProfile } from "../profile/block.js";
 import type { ProfilePack } from "../profile/types.js";
 import type { ViewerPage, ViewerSnapshot } from "../viewer/types.js";
 
@@ -32,29 +32,18 @@ import type { ViewerPage, ViewerSnapshot } from "../viewer/types.js";
  * `retrieval.includeInContext`.
  *
  * The ORIGINAL snapshot object is returned unchanged whenever nothing is
- * excluded (the built-in default profile, a read error, or a profile that opts
- * nothing out), so the common path allocates nothing and the default context
- * pack is byte-identical.
+ * excluded (the built-in default profile or a profile that opts nothing out), so
+ * the common path allocates nothing and the default context pack is
+ * byte-identical. Pure: the caller loaded the profile ONCE (its load failure is
+ * the caller's), so one pack is never assembled against two mid-swapped profiles.
  *
- * @param root - Absolute project root.
  * @param snapshot - The frozen viewer snapshot to scope.
- * @param preloaded - A profile the caller already resolved, threaded through so
- *   one pack is never assembled against two mid-swapped profiles.
+ * @param preloaded - The caller's non-default profile, or `null` for the built-in default.
  * @returns The snapshot, minus any typed page its entity type keeps out of context.
  */
-export async function narrowSnapshotToContextPool(
-  root: string,
-  snapshot: ViewerSnapshot,
-  preloaded?: PreloadedProfile,
-): Promise<ViewerSnapshot> {
-  let profile: ProfilePack;
-  try {
-    const loaded = await resolveNonDefaultProfile(root, preloaded);
-    if (loaded === undefined) return snapshot; // default profile → byte-identical pool
-    profile = loaded.profile;
-  } catch {
-    return snapshot; // a profile-load failure must not break context
-  }
+export function narrowSnapshotToContextPool(snapshot: ViewerSnapshot, preloaded: PreloadedProfile): ViewerSnapshot {
+  if (preloaded === null) return snapshot; // default profile → byte-identical pool
+  const profile = preloaded.profile;
   const pages = snapshot.pages.filter((page) => !isExcludedFromContext(page, profile));
   if (pages.length === snapshot.pages.length) return snapshot;
   return { ...snapshot, pages };

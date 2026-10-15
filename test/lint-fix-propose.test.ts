@@ -8,12 +8,17 @@
  * stale-state guard — a target page edited SINCE the proposal is REFUSED at
  * approval, never clobbered by the stale fix. An out-of-range index stages
  * nothing. (`--fix-preview` writing nothing is covered by lint-fix-preview-cli.)
+ *
+ * The last case runs the REAL binary: `lint --fix-propose 1` with both report
+ * flags beside it, so the root command's own dispatch is exercised, not only
+ * the writer it calls.
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { useCommandProject } from "./fixtures/command-project.js";
+import { expectCLIExit, runCLI } from "./fixtures/run-cli.js";
 import { lintFixProposeCommand } from "../src/commands/lint-fix-propose.js";
 import reviewApproveCommand from "../src/commands/review-approve.js";
 import { listCandidates } from "../src/compiler/candidates.js";
@@ -76,4 +81,25 @@ describe("lint --fix-propose stages a reviewable fix, applied to land it; a chan
     expect(await lintFixProposeCommand(99)).toBe(1);
     expect((await listCandidates(root)).length).toBe(0);
   });
+
+  it("through the real binary: fix-propose wins over both report flags, announces the schema once, stages the fix and leaves wiki/ alone", async () => {
+    const before = await readFile(linker(), "utf8");
+    const result = await runCLI(["lint", "--fix-propose", "1", "--fix-preview", "--tiered"], root);
+    expectCLIExit(result, 0);
+    const lines = result.stdout.split("\n");
+    const at = (text: string): number[] => lines.flatMap((line, index) => (line.includes(text) ? [index] : []));
+    const [candidate] = await listCandidates(root);
+    expect(candidate, "the binary staged no candidate").toBeTruthy();
+    // Header once, then the schema line once, then the proposal: nothing else reports.
+    expect([at("Linting wiki").length, at("Schema: defaults (no schema file)").length, at("Proposed fix for").length]).toEqual([1, 1, 1]);
+    expect(at("Linting wiki")[0]).toBeLessThan(at("Schema: ")[0]!);
+    expect(at("Schema: ")[0]).toBeLessThan(at("Proposed fix for")[0]!);
+    expect(lines[at("Proposed fix for")[0]!]).toContain(`llmwiki review approve ${candidate!.id}`);
+    // Neither report path ran: no preview footer, no tier heading, no flat summary, no lint cache.
+    expect([at("Nothing was written.").length, at("deterministic").length, at("error(s)").length]).toEqual([0, 0, 0]);
+    await expect(readFile(path.join(root, ".llmwiki", "last-lint.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await listCandidates(root)).length).toBe(1);
+    expect(candidate!.body).toContain("[[sdpa|Scaled Dot-Product Attention]]");
+    expect(await readFile(linker(), "utf8"), "the binary wrote to wiki/").toBe(before);
+  }, 30_000);
 });

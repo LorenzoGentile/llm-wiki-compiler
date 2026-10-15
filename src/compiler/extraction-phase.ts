@@ -10,12 +10,8 @@
  * results feed the page-generation phase in the orchestration spine.
  */
 
-import { readFile } from "fs/promises";
 import path from "path";
-import {
-  readConfinedWikiFile,
-  warnDroppedWikiReadIfPresent,
-} from "./confined-wiki-read.js";
+import type { CompileAccess } from "./compile-access.js";
 import { callClaude } from "../utils/llm.js";
 import {
   CONCEPT_EXTRACTION_TOOL,
@@ -30,7 +26,7 @@ import {
 } from "./deps.js";
 import * as output from "../utils/output.js";
 import { verbose } from "../utils/output.js";
-import { INDEX_FILE, SOURCES_DIR } from "../utils/constants.js";
+import { SOURCES_DIR } from "../utils/constants.js";
 import pLimit from "p-limit";
 import { reusableExtraction } from "./extraction-snapshot.js";
 import type {
@@ -51,7 +47,7 @@ import type {
  * already failing. In-flight sources still finish; only the queue is skipped.
  */
 async function extractSourcesLimited(
-  root: string,
+  access: CompileAccess,
   files: string[],
   limit: ReturnType<typeof pLimit>,
   reuse: ExtractionReuse,
@@ -60,7 +56,7 @@ async function extractSourcesLimited(
   return Promise.all(files.map((file) => limit(async () => {
     if (aborted) throw new Error(`extraction skipped for ${file}: a prior source failed`);
     try {
-      return await extractForSource(root, file, reuse);
+      return await extractForSource(access, file, reuse);
     } catch (err) {
       aborted = true;
       throw err;
@@ -94,7 +90,7 @@ interface ExtractionReuse {
  * was absent from its prior state entry.
  */
 export async function runExtractionPhases(
-  root: string,
+  access: CompileAccess,
   toCompile: SourceChange[],
   state: WikiState,
   changeSets: ChangeSets,
@@ -103,7 +99,7 @@ export async function runExtractionPhases(
 ): Promise<ExtractionResult[]> {
   const limit = pLimit(concurrency);
   const reuse = { state, eligible: reusableSources };
-  const extractions = await extractSourcesLimited(root, toCompile.map((c) => c.file), limit, reuse);
+  const extractions = await extractSourcesLimited(access, toCompile.map((c) => c.file), limit, reuse);
 
   while (true) {
     const extracted = new Set(extractions.map((result) => result.sourceFile));
@@ -114,7 +110,7 @@ export async function runExtractionPhases(
     for (const file of lateAffected) {
       output.status("~", output.info(`${file} [shares concept with new source]`));
     }
-    const batch = await extractSourcesLimited(root, lateAffected, limit, reuse);
+    const batch = await extractSourcesLimited(access, lateAffected, limit, reuse);
     extractions.push(...batch);
   }
 
@@ -126,12 +122,14 @@ export async function runExtractionPhases(
  * Returns extraction data for the generation phase.
  */
 async function extractForSource(
-  root: string,
+  access: CompileAccess,
   sourceFile: string,
   reuse: ExtractionReuse,
 ): Promise<ExtractionResult> {
-  const sourcePath = path.join(root, SOURCES_DIR, sourceFile);
-  const sourceContent = await readFile(sourcePath, "utf-8");
+  // Project-relative: the result names the source, it does not locate it. Every
+  // later read of the source goes back through the access seam by file name.
+  const sourcePath = path.join(SOURCES_DIR, sourceFile);
+  const sourceContent = await access.readSource(sourceFile);
   const cached = reuse.eligible.has(sourceFile)
     ? reusableExtraction(reuse.state.sources[sourceFile], sourceContent) : undefined;
   if (cached) {
@@ -142,7 +140,7 @@ async function extractForSource(
   const lines = sourceContent.split("\n").length;
   const chars = sourceContent.length;
   verbose(`source ${sourceFile}: ${lines} lines, ${chars} chars`);
-  const existingIndex = await readConfinedExtractionIndex(root);
+  const existingIndex = await access.readExtractionIndex();
   const concepts = await extractConcepts(sourceContent, existingIndex);
 
   if (concepts && concepts.length > 0) {
@@ -152,27 +150,6 @@ async function extractForSource(
   return { sourceFile, sourcePath, sourceContent, concepts: concepts ?? [],
     ...(concepts === undefined ? { failed: true as const } : {}),
     previousConcepts: reuse.state.sources[sourceFile]?.concepts ?? [] };
-}
-
-/**
- * Read `wiki/index.md` through the confined helper for the EXTRACTION prompt.
- * The index bytes are sent to the extraction LLM as dedup context, so a
- * symlinked `wiki/index.md` whose target escapes the project root is dropped
- * (warned, skipped) and extraction proceeds with an EMPTY index — its
- * out-of-tree bytes never reach the provider. An absent index yields an empty
- * string, byte-identical to before.
- *
- * This is the fixed-file (`readConfinedWikiFile`) twin of the per-page
- * `readWikiPageContentOrWarn(..., warnAlways=false)` policy: absence is normal,
- * so the drop warning fires only when the file physically exists.
- */
-async function readConfinedExtractionIndex(root: string): Promise<string> {
-  const result = await readConfinedWikiFile(root, INDEX_FILE);
-  if ("content" in result) return result.content;
-  // An absent index shares the escapes-dir reason; warn only when index.md
-  // physically exists (an escaping symlink or a fail-closed read).
-  await warnDroppedWikiReadIfPresent(path.join(root, INDEX_FILE), INDEX_FILE, result.dropped);
-  return "";
 }
 
 /**

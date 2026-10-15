@@ -2,13 +2,13 @@
  * Extract pending prose against a per-run snapshot of current source text.
  * Missing and changed generation evidence stays visible and is never judged as
  * fresh. Uses the existing citation parser and source confinement boundary.
+ *
+ * The evidence reader has ONE body, {@link currentEvidenceReaderFrom}, over the
+ * source resolver's reads. `currentEvidenceReader` hands it the local disk's.
  */
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { parseFrontmatter, extractClaimCitations, splitProseParagraphs } from "../utils/markdown.js";
-import { SOURCES_DIR } from "../utils/constants.js";
-import { resolveSourceFile } from "./source-path.js";
+import { diskSourceFileReads, resolveSourceFileFrom, type SourceFileReads } from "./source-path.js";
 import type { SourceSpan } from "../utils/types.js";
 import type { CandidateAssessment, CandidateEvidence, CandidateReference } from "./candidate-types.js";
 
@@ -19,18 +19,27 @@ export function evaluationHash(text: string): string {
 
 /** Read each cited source once, so hash comparison and judged lines agree. */
 export function currentEvidenceReader(root: string) {
+  return currentEvidenceReaderFrom(diskSourceFileReads(root));
+}
+
+/**
+ * {@link currentEvidenceReader} over {@link SourceFileReads}: THE ONE BODY. One
+ * promise is kept per cited file NAME AS WRITTEN, an unavailable answer
+ * included, so two names for one file are read twice.
+ */
+export function currentEvidenceReaderFrom(reads: SourceFileReads) {
   const sources = new Map<string, Promise<string | null>>();
   return (file: string): Promise<string | null> => {
-    if (!sources.has(file)) sources.set(file, readEvidence(root, file));
+    if (!sources.has(file)) sources.set(file, readEvidence(reads, file));
     return sources.get(file)!;
   };
 }
 
 /** Missing, unreadable, and rejected paths are all unavailable evidence. */
-async function readEvidence(root: string, file: string): Promise<string | null> {
-  const resolved = await resolveSourceFile(path.join(root, SOURCES_DIR), file);
+async function readEvidence(reads: SourceFileReads, file: string): Promise<string | null> {
+  const resolved = await resolveSourceFileFrom(reads.locations, file);
   if (!resolved) return null;
-  try { return await readFile(resolved, "utf8"); }
+  try { return await reads.readText(resolved); }
   catch { return null; }
 }
 

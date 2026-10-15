@@ -24,9 +24,19 @@
  * them could fix the run's identity, freeze its clock, or inject a fault. The
  * caller supplies exactly one thing — the plan document — and the service
  * supplies everything else.
+ *
+ * ONE SHELL BODY EACH, {@link stagePreparationOperationWith} and
+ * {@link previewPreparationOperationWith}, over {@link StageShellSteps}: the
+ * preflight, (for stage) the ordinary lock as a MECHANISM whose two refusals are
+ * decided here, and the publication. The publication is the substrate call
+ * `stagePreparationLocked` (or its forced dry run), whose own decision body is
+ * NOT bound by this module and remains a residual. The root forms keep their
+ * signatures and pass the local steps, which call the incumbents when asked;
+ * {@link stageShellStepsOver} composes the preflight from its own body and takes
+ * the caller's lock and publication.
  */
 
-import { RecoveryGateError, acquireMutationLock } from "../operation-bundles/lock-gate.js";
+import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
 import { releaseLock } from "../utils/lock.js";
 import { parseBoundedUniqueJson } from "../profile/templates/signing/json.js";
 import { StageCapacityError } from "./capacity.js";
@@ -38,8 +48,9 @@ import { preparationRunActor } from "./principals.js";
 import type { PreparationPrincipal, PreparationSurface } from "./principals.js";
 import type { PreparationPrincipalV1 } from "./run-types.js";
 import { RunBudgetError } from "./run-budget.js";
-import { preparationPreflightRefusal } from "./service-readiness.js";
+import { preparationPreflightRefusal, preparationPreflightRefusalFrom, type PreparationReadinessReads } from "./service-readiness.js";
 import { previewPreparation } from "./preview.js";
+import { underGatedLock } from "./service-control-transition.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
 import { stagePreparationLocked } from "./stage.js";
 import type { StagePreparationRequest, StagePreparationResult } from "./stage.js";
@@ -238,13 +249,48 @@ interface LoadedStageDocumentsV1 {
  */
 const PREVIEW_ACTOR_ID = "preview";
 
+/** What the stage and preview shells ask for. No member takes a project root. */
+export interface StageShellSteps {
+  /** Why the project cannot be staged into, or null. */
+  preflightRefusal(): Promise<string | null>;
+  /** The substrate publication: durable for stage, the forced dry run for preview. Its decision body is a residual. */
+  readonly publish: PreparationPublisher;
+}
+
+/** The stage shell's steps: the shell's, plus the ordinary project lock as a MECHANISM; `acquire` may throw the gate's refusal. */
+export interface StageOperationSteps extends StageShellSteps {
+  readonly lock: { acquire(): Promise<boolean>; release(): Promise<void> };
+}
+
+/** LOCAL DISK. The incumbent preflight, lock and durable publication for `root`, each called when asked. */
+function diskStageSteps(root: string): StageOperationSteps {
+  return {
+    preflightRefusal: () => preparationPreflightRefusal(root),
+    publish: (request) => stagePreparationLocked(root, request),
+    lock: { acquire: () => acquireMutationLock(root, "ordinary"), release: () => releaseLock(root) },
+  };
+}
+
+/** LOCAL DISK. The incumbent preflight and dry-run publication for `root`; no lock, as preview takes none. */
+function diskPreviewSteps(root: string): StageShellSteps {
+  return {
+    preflightRefusal: () => preparationPreflightRefusal(root),
+    publish: (request) => previewPreparation(root, request),
+  };
+}
+
+/** The shell's preflight over its own body, with the caller's publication. Building it does no I/O. */
+export function stageShellStepsOver(readiness: PreparationReadinessReads, publish: PreparationPublisher): StageShellSteps {
+  return { preflightRefusal: () => preparationPreflightRefusalFrom(readiness), publish };
+}
+
 /** Build the request field by field and publish it through `publish`. */
 async function publishStageRequest(
-  root: string, documents: LoadedStageDocumentsV1,
+  documents: LoadedStageDocumentsV1,
   actor: PreparationPrincipalV1, publish: PreparationPublisher,
 ): Promise<StageResultV1> {
   const { plan, value, allowance } = documents;
-  return asRefusal(async () => publish(root, {
+  return asRefusal(async () => publish({
     // FIELD BY FIELD. No spread of anything the caller supplied.
     plan, createdBy: actor, actor,
     initialInputs: [{
@@ -286,14 +332,11 @@ async function publishStageRequest(
  * WHAT IS NOT SHARED IS THE ACQUISITION, and it must not be: see
  * {@link previewPreparationOperation}.
  */
-type PreparationPublisher = (
-  root: string, request: StagePreparationRequest,
-) => Promise<StagePreparationResult>;
+export type PreparationPublisher = (request: StagePreparationRequest) => Promise<StagePreparationResult>;
 
 /** Take the project lock, then publish through `publish`. */
 async function stageUnderMutationLock(
-  root: string, documents: LoadedStageDocumentsV1,
-  actor: PreparationPrincipalV1, publish: PreparationPublisher,
+  steps: StageOperationSteps, documents: LoadedStageDocumentsV1, actor: PreparationPrincipalV1,
 ): Promise<StageResultV1> {
   // UNDER THE PROJECT LOCK. `stagePreparationLocked` documents that its caller
   // already holds it, and calling it bare let six concurrent stages race on
@@ -313,19 +356,8 @@ async function stageUnderMutationLock(
   // body. Measured through the binary. Only the busy arm was ever carried,
   // because nothing that shipped could leave a pending reset unit for an
   // operator to meet.
-  let acquired: boolean;
-  try {
-    acquired = await acquireMutationLock(root, "ordinary");
-  } catch (error) {
-    if (error instanceof RecoveryGateError) return { status: "refused", reason: error.message };
-    throw error;
-  }
-  if (!acquired) return { status: "refused", reason: "project lock is busy" };
-  try {
-    return await publishStageRequest(root, documents, actor, publish);
-  } finally {
-    await releaseLock(root);
-  }
+  return underGatedLock<StageResultV1>(steps.lock, (reason) => ({ status: "refused", reason }),
+    () => publishStageRequest(documents, actor, steps.publish));
 }
 
 /** One stage request, copied out of the caller's object field by field. */
@@ -380,10 +412,17 @@ function captureStageRequest(request: StageRequestV1): CapturedStageRequestV1 | 
 export async function stagePreparationOperation(
   root: string, principal: PreparationPrincipal, request: StageRequestV1,
 ): Promise<StageResultV1> {
-  const documents = await loadStageDocuments(root, request);
+  // Building the disk steps does no I/O and awaits nothing, so the capture still runs before the first await.
+  return stagePreparationOperationWith(diskStageSteps(root), principal, request);
+}
+
+/** {@link stagePreparationOperation} over {@link StageOperationSteps}: THE ONE SHELL BODY. */
+export async function stagePreparationOperationWith(
+  steps: StageOperationSteps, principal: PreparationPrincipal, request: StageRequestV1,
+): Promise<StageResultV1> {
+  const documents = await loadStageDocuments(steps, request);
   if (!documents.ok) return { status: "refused", reason: documents.reason };
-  return stageUnderMutationLock(
-    root, documents.documents, preparationRunActor(principal), stagePreparationLocked);
+  return stageUnderMutationLock(steps, documents.documents, preparationRunActor(principal));
 }
 
 /**
@@ -429,11 +468,18 @@ export async function stagePreparationOperation(
 export async function previewPreparationOperation(
   root: string, surface: PreparationSurface, request: PreviewRequestV1,
 ): Promise<PreviewResultV1> {
-  const documents = await loadStageDocuments(root, request);
+  return previewPreparationOperationWith(diskPreviewSteps(root), surface, request);
+}
+
+/** {@link previewPreparationOperation} over {@link StageShellSteps}: THE ONE SHELL BODY. No lock. */
+export async function previewPreparationOperationWith(
+  steps: StageShellSteps, surface: PreparationSurface, request: PreviewRequestV1,
+): Promise<PreviewResultV1> {
+  const documents = await loadStageDocuments(steps, request);
   if (!documents.ok) return { status: "refused", reason: documents.reason };
   const actor = { id: PREVIEW_ACTOR_ID, surface };
   return asPreview(
-    await publishStageRequest(root, documents.documents, actor, previewPreparation));
+    await publishStageRequest(documents.documents, actor, steps.publish));
 }
 
 /**
@@ -464,11 +510,11 @@ type StageDocumentLoadV1 =
  * nothing before calling it — no await intervenes, so D-10-9 still holds.
  */
 async function loadStageDocuments(
-  root: string, request: StageRequestV1,
+  steps: StageShellSteps, request: StageRequestV1,
 ): Promise<StageDocumentLoadV1> {
   const captured = captureStageRequest(request);
   if (captured === null) return { ok: false, reason: REQUEST_CAPTURE_REFUSAL };
-  const blocked = await preparationPreflightRefusal(root);
+  const blocked = await steps.preflightRefusal();
   if (blocked !== null) return { ok: false, reason: blocked };
   const loaded = await loadPlan(captured.documents);
   if (!loaded.ok) return { ok: false, reason: loaded.reason };

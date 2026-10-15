@@ -16,7 +16,8 @@
  * layout someone rearranges by hand.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { makeDirectoryTree } from "../storage/disk-guarded-leaves.js";
+import { createLocationTextExclusive } from "../storage/disk-locations.js";
 import path from "node:path";
 
 /** What happened to one artifact: written fresh, or left as the user had it. */
@@ -40,13 +41,13 @@ export async function writeDerivedArtifact(
   root: string, relativePath: string, body: string,
 ): Promise<ArtifactWriteResultV1> {
   const destination = path.join(root, relativePath);
-  await mkdir(path.dirname(destination), { recursive: true });
+  await makeDirectoryTree(path.dirname(destination));
   try {
     // EXCLUSIVE create, not stat-then-write. Checking for existence and then
     // writing leaves a window in which a file appears between the two and is
     // silently overwritten — which is exactly the customization this promises
     // never to clobber. `wx` makes the check and the write one operation.
-    await writeFile(destination, body, { encoding: "utf8", flag: "wx" });
+    await createLocationTextExclusive(destination, body);
     return { file: relativePath, outcome: "created" };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {

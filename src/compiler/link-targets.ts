@@ -16,7 +16,7 @@
  */
 
 import type { MergedConcept } from "./types.js";
-import { buildTitleIndex } from "./resolver.js";
+import { asCompileAccess, type CompileProject } from "./compile-access.js";
 import { slugify } from "../utils/markdown.js";
 
 /** Maximum characters of rendered link-target lines offered to one page prompt. */
@@ -68,14 +68,14 @@ function renderSorted(refs: readonly PageRef[], seenSlugs: Set<string>): string[
 /**
  * Link targets for this compile's concept pages: every concept being generated
  * now, then every existing page, within {@link LINK_TARGET_BUDGET_CHARS}.
- * @param root - Project root, whose `wiki/concepts` pages supply existing targets.
+ * @param project - The project (access seam or local root) whose concept pages supply existing targets.
  * @param merged - The concepts this compile generates pages for.
  * @returns Targets in a stable order, identical for every page in the compile.
  */
-export async function buildLinkTargets(root: string, merged: readonly MergedConcept[]): Promise<string[]> {
+export async function buildLinkTargets(project: CompileProject, merged: readonly MergedConcept[]): Promise<string[]> {
   const seen = new Set<string>();
   const current = renderSorted(merged.map((entry) => ({ slug: entry.slug, title: entry.concept.concept })), seen);
-  const existing = renderSorted((await buildTitleIndex(root)).map(({ slug, title }) => ({ slug, title })), seen);
+  const existing = renderSorted(await asCompileAccess(project).listConceptTitles(), seen);
   const targets: string[] = [];
   let used = 0;
   for (const target of [...current, ...existing]) {

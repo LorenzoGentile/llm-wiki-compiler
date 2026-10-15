@@ -3,11 +3,21 @@
  * @description Bounded, no-follow traversal of the complete operation store.
  * The scanner classifies protocol-owned durable aliases explicitly and reports
  * every unknown or unreadable leg instead of silently omitting capacity.
+ *
+ * ONE WALK, OVER THE SCANNER'S OWN READS. The walk, the classifiers, the
+ * directory policy, the byte caps, the entry and depth budgets, the order and
+ * every problem's words live in one body, `scanOperationOrphansFrom`, that takes
+ * `OperationStoreWalkReads` and no project root; it works in paths relative to
+ * `.llmwiki/workspaces` and reports each problem path as the project-relative
+ * path it always was. `scanOperationOrphans` keeps its signature and delegates
+ * over the local-disk reads, built on each call, which are the same no-follow,
+ * confined, handle-bound primitives in `utils/inventory-scan.ts` as before. No
+ * file handle crosses the seam, and nothing here selects a backend.
  */
 
 import path from "node:path";
-import type { Dirent } from "node:fs";
-import { noteInventoryProblem as problem, durableAlias, verified, walkInventoryDirectory, openInventoryLeaf, recordInventoryLeaf, positiveScanEntryLimit } from "../utils/inventory-scan.js";
+import { durableAlias, verified, positiveScanEntryLimit, captureInventoryLeaf, walkInventoryTree } from "../utils/inventory-scan.js";
+import { diskInventoryWalkReads } from "../utils/inventory-disk-walk.js";
 import { assertBundleId, assertOperationRunId } from "./ids.js";
 import {
   MAX_CATALOG_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_PAYLOAD_BYTES,
@@ -80,9 +90,38 @@ export interface OperationScanOptions {
   maxDirectoryEntriesForTest?: number;
 }
 
+/** One directory entry as the scanner reads it: a name and three kind tests. */
+export interface OperationStoreEntry {
+  name: string;
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * What the scanner asks of the operation store, in the shape of
+ * `PreparationStoreWalkReads`. Every path is relative to `.llmwiki/workspaces`
+ * (the root is `""`); no member takes a project root.
+ */
+export interface OperationStoreWalkReads {
+  /**
+   * Visit one directory: obtain an entry, THEN call `take()`; if it is false
+   * deliver nothing more, otherwise await `inspect(entry)` before the next.
+   * Answer `absent`, `unavailable` or `unlistable` ONLY before any entry was
+   * delivered; a failure after that REJECTS. Each name is one path segment.
+   */
+  visitDirectory(
+    directory: string,
+    visitor: { take(): boolean; inspect(entry: OperationStoreEntry): Promise<void> },
+  ): Promise<"visited" | "absent" | "unavailable" | "unlistable">;
+  /** One leaf's size and identity from the opened leaf; nothing stays open afterwards. */
+  observeLeaf(file: string, parent: string): Promise<
+    { kind: "confirmed"; size: number; dev: number; ino: number } | { kind: "absent" } | { kind: "unavailable" }
+  >;
+}
+
 interface ScanState {
-  root: string;
-  workspacesRoot: string;
+  reads: OperationStoreWalkReads;
   maxEntries: number;
   entries: number;
   exhausted: boolean;
@@ -99,6 +138,11 @@ type LeafClassifier = (
   workspaceId: string,
   parts: readonly string[],
 ) => ClassifiedLeaf | null;
+
+/** Record one problem against a workspaces-relative path, reported as the project-relative path it always was. */
+function problem(state: ScanState, dimension: string, detail: string, relative: string): void {
+  state.problems.push({ dimension, detail, path: path.join(".llmwiki", "workspaces", relative) });
+}
 
 /** Classify one regular leaf solely from validated literal path segments. */
 function classifyLeaf(relative: string): ClassifiedLeaf {
@@ -254,21 +298,22 @@ function projectionDirectoryAllowed(parts: readonly string[]): boolean {
   return parts.slice(3).every(PORTABLE_OUTPUT.test.bind(PORTABLE_OUTPUT));
 }
 
-/** Capture one opened regular file and its protocol-aware classification. */
+/** Capture one observed regular file and its protocol-aware classification. */
 async function captureLeaf(state: ScanState, file: string, parent: string): Promise<void> {
-  const opened = await openInventoryLeaf(state, file, parent, "operation");
-  if (opened === null) return;
-  const relativePath = path.relative(state.workspacesRoot, file);
-  const classified = classifyLeaf(relativePath);
-  noteQuarantineDotEntry(state, relativePath, file);
-  noteLeafCap(state, classified.kind, opened.size, file);
-  await recordInventoryLeaf(state.leaves, classified, relativePath, opened);
-  if (classified.kind === "unknown") problem(state, "operation-entry", "unknown operation leaf", file);
+  await captureInventoryLeaf((leaf, dir) => state.reads.observeLeaf(leaf, dir), file, parent, {
+    label: "operation",
+    problem: (dimension, detail, relative) => problem(state, dimension, detail, relative),
+    classify: classifyLeaf,
+    // OPERATION ONLY: a dot entry inside the quarantine is flagged before the cap.
+    beforeCap: (leaf) => noteQuarantineDotEntry(state, leaf),
+    noteCap: (kind, bytes, leaf) => noteLeafCap(state, kind, bytes, leaf),
+    record: (observation) => { state.leaves.push(observation); },
+  });
 }
 
 /** Mark hidden quarantine state while retaining its visible capacity bytes. */
-function noteQuarantineDotEntry(state: ScanState, relative: string, file: string): void {
-  const parts = relative.split(path.sep);
+function noteQuarantineDotEntry(state: ScanState, file: string): void {
+  const parts = file.split(path.sep);
   if (parts[0] === ".quarantine" && parts.slice(1).some((part) => part.startsWith("."))) {
     problem(state, "operation-entry", "dot entry inside operation quarantine", file);
   }
@@ -307,11 +352,11 @@ function takeEntry(state: ScanState, dir: string): boolean {
 /** Inspect one directory entry without duplicating topology decisions. */
 async function inspectEntry(
   state: ScanState,
-  entry: Dirent,
+  entry: OperationStoreEntry,
   dir: string,
   depth: number,
 ): Promise<void> {
-  const child = path.join(dir, entry.name), relative = path.relative(state.workspacesRoot, child);
+  const child = path.join(dir, entry.name), relative = child;
   if (entry.isDirectory()) {
     if (isForeignStoreDirectory(relative)) return; // preparation store owns this; not operation inventory
     if (!directoryAllowed(relative)) {
@@ -332,16 +377,17 @@ async function inspectEntry(
 
 /** Traverse until the global entry bound is reached, then fail closed. */
 async function walk(state: ScanState, dir: string, depth: number): Promise<void> {
-  if (state.exhausted) return;
-  if (depth > MAX_SCAN_DEPTH) {
-    problem(state, "directory-depth", "operation inventory depth exceeded", dir);
-    state.exhausted = true;
-    return;
-  }
-  await walkInventoryDirectory(state, { directory: dir, store: "operation" }, {
-    take: () => !state.exhausted && takeEntry(state, dir),
-    inspect: (entry) => inspectEntry(state, entry, dir, depth),
-  });
+  await walkInventoryTree(state, dir, depth, { label: "operation", maxDepth: MAX_SCAN_DEPTH, problem, takeEntry, inspectEntry });
+}
+
+/**
+ * The local-disk walk reads for one project root. Built per call and PURE to
+ * build (two lexical resolutions, no I/O): each closure joins the
+ * workspaces-relative path back under the resolved store root and calls the
+ * shared confined primitive with the resolved project root. In no package index.
+ */
+export function diskOperationStoreWalkReads(root: string): OperationStoreWalkReads {
+  return diskInventoryWalkReads(root, path.join(".llmwiki", "workspaces"));
 }
 
 /** Inventory every operation-store leaf without creating any path. */
@@ -349,14 +395,20 @@ export async function scanOperationOrphans(
   root: string,
   options: OperationScanOptions = {},
 ): Promise<OperationOrphanScan> {
-  const workspacesRoot = path.join(root, ".llmwiki", "workspaces");
+  return scanOperationOrphansFrom(diskOperationStoreWalkReads(root), options);
+}
+
+/** {@link scanOperationOrphans} over the scanner's own reads: the one walk body. */
+export async function scanOperationOrphansFrom(
+  reads: OperationStoreWalkReads,
+  options: OperationScanOptions = {},
+): Promise<OperationOrphanScan> {
   const requested = positiveScanEntryLimit(options.maxDirectoryEntriesForTest ?? DEFAULT_MAX_ENTRIES, "operation");
   const state: ScanState = {
-    root: path.resolve(root), workspacesRoot: path.resolve(workspacesRoot),
-    maxEntries: requested, entries: 0, exhausted: false, leaves: [],
+    reads, maxEntries: requested, entries: 0, exhausted: false, leaves: [],
     workspaces: new Set(), bundleDirectories: new Map(), problems: [],
   };
-  await walk(state, state.workspacesRoot, 0);
+  await walk(state, "", 0);
   return {
     leaves: state.leaves,
     workspaces: [...state.workspaces].sort(),

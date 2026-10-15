@@ -12,12 +12,18 @@
  * problem (`pdf_unavailable`, message naming the step), never a 500, never sniffed bytes.
  * The response carries its OWN CSP so the viewer's same-origin iframe may embed it
  * (D-PDF-EMBED) while every other response keeps `frame-ancestors 'none'`.
+ *
+ * ONE BODY. {@link gatherPdfWith} decides over {@link PdfReads} (the projection, the
+ * profile, the resolution, the manifest body, the member bytes). {@link handleApiWorkflowPdf}
+ * keeps its signature and passes the incumbent root readers through the existing
+ * {@link PdfReadIo} seam, called when asked; {@link pdfReadsOver} composes the same reads
+ * from each one's root-free body. Response writing is unchanged. In no package index.
  */
 
 import type { ServerResponse } from "http";
-import { loadProfile } from "../profile/load.js";
+import { loadProfile, loadProfileFrom, type EffectiveProfileSources } from "../profile/load.js";
 import type { ProfilePack } from "../profile/types.js";
-import { resolveArtifactRef, type ArtifactResolution } from "../artifacts/resolve.js";
+import { resolveArtifactRef, resolveArtifactRefFrom, type ArtifactResolution, type ArtifactStoreReads } from "../artifacts/resolve.js";
 import { parseArtifactRef, formatArtifactRef, type ArtifactRef } from "../artifacts/ref.js";
 import {
   artifactPaths, hashArtifactBody, memberLeafPath, readArtifactBody, readArtifactMemberBytes,
@@ -25,7 +31,11 @@ import {
 } from "../artifacts/store.js";
 import { hashMemberBytes, parseMemberEntries, type ArtifactMemberEntry } from "../artifacts/members.js";
 import type { ArtifactBodyRead } from "../artifacts/store.js";
-import { buildWorkflowRunProjection, type LiveStageProjectionProvider, type StageProjection } from "./workflow-run-projection.js";
+import type { WorkflowRunReads } from "../workflow-history/store.js";
+import {
+  buildWorkflowRunProjection, buildWorkflowRunProjectionWith, runProjectionReadsOver,
+  type LiveStageHost, type LiveStageProjectionProvider, type StageProjection,
+} from "./workflow-run-projection.js";
 
 /** The confined reads the route performs, injectable so a witness can race them. */
 export interface PdfReadIo {
@@ -77,6 +87,8 @@ const PDF_RESPONSE_CSP = "default-src 'none'; frame-ancestors 'self'";
 
 /** A pdfRef as a verified stage row carries it. */
 type StagePdfRef = { artifactType: string; slug: string; sha256: string; member: string };
+/** The run a PDF request names. */
+type PdfIds = { readonly workflowId: string; readonly runId: string };
 
 /** Parse `/api/workflows/:workflowId/runs/:runId/pdf` into its ids, or null. */
 export function parsePdfPath(pathname: string): { workflowId: string; runId: string } | null {
@@ -106,10 +118,8 @@ function verifiedPdfRef(stage: StageProjection): StagePdfRef | null {
 }
 
 /** The single pdfRef among the projection's verified stages, or a problem. */
-async function projectedPdfRef(
-  root: string, ids: { workflowId: string; runId: string }, provider: LiveStageProjectionProvider | undefined, timeoutMs: number | undefined,
-): Promise<{ readonly ref: StagePdfRef } | { readonly problem: string }> {
-  const projection = await buildWorkflowRunProjection(root, ids.workflowId, ids.runId, provider, timeoutMs);
+async function projectedPdfRef(reads: PdfReads, ids: PdfIds): Promise<{ readonly ref: StagePdfRef } | { readonly problem: string }> {
+  const projection = await reads.projection(ids);
   if (!("stages" in projection)) return { problem: `run "${ids.runId}" could not be projected: ${projection.problem}` };
   const refs = projection.stages.map(verifiedPdfRef).filter((ref): ref is StagePdfRef => ref !== null);
   if (refs.length === 0) return { problem: "no verified stage of this run carries a final PDF" };
@@ -124,33 +134,32 @@ function artifactRefOf(pdf: StagePdfRef): ArtifactRef | null {
   return parseArtifactRef(formatArtifactRef({ artifactType: pdf.artifactType, slug: pdf.slug, sha256: hex }));
 }
 
-/** A member entry snapshotted from a manifest body that re-bound to the pin, plus where its leaf lives. */
-type BoundMemberEntry = { readonly entry: ArtifactMemberEntry; readonly paths: ArtifactPathsV1; readonly maxMemberBytes: number };
+/** A member entry snapshotted from a manifest body that re-bound to the pin, plus the bundle's body file name and member cap. */
+type BoundMemberEntry = { readonly entry: ArtifactMemberEntry; readonly fileName: string; readonly maxMemberBytes: number };
 
 /** Resolve the bundle healthy, re-read its manifest BODY, re-bind it to the pin, and snapshot `member`'s entry — or a problem. */
 async function boundMemberEntry(
-  root: string, profile: ProfilePack, ref: ArtifactRef, member: string, io: PdfReadIo,
+  reads: PdfReads, profile: ProfilePack, ref: ArtifactRef, member: string,
 ): Promise<BoundMemberEntry | { readonly problem: string }> {
   const def = profile.artifacts?.[ref.artifactType];
   if (def === undefined || def.members === undefined) return { problem: `artifact type "${ref.artifactType}" declares no members` };
-  if ((await io.resolve(root, profile, ref)).health !== "ok") return { problem: "the pinned bundle does not verify" };
-  const paths = artifactPaths(root, ref.artifactType, ref.slug, def.fileName);
-  const body = await io.readManifestBody(root, paths, def.maxBytes);
+  if ((await reads.resolve(profile, ref)).health !== "ok") return { problem: "the pinned bundle does not verify" };
+  const body = await reads.readManifestBody(ref, def.fileName, def.maxBytes);
   if (body.kind !== "ok") return { problem: `the bundle manifest is ${body.kind}` };
   if (hashArtifactBody(body.body) !== ref.sha256) return { problem: "the bundle manifest does not re-bind to the pinned digest" };
   const entry = parseMemberEntries(body.body)?.find((row) => row.fileName === member);
   if (entry === undefined) return { problem: `member ${member} is not in the pinned manifest` };
-  return { entry, paths, maxMemberBytes: def.members.maxMemberBytes };
+  return { entry, fileName: def.fileName, maxMemberBytes: def.members.maxMemberBytes };
 }
 
 /** Read `member` of the pinned bundle, re-bound at every step, or a problem naming the failed step. */
 async function readPinnedMember(
-  root: string, profile: ProfilePack, ref: ArtifactRef, member: string, io: PdfReadIo,
+  reads: PdfReads, profile: ProfilePack, ref: ArtifactRef, member: string,
 ): Promise<{ readonly bytes: Buffer } | { readonly problem: string }> {
-  const bound = await boundMemberEntry(root, profile, ref, member, io);
+  const bound = await boundMemberEntry(reads, profile, ref, member);
   if ("problem" in bound) return bound;
-  const { entry, paths } = bound;
-  const read = await io.readMember(root, memberLeafPath(paths.expectedDir, entry.fileName), paths.expectedDir, bound.maxMemberBytes);
+  const { entry } = bound;
+  const read = await reads.readMember(ref, bound.fileName, entry.fileName, bound.maxMemberBytes);
   if (read.kind !== "ok") return { problem: `member ${member} is ${read.kind}` };
   if (read.body.byteLength !== entry.bytes || hashMemberBytes(read.body) !== entry.sha256) {
     return { problem: `member ${member} does not match its manifest entry` };
@@ -158,17 +167,17 @@ async function readPinnedMember(
   return { bytes: read.body };
 }
 
-/** Gather the servable PDF bytes; ANY throw (profile, provider, confined read) becomes a problem. */
-async function gatherPdf(
-  root: string, ids: { workflowId: string; runId: string }, deps: PdfRouteDeps,
+/** Gather the servable PDF bytes; ANY throw (profile, provider, confined read) becomes a problem. THE ONE BODY. */
+export async function gatherPdfWith(
+  reads: PdfReads, ids: PdfIds,
 ): Promise<{ readonly bytes: Buffer; readonly disposition: string } | { readonly problem: string }> {
   try {
-    const projected = await projectedPdfRef(root, ids, deps.provider, deps.timeoutMs);
+    const projected = await projectedPdfRef(reads, ids);
     if ("problem" in projected) return projected;
     const ref = artifactRefOf(projected.ref);
     if (ref === null) return { problem: "the final PDF ref is malformed" };
-    const { profile } = await loadProfile(root);
-    const read = await readPinnedMember(root, profile, ref, projected.ref.member, deps.io ?? PDF_READ_IO);
+    const { profile } = await reads.loadProfile();
+    const read = await readPinnedMember(reads, profile, ref, projected.ref.member);
     return "problem" in read ? read : { bytes: read.bytes, disposition: contentDispositionFor(projected.ref.member) };
   } catch {
     return { problem: "the run, its profile, or its bundle could not be read" };
@@ -182,6 +191,53 @@ export interface PdfRouteDeps {
   readonly io?: PdfReadIo;
 }
 
+/** The reads one PDF serve makes, in order. No member takes a project root. */
+export interface PdfReads {
+  /** The run's projection, built as the run route builds it. */
+  projection(ids: PdfIds): ReturnType<typeof buildWorkflowRunProjection>;
+  /** The effective profile. */
+  loadProfile(): ReturnType<typeof loadProfile>;
+  /** The pinned bundle's resolution under `profile`. */
+  resolve(profile: ProfilePack, ref: ArtifactRef): Promise<ArtifactResolution>;
+  /** The bundle's BODY (the member manifest, named `fileName`) within `maxBytes` — the file the pin hashes. */
+  readManifestBody(ref: ArtifactRef, fileName: string, maxBytes: number): Promise<ArtifactBodyRead>;
+  /** The bytes of `member` beside the bundle body `fileName`, within `maxBytes`. */
+  readMember(ref: ArtifactRef, fileName: string, member: string, maxBytes: number): Promise<ArtifactMemberRead>;
+}
+
+/** LOCAL DISK. The incumbent root readers for `root` through the route's {@link PdfReadIo}, each called when asked. */
+function diskPdfReads(root: string, deps: PdfRouteDeps): PdfReads {
+  const io = deps.io ?? PDF_READ_IO;
+  const pathsOf = (ref: ArtifactRef, fileName: string) => artifactPaths(root, ref.artifactType, ref.slug, fileName);
+  return {
+    projection: (ids) => buildWorkflowRunProjection(root, ids.workflowId, ids.runId, deps.provider, deps.timeoutMs),
+    loadProfile: () => loadProfile(root),
+    resolve: (profile, ref) => io.resolve(root, profile, ref),
+    readManifestBody: (ref, fileName, maxBytes) => io.readManifestBody(root, pathsOf(ref, fileName), maxBytes),
+    readMember: (ref, fileName, member, maxBytes) => {
+      const paths = pathsOf(ref, fileName);
+      return io.readMember(root, memberLeafPath(paths.expectedDir, member), paths.expectedDir, maxBytes);
+    },
+  };
+}
+
+/**
+ * The same reads over the run store's, the profile loader's and the artifact store's own
+ * seams, with an optional caller-bound live host and budget for the projection. Building it does no I/O.
+ */
+export function pdfReadsOver(sources: {
+  runs: WorkflowRunReads; profile: EffectiveProfileSources; store: ArtifactStoreReads; live?: LiveStageHost; timeoutMs?: number;
+}): PdfReads {
+  const runReads = runProjectionReadsOver(sources);
+  return {
+    projection: (ids) => buildWorkflowRunProjectionWith(runReads, ids.workflowId, ids.runId, sources.live, sources.timeoutMs),
+    loadProfile: () => loadProfileFrom(sources.profile),
+    resolve: (profile, ref) => resolveArtifactRefFrom(sources.store, profile, ref),
+    readManifestBody: (ref, fileName, maxBytes) => sources.store.artifactAt(ref.artifactType, ref.slug, fileName).readBodyText(maxBytes),
+    readMember: (ref, fileName, member, maxBytes) => sources.store.artifactAt(ref.artifactType, ref.slug, fileName).readMemberBytes(member, maxBytes),
+  };
+}
+
 /**
  * Serve the run's final PDF member bytes: `application/pdf`, inline, nosniff, no-store, and
  * the PDF response's own CSP. Every failure is the one fail-visible 404 problem.
@@ -189,7 +245,7 @@ export interface PdfRouteDeps {
 export async function handleApiWorkflowPdf(res: ServerResponse, pathname: string, root: string, deps: PdfRouteDeps): Promise<void> {
   const ids = parsePdfPath(pathname);
   if (ids === null) return writePdfProblem(res, `bad pdf path: ${pathname}`);
-  const served = await gatherPdf(root, ids, deps);
+  const served = await gatherPdfWith(diskPdfReads(root, deps), ids);
   if ("problem" in served) return writePdfProblem(res, served.problem);
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/pdf");

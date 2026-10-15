@@ -12,10 +12,57 @@
  *      symlinks inside sources/ that point outside the tree.
  *
  * The confinement pattern mirrors `resolveSafePath` in src/context/provenance.ts.
+ *
+ * The resolver has ONE body, {@link resolveSourceFileFrom}. It asks the place
+ * sources are kept for two raw facts only, through {@link SourceFileLocations}:
+ * where the sources directory is, and what a location resolves to. Every rule
+ * above stays in that body. `resolveSourceFile` hands it the local disk's facts.
  */
 
-import { realpath } from "fs/promises";
 import path from "path";
+import { locationRealPath, readLocationText } from "../storage/disk-locations.js";
+import { SOURCES_DIR } from "../utils/constants.js";
+
+/**
+ * The raw facts the resolver asks for. Neither member decides anything: the
+ * lexical rules, both containment checks and the null-on-failure rule are all
+ * in {@link resolveSourceFileFrom}.
+ *
+ * `sourcesDir`, and every location handed to `realPath` or returned by it, is a
+ * LOCATOR in the legacy local sense: on disk, an absolute path. Locators are
+ * physical identities, joined and compared with the host's path rules. They are
+ * not logical ids, and a body that takes them is not free of the local layout.
+ */
+export interface SourceFileLocations {
+  /** The sources directory's locator. On local disk, `path.join(root, SOURCES_DIR)`. */
+  sourcesDir: string;
+  /** The location with every link resolved. Returns a promise that rejects raw when the location does not resolve. */
+  realPath(location: string): Promise<string>;
+}
+
+/** LOCAL DISK. The locations for the project at `root`, built per call and held by none. Building them does no I/O. */
+export function diskSourceFileLocations(root: string): SourceFileLocations {
+  return { sourcesDir: path.join(root, SOURCES_DIR), realPath: locationRealPath };
+}
+
+/**
+ * The resolver's locations and ONE more raw read: the whole text at a location.
+ * A consumer resolves a cited file with {@link resolveSourceFileFrom} and reads
+ * the location that came back. The read resolves, confines and checks nothing,
+ * and says nothing about whether the text is usable: every such decision stays
+ * with the consumer. Locations are the same legacy physical locators as above.
+ */
+export interface SourceFileReads {
+  /** The source resolver's locations. */
+  locations: SourceFileLocations;
+  /** The whole text at a location as UTF-8, following links. Returns a promise that rejects raw when it cannot be read. */
+  readText(location: string): Promise<string>;
+}
+
+/** LOCAL DISK. The source reads for the project at `root`, built per call. Building them does no I/O. */
+export function diskSourceFileReads(root: string): SourceFileReads {
+  return { locations: diskSourceFileLocations(root), readText: readLocationText };
+}
 
 /**
  * True when any `/`- or `\`-separated segment of `file` is literally `..`.
@@ -52,13 +99,27 @@ export async function resolveSourceFile(
   sourcesDir: string,
   file: string,
 ): Promise<string | null> {
+  return resolveSourceFileFrom({ sourcesDir, realPath: locationRealPath }, file);
+}
+
+/**
+ * {@link resolveSourceFile} over {@link SourceFileLocations}: THE ONE BODY.
+ * The directory is resolved first, then the file, one after the other, on
+ * every call; nothing is remembered between calls. Any failure of either
+ * lookup answers `null`.
+ *
+ * @param locations - Where the sources directory is, and what a location resolves to.
+ * @param file - Relative file path from a citation marker (untrusted input).
+ */
+export async function resolveSourceFileFrom(locations: SourceFileLocations, file: string): Promise<string | null> {
+  const { sourcesDir } = locations;
   if (file.length === 0 || path.isAbsolute(file)) return null;
   if (containsParentSegment(file)) return null;
   const joined = path.join(sourcesDir, file);
   if (!isInside(sourcesDir, path.resolve(joined))) return null;
   try {
-    const realDir = await realpath(sourcesDir);
-    const realFile = await realpath(joined);
+    const realDir = await locations.realPath(sourcesDir);
+    const realFile = await locations.realPath(joined);
     if (!isInside(realDir, realFile)) return null;
     return realFile;
   } catch {

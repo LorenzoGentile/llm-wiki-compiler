@@ -34,7 +34,7 @@ export function stubOwnerClosureProvider(
     return resolveExtraction(system);
   });
   vi.spyOn(AnthropicProvider.prototype, "complete").mockResolvedValue("Generated page.");
-  vi.spyOn(embeddings, "updateEmbeddingsLockedCore")
+  vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
     .mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
   vi.spyOn(console, "log").mockImplementation(() => {});
   return systems;

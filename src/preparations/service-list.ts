@@ -13,13 +13,21 @@
  * distinction is carried in `detail` rather than collapsed into an absent row.
  * An operator deciding whether to act needs to know which one they are looking
  * at, and so does every other surface.
+ *
+ * ONE BODY, OVER THE LISTING'S OWN READS. Every decision above is made in
+ * `listPreparationsOperationFrom`, which takes `PreparationListReads` and no
+ * project root: readiness, the inventory scan, the key's epoch, and one run
+ * read per manifest, in that order. The root-named operation keeps its
+ * signature and reaches that body over the private local-disk reads, built on
+ * each call from the same root-taking readers as before. Naming the reads here
+ * selects no backend and rules on no mechanism.
  */
 
-import { scanPreparationInventory } from "./capacity.js";
-import { readPreparationKey } from "./key-epoch.js";
+import { scanPreparationInventory, type PreparationInventory } from "./capacity.js";
+import { readPreparationKeyEpoch, type PreparationKeyEpochRead } from "./key-epoch.js";
 import type { PreparationManifestV1 } from "./manifest-parse.js";
 import { bindingFor } from "./references.js";
-import { readPreparationRun } from "./run-store.js";
+import { readPreparationRun, type PreparationRunRead } from "./run-store.js";
 import { resolvePreparationReadReadiness } from "./service-readiness.js";
 import type { ReadReadinessV1 } from "./service-readiness.js";
 import type { PreparationRunBinding, PreparationRunState } from "./run-types.js";
@@ -139,18 +147,50 @@ function bounded(
   };
 }
 
+/** What the listing consults of one inventory scan: the manifests, the scan's problems and its own counts. */
+type ListedInventory = Pick<PreparationInventory, "manifests" | "problems" | "epoch">;
+
+/**
+ * What the listing asks of the preparation store. Owned by the listing; no
+ * read takes a project root. Each member must resolve or reject, never throw
+ * synchronously: the body catches nothing and adds no normalization.
+ */
+export interface PreparationListReads {
+  /** Whether the project is something to list runs from. */
+  readReadiness(): Promise<ReadReadinessV1>;
+  /** One inventory scan: the manifests, the scan's problems, and the run and orphan counts it saw. */
+  scanInventory(): Promise<ListedInventory>;
+  /** Whether the preparation key can be read, and its epoch. NEVER the key bytes. */
+  readKeyEpoch(): Promise<PreparationKeyEpochRead>;
+  /** One run leaf by its binding, authenticated by whatever answers. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+}
+
+/**
+ * The local-disk reads for one project root. Private, and built per call: each
+ * closure calls the imported root-taking reader when it is asked, never earlier.
+ */
+function diskPreparationListReads(root: string): PreparationListReads {
+  return {
+    readReadiness: () => resolvePreparationReadReadiness(root),
+    scanInventory: () => scanPreparationInventory(root),
+    readKeyEpoch: () => readPreparationKeyEpoch(root),
+    readRun: (binding) => readPreparationRun(root, binding),
+  };
+}
+
 /** Why one run could not be read, in the could-not-see / does-not-exist taxonomy. */
-function unreadableDetail(read: Awaited<ReturnType<typeof readPreparationRun>>): string | null {
+function unreadableDetail(read: PreparationRunRead): string | null {
   if (read.status === "ok") return null;
   return read.status === "absent" ? "manifest names an absent run" : read.code;
 }
 
 /** Read one manifest's run into a row. */
 async function readRow(
-  root: string, manifest: PreparationManifestV1,
+  reads: PreparationListReads, manifest: PreparationManifestV1,
   keyEpochId: PreparationRunBinding["keyEpochId"],
 ): Promise<PreparationRunRowV1> {
-  const read = await readPreparationRun(root, bindingFor(manifest, keyEpochId));
+  const read = await reads.readRun(bindingFor(manifest, keyEpochId));
   return {
     workspaceId: manifest.workspaceId, preparationId: manifest.preparationId,
     runId: manifest.runId,
@@ -164,12 +204,12 @@ async function readRows(
   // The BRANDED epoch, not `string`: widening it here would let any string
   // stand in for the authority the binding is built from, which is the one
   // thing a run read must not accept loosely.
-  root: string, manifests: readonly PreparationManifestV1[],
+  reads: PreparationListReads, manifests: readonly PreparationManifestV1[],
   keyEpochId: PreparationRunBinding["keyEpochId"],
 ): Promise<readonly PreparationRunRowV1[]> {
   const rows: PreparationRunRowV1[] = [];
   for (const manifest of manifests) {
-    rows.push(await readRow(root, manifest, keyEpochId));
+    rows.push(await readRow(reads, manifest, keyEpochId));
   }
   return rows;
 }
@@ -191,7 +231,7 @@ async function readRows(
  * runs I can see", and only the second is honest.
  */
 function unlistedRunProblems(
-  inventory: Awaited<ReturnType<typeof scanPreparationInventory>>,
+  inventory: ListedInventory,
   rows: readonly PreparationRunRowV1[],
 ): readonly string[] {
   const problems: string[] = [];
@@ -236,7 +276,7 @@ function unreadableRow(manifest: PreparationManifestV1, keyStatus: string): Prep
  * that skipped it.
  */
 function keylessListing(
-  inventory: Awaited<ReturnType<typeof scanPreparationInventory>>,
+  inventory: ListedInventory,
   manifests: readonly PreparationManifestV1[],
   keyStatus: string, problems: readonly string[], readiness: readonly string[],
 ): ListResultV1 {
@@ -273,10 +313,15 @@ function readinessProblems(readiness: ReadReadinessV1): readonly string[] {
 
 /** Enumerate every preparation run this project can account for. */
 export async function listPreparationsOperation(root: string): Promise<ListResultV1> {
+  return listPreparationsOperationFrom(diskPreparationListReads(root));
+}
+
+/** {@link listPreparationsOperation} over the listing's own reads: the one body. */
+export async function listPreparationsOperationFrom(reads: PreparationListReads): Promise<ListResultV1> {
   // FIRST, so the answer can never claim an empty store for a directory that is
   // not one — or for one this process could not read.
-  const readiness = await resolvePreparationReadReadiness(root);
-  const inventory = await scanPreparationInventory(root);
+  const readiness = await reads.readReadiness();
+  const inventory = await reads.scanInventory();
   // ORDERED BEFORE ANYTHING IS CAPPED. A cap over an unordered walk answers
   // with a different hundred runs each time it is called.
   const manifests = [...inventory.manifests].sort(comparePreparationListing);
@@ -289,14 +334,14 @@ export async function listPreparationsOperation(root: string): Promise<ListResul
     problem.path === undefined
       ? `${problem.dimension}: ${problem.detail}`
       : `${problem.dimension}: ${problem.detail} (${problem.path})`).sort();
-  const key = await readPreparationKey(root);
+  const key = await reads.readKeyEpoch();
   // `readPreparationRun` reads the key itself and returns the distinct typed
   // codes `integrity-key-missing` / `integrity-key-unreadable`, so letting the
   // rows leg run produces the right per-run taxonomy for free.
   if (key.status !== "ok") {
     return keylessListing(inventory, manifests, key.status, problems, readinessProblems(readiness));
   }
-  const rows = await readRows(root, manifests, key.keyEpochId);
+  const rows = await readRows(reads, manifests, key.keyEpochId);
   // THE CROSS-CHECK RUNS OVER THE FULL ROW SET, BEFORE THE CAP. Accounting for
   // capped rows would report `the scan saw 150 run leaves but only 100 could be
   // listed` on every healthy store with more than a hundred runs — turning the

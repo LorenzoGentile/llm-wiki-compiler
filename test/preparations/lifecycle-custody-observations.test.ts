@@ -13,8 +13,9 @@
  *                     registry sat at zero on this meter for several rounds while
  *                     it ran on every operation. External review found that by
  *                     reading the code; this file did not find it by measuring.
- *   `registryWalks` — calls to `scanPreparationOrphans`. Exists precisely because
- *                     `bindings` could not see it.
+ *   `registryWalks` — calls to `scanPreparationOrphans` OR to its bound body
+ *                     `scanPreparationOrphansFrom`, through either imported name.
+ *                     Exists precisely because `bindings` could not see it.
  *
  * All three are mutation-tested against the change they claim to detect: adding a
  * driver capture moves the first, adding a namespace open moves the second, and
@@ -54,6 +55,14 @@ vi.mock("../../src/preparations/orphan-scan.js", async () => {
     scanPreparationOrphans: async (...args: Parameters<OrphanScanModule["scanPreparationOrphans"]>) => {
       observed.registryWalks += 1;
       return actual.scanPreparationOrphans(...args);
+    },
+    // THE BOUND BODY WALKS THE SAME REGISTRY. An importer that reached it instead
+    // of the root form would re-walk unseen unless it is metered too. The root
+    // form calls it from INSIDE the module, which this wrapper does not see, so
+    // one call through either imported name counts once.
+    scanPreparationOrphansFrom: async (...args: Parameters<OrphanScanModule["scanPreparationOrphansFrom"]>) => {
+      observed.registryWalks += 1;
+      return actual.scanPreparationOrphansFrom(...args);
     },
   };
 });
@@ -99,6 +108,7 @@ vi.mock("../../src/preparations/lifecycle-fs/namespace.js", async () => {
 });
 
 import { quarantinePreparationRunLocked } from "../../src/preparations/quarantine.js";
+import { scanPreparationOrphans, scanPreparationOrphansFrom } from "../../src/preparations/orphan-scan.js";
 import {
   prunePreparationRunLocked, sweepPreparationOrphansLocked,
 } from "../../src/preparations/retention.js";
@@ -193,6 +203,19 @@ describe("custody operation observation counts", () => {
     const counted = await measuredQuarantine(tempRoot.dir);
 
     expect(counted.registryWalks).toBe(0);
+  });
+
+  it("POSITIVE CONTROL: the registry-walk meter moves for either imported entry point", async () => {
+    // A meter that never moves proves nothing by reading zero. Each name is
+    // called once here, as an importer would call it, and each moves the count.
+    resetCounters();
+    await scanPreparationOrphans(tempRoot.dir);
+    expect(observed.registryWalks).toBe(1);
+    await scanPreparationOrphansFrom({
+      visitDirectory: async () => "absent",
+      observeLeaf: async () => ({ kind: "absent" }),
+    });
+    expect(observed.registryWalks).toBe(2);
   });
 
   it("pins what per-run quarantine's assessment actually observes", async () => {

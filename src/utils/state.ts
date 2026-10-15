@@ -17,16 +17,17 @@
  * {@link StateTooNewError} rather than starting fresh — which would clobber the
  * forward-incompatible layout on the next write. A `corrupt` (unparseable) file
  * is backed up to `.bak` and recovered as empty state instead.
+ *
+ * STORAGE. Every decision above is made HERE. The bytes are read, backed up and
+ * written through the legacy-compatibility record binding
+ * (`../storage/legacy-local-records.ts`); each root-taking function is its
+ * `…From` / `…To` variant over the local-directory binding for that root.
  */
 
-import { copyFile } from "fs/promises";
-import { openFileNoFollow } from "./no-follow-open.js";
-import { constants as fsConstants } from "node:fs";
-import { existsSync } from "fs";
-import path from "path";
+import { diskLocalRecords } from "../storage/disk-local-records.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
 import { STATE_FILE } from "./constants.js";
 import { note } from "./output.js";
-import { atomicWrite } from "./markdown.js";
 import { isSafeFilenameComponent } from "../profile/identity.js";
 import { mintConceptEntities } from "../state/migrate.js";
 import type { WikiState, SourceState } from "./types.js";
@@ -112,35 +113,42 @@ export interface ClassifiedState {
  * Unlike readState(), this never writes a .bak on corrupt input, so read-only
  * callers (freshness/lint/view/export) can safely use it.
  */
-export async function readStateClassified(root: string): Promise<ClassifiedState> {
-  const filePath = path.join(root, STATE_FILE);
-  if (!existsSync(filePath)) return { status: "missing", state: emptyState() };
+export function readStateClassified(root: string): Promise<ClassifiedState> {
+  return readStateClassifiedFrom(diskLocalRecords(root));
+}
+
+/** {@link readStateClassified}, with the record read through `records`. Still side-effect free. */
+export async function readStateClassifiedFrom(records: LegacyLocalRecords): Promise<ClassifiedState> {
+  if (!(await records.exists(STATE_FILE))) return { status: "missing", state: emptyState() };
   try {
     // A read error here (e.g. ELOOP on a symlinked state.json) falls through to
-    // the catch and classifies CORRUPT — fail closed, never read-through.
-    const raw = await readStateNoFollow(filePath);
-    return classifyParsedState(JSON.parse(raw));
+    // the catch and classifies CORRUPT — fail closed, never read-through. The
+    // binding reads without following a leaf link, so a SYMLINKED state.json is
+    // never read THROUGH to attacker-chosen out-of-tree bytes (which would feed
+    // `concepts` / `frozenSlugs` into orphan path-joins).
+    return classifyStateText(await records.readTextNoFollow(STATE_FILE));
   } catch {
     return { status: "corrupt", state: emptyState() };
   }
 }
 
 /**
- * Read `state.json` with `O_RDONLY | O_NOFOLLOW` so a SYMLINKED state.json fails
- * the open (`ELOOP`) and is treated as corrupt rather than read THROUGH to
- * attacker-chosen out-of-tree bytes (which feed `concepts` / `frozenSlugs` into
- * orphan path-joins). Mirrors the relation store's `openStoreFileRead` leaf
- * defense. The caller has already established the file exists; any open/read
- * error (including a symlinked leaf) propagates so the caller's try/catch
- * classifies it CORRUPT (fail closed).
+ * Classify compile-state text that has already been read, by whatever means.
+ * `null` is a state that does not exist yet. A reader with no filesystem uses
+ * this so "missing", "corrupt" and "too-new" mean the same thing everywhere.
  */
-async function readStateNoFollow(filePath: string): Promise<string> {
-  const handle = await openFileNoFollow(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+function classifyStateText(raw: string | null): ClassifiedState {
+  if (raw === null) return { status: "missing", state: emptyState() };
   try {
-    return await handle.readFile("utf-8");
-  } finally {
-    await handle.close();
+    return classifyParsedState(JSON.parse(raw));
+  } catch {
+    return { status: "corrupt", state: emptyState() };
   }
+}
+
+/** The stored text of a compile state, with the typed mirror re-derived. */
+export function serializeState(state: WikiState): string {
+  return JSON.stringify(syncEntityMirror(state), null, 2);
 }
 
 /** True when `value` is an array whose every element is a string. */
@@ -220,18 +228,22 @@ function classifyParsedState(parsed: unknown): ClassifiedState {
 }
 
 /** Read .llmwiki/state.json, recovering from corruption gracefully (writes a .bak). */
-export async function readState(root: string): Promise<WikiState> {
-  const classified = await readStateClassified(root);
+export function readState(root: string): Promise<WikiState> {
+  return readStateFrom(diskLocalRecords(root));
+}
+
+/** {@link readState}, with the record read and its corrupt copy backed up through `records`. */
+export async function readStateFrom(records: LegacyLocalRecords): Promise<WikiState> {
+  const classified = await readStateClassifiedFrom(records);
   if (classified.status === "too-new") {
     // Fail closed: never start fresh (which would clobber a forward-incompatible
     // file on the next write) and never copy a .bak.
     throw new StateTooNewError(classified.state.version as number);
   }
   if (classified.status === "corrupt") {
-    const filePath = path.join(root, STATE_FILE);
-    const bakPath = filePath + ".bak";
-    note(`⚠ Corrupt state.json — backed up to ${bakPath}, starting fresh.`);
-    await copyFile(filePath, bakPath);
+    const backup = STATE_FILE + ".bak";
+    note(`⚠ Corrupt state.json — backed up to ${records.locate(backup)}, starting fresh.`);
+    await records.copy(STATE_FILE, backup);
   }
   return classified.state;
 }
@@ -242,12 +254,15 @@ export async function readState(root: string): Promise<WikiState> {
  * leaf-symlink write-escape defenses as every page write rather than carrying its
  * own bespoke temp+rename.
  */
-export async function writeState(root: string, state: WikiState): Promise<void> {
-  const filePath = path.join(root, STATE_FILE);
+export function writeState(root: string, state: WikiState): Promise<void> {
+  return writeStateTo(diskLocalRecords(root), state);
+}
+
+/** {@link writeState}, with the serialized record written through `records`. */
+export async function writeStateTo(records: LegacyLocalRecords, state: WikiState): Promise<void> {
   // Re-derive the v2 typed mirror at the single write choke point so no writer
   // can persist a desynced `entities` / `frozenEntities`. No-op for v1 states.
-  const synced = syncEntityMirror(state);
-  await atomicWrite(filePath, JSON.stringify(synced, null, 2), { confineRoot: root });
+  await records.writeAtomic(STATE_FILE, serializeState(state));
 }
 
 /**

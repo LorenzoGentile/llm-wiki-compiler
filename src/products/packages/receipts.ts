@@ -7,13 +7,19 @@
  * than an active binding. Slice 1 writes only `local-unverified` provenance.
  * Receipts live beside — never inside — the immutable package bytes so a receipt
  * repair can rewrite one without mutating a content-addressed package.
+ *
+ * ONE BODY EACH: {@link writeProductInstallReceiptTo} (canonical bytes, then the cap,
+ * then the replace) and {@link readProductInstallReceiptFrom} (absent, unavailable,
+ * invalid, ok) over {@link ProductReceiptLeaves}; the root forms pass
+ * {@link diskProductReceiptLeaves}, the incumbent confined read and durable replace.
  */
 
 import { canonicalBytes } from "../../profile/templates/signing/canonical.js";
 import { parseBoundedUniqueJson } from "../../profile/templates/signing/json.js";
 import { enumValue, exact, record, timestamp } from "../../operation-bundles/manifest-values.js";
-import { atomicWrite } from "../../utils/atomic-write.js";
-import { readConfinedLeaf } from "../../utils/confined-read.js";
+import { replaceLeafAtomicWith } from "../../storage/disk-durable-leaves.js";
+import { readConfinedLeafText } from "../../storage/disk-guarded-leaves.js";
+import type { CappedLeafRead } from "../../utils/confined-read.js";
 import { MAX_PRODUCT_INSTALL_RECEIPT_BYTES, PRODUCT_INSTALL_RECEIPT_SCHEMA_VERSION } from "../constants.js";
 import { assertProductDigest, assertProductId, assertVersion, digestDirectoryName } from "../ids.js";
 import { asProductProblem, ProductPackageError } from "../problems.js";
@@ -68,24 +74,55 @@ function parseProductInstallReceipt(text: string): ProductInstallReceiptV1 {
   });
 }
 
+/**
+ * What the advisory receipts ask of the project, by package digest directory name.
+ * No member takes a project root.
+ */
+export interface ProductReceiptLeaves {
+  /** One receipt's text, confined and no-follow, within `maxBytes`. */
+  readReceipt(digestHex: string, maxBytes: number): Promise<CappedLeafRead>;
+  /** Durably replace one receipt with `bytes`. */
+  replaceReceipt(digestHex: string, bytes: Buffer): Promise<void>;
+}
+
+/** LOCAL DISK: the incumbent confined read and durable replace for one root, built per call. In no package index. */
+function diskProductReceiptLeaves(root: string): ProductReceiptLeaves {
+  return {
+    readReceipt: (digestHex, maxBytes) => {
+      const paths = productStorePaths(root);
+      return readConfinedLeafText(root, paths.receiptFile(digestHex), paths.receiptsRoot, maxBytes);
+    },
+    replaceReceipt: (digestHex, bytes) =>
+      replaceLeafAtomicWith(productStorePaths(root).receiptFile(digestHex), bytes, { confineRoot: root, durable: true }),
+  };
+}
+
 /** Durably write one advisory receipt; callers must not treat it as authority. */
 export async function writeProductInstallReceipt(root: string, receipt: ProductInstallReceiptV1): Promise<void> {
+  return writeProductInstallReceiptTo(diskProductReceiptLeaves(root), receipt);
+}
+
+/** {@link writeProductInstallReceipt} over {@link ProductReceiptLeaves}: THE ONE BODY. The cap is checked before any write. */
+export async function writeProductInstallReceiptTo(leaves: ProductReceiptLeaves, receipt: ProductInstallReceiptV1): Promise<void> {
   const bytes = canonicalBytes(receipt);
   if (bytes.byteLength > MAX_PRODUCT_INSTALL_RECEIPT_BYTES) {
     throw new ProductPackageError("advisory install receipt exceeds its byte cap");
   }
-  const file = productStorePaths(root).receiptFile(digestDirectoryName(receipt.packageDigest));
-  await atomicWrite(file, bytes, { confineRoot: root, durable: true });
+  await leaves.replaceReceipt(digestDirectoryName(receipt.packageDigest), bytes);
 }
 
 /** Read one advisory receipt through the confined no-follow leaf reader. */
 export async function readProductInstallReceipt(
   root: string, packageDigest: ProductPackageManifestV1["packageDigest"],
 ): Promise<ProductInstallReceiptRead> {
-  const paths = productStorePaths(root);
-  const read = await readConfinedLeaf(
-    root, paths.receiptFile(digestDirectoryName(packageDigest)), paths.receiptsRoot,
-    MAX_PRODUCT_INSTALL_RECEIPT_BYTES);
+  return readProductInstallReceiptFrom(diskProductReceiptLeaves(root), packageDigest);
+}
+
+/** {@link readProductInstallReceipt} over {@link ProductReceiptLeaves}: THE ONE BODY. */
+export async function readProductInstallReceiptFrom(
+  leaves: ProductReceiptLeaves, packageDigest: ProductPackageManifestV1["packageDigest"],
+): Promise<ProductInstallReceiptRead> {
+  const read = await leaves.readReceipt(digestDirectoryName(packageDigest), MAX_PRODUCT_INSTALL_RECEIPT_BYTES);
   if (read.kind === "absent") return { status: "absent" };
   if (read.kind !== "ok") return { status: "unavailable" };
   try {

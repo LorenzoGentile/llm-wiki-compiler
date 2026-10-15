@@ -12,16 +12,41 @@
  * resolver so symlinks and path differences are handled consistently.
  * When no valid sources remain after filtering, utilizationRate is null
  * ("not measured").
+ *
+ * The measure has ONE body, {@link evaluateSourceUtilizationFrom}, over
+ * {@link SourceUtilizationSources}. It names no project root.
+ * `evaluateSourceUtilization` builds the local-disk sources and delegates.
  */
 
-import { lstat } from "fs/promises";
 import path from "path";
-import { collectAllPages } from "../linter/rules.js";
+import { diskLocalReads, locationKindNoFollow } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads, LocalEntryKind } from "../storage/legacy-local-reads.js";
+import { collectAllPagesFrom, diskLintPageSources, type LintPageSources } from "../linter/rules-shared.js";
 import { parseFrontmatter, extractClaimCitations, splitProseParagraphs } from "../utils/markdown.js";
-import { resolveSourceFile } from "./source-path.js";
-import { SOURCES_DIR } from "../utils/constants.js";
-import { scanSelectedSources } from "../sources/scan.js";
+import { scanSelectedSourcesFrom } from "../sources/scan.js";
+import { diskSourceFileLocations, resolveSourceFileFrom, type SourceFileLocations } from "./source-path.js";
 import type { SourceUtilizationResult } from "./types.js";
+
+/**
+ * Everything the measure asks of the project, in the order it asks. Each member
+ * is an existing seam or one raw lookup; the inventory rules, the warnings,
+ * the early return and the counting stay in this module.
+ */
+export interface SourceUtilizationSources {
+  /** The source scan's reads: the source selection's configuration, then the sources directory's listings. */
+  reads: LegacyLocalReads;
+  /** The source resolver's locations: for every inventory file first, then for every file a page cites. */
+  locations: SourceFileLocations;
+  /**
+   * What is at a location, WITHOUT following a final link. Asked once per
+   * inventory file the resolver refused, only to word its warning. Returns a
+   * promise that rejects raw when nothing is there; a rejection is worded as
+   * the generic reason.
+   */
+  kindNoFollow(location: string): Promise<LocalEntryKind>;
+  /** The page collection's sources. Not asked when no source is in the inventory. */
+  pages: LintPageSources;
+}
 
 function collectRawCitedFiles(body: string): Set<string> {
   const files = new Set<string>();
@@ -61,26 +86,26 @@ interface InventoryResult {
  * a symlink whose target is missing or resolves outside the sources tree;
  * everything else (bad path, unreadable) collapses to a generic reason.
  */
-async function exclusionReason(sourcesDir: string, file: string): Promise<string> {
-  const stat = await lstat(path.join(sourcesDir, file)).catch(() => null);
-  return stat?.isSymbolicLink()
+async function exclusionReason(sources: SourceUtilizationSources, file: string): Promise<string> {
+  const kind = await sources.kindNoFollow(path.join(sources.locations.sourcesDir, file)).catch(() => null);
+  return kind === "link"
     ? "symlink target missing or outside sources/ (excluded)"
     : "could not be resolved (excluded)";
 }
 
 async function resolveSourceInventory(
-  sourcesDir: string,
+  sources: SourceUtilizationSources,
   sourceFiles: string[],
 ): Promise<InventoryResult> {
   const fileToReal = new Map<string, string>();
   const validFiles: string[] = [];
   const warnings: string[] = [];
   for (const f of sourceFiles) {
-    const resolved = await resolveSourceFile(sourcesDir, f);
+    const resolved = await resolveSourceFileFrom(sources.locations, f);
     if (resolved === null) {
       // Filename first so the actionable detail survives any display
       // truncation; distinguish the common symlink case from other failures.
-      warnings.push(`${f}: ${await exclusionReason(sourcesDir, f)}`);
+      warnings.push(`${f}: ${await exclusionReason(sources, f)}`);
     } else {
       fileToReal.set(f, resolved);
       validFiles.push(f);
@@ -90,7 +115,7 @@ async function resolveSourceInventory(
 }
 
 async function collectCitedRealpaths(
-  sourcesDir: string,
+  locations: SourceFileLocations,
   pages: Array<{ filePath: string; content: string }>,
 ): Promise<Map<string, Set<string>>> {
   const citedRealToPages = new Map<string, Set<string>>();
@@ -98,7 +123,7 @@ async function collectCitedRealpaths(
     const { body } = parseFrontmatter(content);
     const slug = pageSlug(filePath);
     for (const rawFile of collectRawCitedFiles(body)) {
-      const resolved = await resolveSourceFile(sourcesDir, rawFile);
+      const resolved = await resolveSourceFileFrom(locations, rawFile);
       if (resolved === null) continue;
       const entry = citedRealToPages.get(resolved);
       if (entry) entry.add(slug);
@@ -132,13 +157,27 @@ function buildPerSource(
 export async function evaluateSourceUtilization(
   root: string,
 ): Promise<SourceUtilizationResult> {
-  const sourcesDir = path.join(root, SOURCES_DIR);
-  const scan = await scanSelectedSources(root);
+  return evaluateSourceUtilizationFrom({
+    reads: diskLocalReads(root), locations: diskSourceFileLocations(root),
+    kindNoFollow: locationKindNoFollow, pages: diskLintPageSources(root),
+  });
+}
+
+/**
+ * {@link evaluateSourceUtilization} over {@link SourceUtilizationSources}: THE
+ * ONE BODY. The scan, then the inventory, then (only when a source remains) the
+ * pages and their citations.
+ *
+ * @param sources - The scan's reads, the resolver's locations, the kind lookup and the pages.
+ * @returns The counts, the rate or null, each source's citing pages, and the warnings in the order they arose.
+ */
+export async function evaluateSourceUtilizationFrom(sources: SourceUtilizationSources): Promise<SourceUtilizationResult> {
+  const scan = await scanSelectedSourcesFrom(sources.reads);
   const rawFiles = scan.files.filter((file) => file.endsWith(".md"));
 
   // Build the filtered inventory — all downstream counts must use this,
   // never rawFiles.length.
-  const { validFiles, fileToReal, warnings } = await resolveSourceInventory(sourcesDir, rawFiles);
+  const { validFiles, fileToReal, warnings } = await resolveSourceInventory(sources, rawFiles);
   warnings.push(...scan.symlinks.map((file) => `${file}: symlink source excluded`));
   const totalSources = validFiles.length;
 
@@ -150,8 +189,8 @@ export async function evaluateSourceUtilization(
     };
   }
 
-  const pages = await collectAllPages(root);
-  const citedRealToPages = await collectCitedRealpaths(sourcesDir, pages);
+  const pages = await collectAllPagesFrom(sources.pages);
+  const citedRealToPages = await collectCitedRealpaths(sources.locations, pages);
   const perSource = buildPerSource(validFiles, fileToReal, citedRealToPages);
 
   const citedCount = perSource.filter((e) => e.citingPageCount > 0).length;

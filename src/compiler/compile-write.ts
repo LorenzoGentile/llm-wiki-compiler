@@ -34,11 +34,24 @@
  * for its whole pipeline, so the self-locking {@link applyApprovedMutations} would
  * re-acquire the same lock and self-deadlock. The CALLER MUST already hold the
  * project lock before invoking {@link applyCompilePageWritesLocked}.
+ *
+ * ONE BODY, TWO DOMAIN COLLABORATORS. {@link applyCompilePageWritesWith} is the
+ * one body. It is handed {@link CompilePageWriteSteps}: the planner and the
+ * executor entry, each a DOMAIN step with its own semantics, NOT a storage port.
+ * The root {@link applyCompilePageWritesLocked} keeps its signature and passes
+ * {@link localCompilePageWriteSteps}, which call `planPageMutation` and
+ * `applyApprovedMutationsLocked` at call time, so their module spies still see
+ * every call. A non-disk caller passes the planner's and the executor's own
+ * bound bodies over its raw ports. The caller's `opts` OBJECT is handed through
+ * untouched: the hook is read and called on it exactly as before, and the SAME
+ * object reaches the executor.
  */
 
 import {
   planPageMutation,
   type PlannedMutation,
+  type PlanPageInput,
+  type PlanResult,
 } from "../trust/planner.js";
 import {
   applyApprovedMutationsLocked,
@@ -75,6 +88,27 @@ export interface SkippedWrite {
 /** Persist derived-work intent for floor-approved pages before any bytes change. */
 export type BeforeCompilePageWrites = (items: CompilePageWrite[]) => Promise<void>;
 
+/** What a compile page write is given: the executor's options plus the derived-work hook. */
+export type CompilePageWriteOptions = ApplyOptions & { beforeApply?: BeforeCompilePageWrites };
+
+/**
+ * The two DOMAIN steps a compile page write composes. Each carries the full
+ * semantics of its own owner (the planner's floor and create/update choice; the
+ * executor's replay, guard, journal and writes) and is NOT storage.
+ */
+export interface CompilePageWriteSteps {
+  /** Plan one page. Local: `planPageMutation(input)`. */
+  plan(input: PlanPageInput): Promise<PlanResult>;
+  /** Apply the allowed plan under the caller's held lock, with the caller's SAME options object. Local: `applyApprovedMutationsLocked(root, planned, opts)`. */
+  apply(root: string, planned: PlannedMutation[], opts: CompilePageWriteOptions): Promise<unknown>;
+}
+
+/** LOCAL. The incumbent planner and lock-free executor core, called at call time; frozen. In no package index. */
+const localCompilePageWriteSteps: CompilePageWriteSteps = Object.freeze({
+  plan: (input: PlanPageInput) => planPageMutation(input),
+  apply: (root: string, planned: PlannedMutation[], opts: CompilePageWriteOptions) => applyApprovedMutationsLocked(root, planned, opts),
+});
+
 /**
  * Plan a set of compile page writes, PARTITIONING them into the allowed plan and
  * the floor-skipped set. Each item goes through {@link planPageMutation} as a
@@ -89,13 +123,14 @@ export type BeforeCompilePageWrites = (items: CompilePageWrite[]) => Promise<voi
  * @returns The accumulated allowed plan and the floor-skipped pages.
  */
 async function planCompilePageWrites(
+  steps: CompilePageWriteSteps,
   root: string,
   items: CompilePageWrite[],
 ): Promise<{ planned: PlannedMutation[]; skipped: SkippedWrite[] }> {
   const planned: PlannedMutation[] = [];
   const skipped: SkippedWrite[] = [];
   for (const it of items) {
-    const r = await planPageMutation({
+    const r = await steps.plan({
       root,
       target: { kind: "raw", directory: it.namespace, slug: it.slug },
       body: it.body,
@@ -139,13 +174,35 @@ export async function applyCompilePageWritesLocked(
   items: CompilePageWrite[],
   opts: ApplyOptions & { beforeApply?: BeforeCompilePageWrites } = {},
 ): Promise<{ skipped: SkippedWrite[] }> {
-  const { planned, skipped } = await planCompilePageWrites(root, items);
+  return applyCompilePageWritesWith(localCompilePageWriteSteps, root, items, opts);
+}
+
+/**
+ * THE ONE BODY of {@link applyCompilePageWritesLocked}, over the two domain
+ * steps it is handed. Every item is planned first; when nothing is allowed the
+ * hook is not read and `apply` is not called, so no replay, no journal and no
+ * `opts.writeOne` read happen. Otherwise `opts.beforeApply` is read, called AS A
+ * METHOD of `opts` with the allowed items, and `apply` gets the SAME `opts`.
+ *
+ * @param steps - The planner and executor entry (domain collaborators).
+ * @param root - Project root, handed to both steps as data.
+ * @param items - The compiled pages to write.
+ * @param opts - The caller's options object, forwarded as is.
+ * @returns The floor-skipped pages.
+ */
+export async function applyCompilePageWritesWith(
+  steps: CompilePageWriteSteps,
+  root: string,
+  items: CompilePageWrite[],
+  opts: CompilePageWriteOptions = {},
+): Promise<{ skipped: SkippedWrite[] }> {
+  const { planned, skipped } = await planCompilePageWrites(steps, root, items);
   if (planned.length > 0) {
     if (opts.beforeApply) {
       const blocked = new Set(skipped.map(({ item }) => item));
       await opts.beforeApply(items.filter(item => !blocked.has(item)));
     }
-    await applyApprovedMutationsLocked(root, planned, opts);
+    await steps.apply(root, planned, opts);
   }
   return { skipped };
 }

@@ -23,17 +23,45 @@
  *
  * GENERIC BY CONSTRUCTION: this module speaks action ids, input fields, and
  * provider output ids — the plan's own vocabulary — and knows nothing about any
- * product's entities. The store reads are injectable (`ExecutionProvenanceStoreV1`)
- * so every conjunct can be witnessed against synthetic runs; production binds
- * the real preparation store.
+ * product's entities.
+ *
+ * ONE BODY: {@link verifyExecutionProvenance} runs
+ * {@link verifyExecutionProvenanceFrom} over the local disk. The three store
+ * reads are ASKED FOR through {@link ExecutionProvenanceReads}, which takes no
+ * project root, so every conjunct can be witnessed against synthetic runs.
+ *
+ * WHAT ANSWERS THOSE THREE READS IS COMPOSED, NOT A ROOT CLOSURE.
+ * {@link executionProvenanceReadsOver} builds them from the preparation
+ * store's RAW LEAF READS (`preparations/store-leaf-reads.ts`): the inventory
+ * scan, the run lookup, the sealed-input read and, under them, the store walk
+ * and the manifest, key, run and evidence readers each run their one body over
+ * the leaves they are handed. So the verifier and every decision under it,
+ * the run's authentication included, run on whatever serves those leaves. On
+ * disk the leaves are the same confined readers as before, asked in the same
+ * order.
+ *
+ * ONE PART IS NOT A LEAF AND IS NOT MADE NEUTRAL: the lifecycle read the scan
+ * borrows, and the proof that it is genuine. Both stay ROOT-BOUND LOCAL-DISK
+ * AUTHORITY, carried as one named member of the leaf reads. That is a
+ * deferment, not an accepted mechanism.
+ *
+ * WHO RUNS IT OVER LEAVES. The artifact health check
+ * (`profile/artifact-lint.ts`) runs {@link verifyExecutionProvenanceFrom} over
+ * {@link executionProvenanceReadsOver} the leaves it is handed, for lint, the
+ * profile summary and the viewer snapshot; on disk those are
+ * `diskPreparationStoreLeafReads(root)`. The write-time precondition
+ * (`enforce-precondition.ts`) still calls the root form
+ * {@link verifyExecutionProvenance}.
  */
 
-import { scanPreparationInventory } from "../preparations/capacity.js";
 import type { PreparationManifestV1 } from "../preparations/manifest-parse.js";
 import {
-  readPreparationInitialInput, resolvePreparationRun,
+  readPreparationInitialInputFrom, resolvePreparationRunFrom,
   type PreparationInitialInputLookupV1, type PreparationRunLookupV1,
 } from "../preparations/service-run-lookup.js";
+import {
+  diskPreparationStoreLeafReads, preparationRunLookupReadsOver, type PreparationStoreLeafReads,
+} from "../preparations/store-leaf-reads.js";
 import type { ExecutionProvenanceReq } from "../profile/types.js";
 
 /** The three-way outcome, matching the health check's deny/park vocabulary. */
@@ -42,32 +70,57 @@ export interface ExecutionProvenanceVerdictV1 {
   readonly detail: string;
 }
 
-/** The store reads the verifier depends on — the real preparation store in production. */
-export interface ExecutionProvenanceStoreV1 {
-  scanInventory(root: string): Promise<{ manifests: readonly PreparationManifestV1[]; problems: readonly unknown[] }>;
-  readInitialInput(root: string, manifest: PreparationManifestV1): Promise<PreparationInitialInputLookupV1>;
-  resolveRun(root: string, runId: string): Promise<PreparationRunLookupV1>;
+/**
+ * The three reads the verifier asks of the preparation store. OWNED BY THE
+ * VERIFIER: a narrow seam, not `ProjectStore`, not a hosted or access-control
+ * contract. No read takes a project root. Each is asked afresh every time:
+ * nothing is remembered between candidates, and nothing makes two reads agree.
+ */
+export interface ExecutionProvenanceReads {
+  /** The store's manifests and its scan problems. A REJECTION here is the one failure the verifier turns into a park. */
+  scanInventory(): Promise<{ manifests: readonly PreparationManifestV1[]; problems: readonly unknown[] }>;
+  /** One candidate's sealed initial input. A rejection propagates. */
+  readInitialInput(manifest: PreparationManifestV1): Promise<PreparationInitialInputLookupV1>;
+  /** One candidate's run, by id. A rejection propagates. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
 }
 
-/** The production binding: the authenticated preparation store's own readers. */
-const PREPARATION_STORE: ExecutionProvenanceStoreV1 = {
-  scanInventory: (root) => scanPreparationInventory(root),
-  readInitialInput: (root, manifest) => readPreparationInitialInput(root, manifest),
-  resolveRun: (root, runId) => resolvePreparationRun(root, runId as never),
-};
+/**
+ * The verifier's three reads over the preparation store's raw leaf reads: THE
+ * ONE COMPOSITION, used by the local disk and by any other supplier of leaves.
+ * Each read is the store's own body over those leaves, with the arguments the
+ * verifier always passed. Building them does no I/O. The run lookup scans the
+ * inventory again on every call, as it always did. In no package index.
+ *
+ * @param leaves - The store's raw leaf reads, and its lifecycle authority.
+ * @returns The inventory scan, the sealed-input read and the run lookup.
+ */
+export function executionProvenanceReadsOver(leaves: PreparationStoreLeafReads): ExecutionProvenanceReads {
+  const lookup = preparationRunLookupReadsOver(leaves);
+  return {
+    scanInventory: () => lookup.scanInventory(),
+    readInitialInput: (manifest) => readPreparationInitialInputFrom(lookup, manifest),
+    resolveRun: (runId) => resolvePreparationRunFrom(lookup, runId),
+  };
+}
+
+/** LOCAL DISK. The production reads for the project at `root`: {@link executionProvenanceReadsOver} the store's own disk leaves. Module-private; in no package index. */
+function diskExecutionProvenanceReads(root: string): ExecutionProvenanceReads {
+  return executionProvenanceReadsOver(diskPreparationStoreLeafReads(root));
+}
 
 /** One candidate's contribution: it vouches, it was unreadable, or it is out. */
 type CandidateOutcome = "vouches" | "unreadable" | "no-match";
 
 /** Whether one candidate run vouches for the pinned digest (see file overview). */
 async function candidateOutcome(
-  store: ExecutionProvenanceStoreV1, root: string, manifest: PreparationManifestV1,
+  reads: ExecutionProvenanceReads, manifest: PreparationManifestV1,
   req: ExecutionProvenanceReq, slug: string, pinnedDigest: string,
 ): Promise<CandidateOutcome> {
-  const input = await store.readInitialInput(root, manifest);
+  const input = await reads.readInitialInput(manifest);
   if (!input.ok) return "unreadable";
   if (input.record[req.slugInputField] !== slug) return "no-match";
-  const resolved = await store.resolveRun(root, manifest.runId);
+  const resolved = await reads.resolveRun(manifest.runId);
   if (!resolved.ok) return resolved.failure === "unavailable" ? "unreadable" : "no-match";
   if (resolved.run.state !== "succeeded") return "no-match";
   const vouches = resolved.run.evidenceRefs.some((ref) =>
@@ -79,15 +132,17 @@ async function candidateOutcome(
 }
 
 /**
- * Verify one execution-provenance arm for a pinned artifact digest against an
- * explicit store — the seam every conjunct is witnessed through.
+ * {@link verifyExecutionProvenance} over {@link ExecutionProvenanceReads}: THE
+ * ONE BODY, and the seam every conjunct is witnessed through. The scan; then
+ * each candidate of the declared action in inventory order, its sealed input
+ * before its run; the first that vouches ends the reading.
  */
-export async function verifyExecutionProvenanceWith(
-  store: ExecutionProvenanceStoreV1, root: string, req: ExecutionProvenanceReq, slug: string, pinnedDigest: string,
+export async function verifyExecutionProvenanceFrom(
+  reads: ExecutionProvenanceReads, req: ExecutionProvenanceReq, slug: string, pinnedDigest: string,
 ): Promise<ExecutionProvenanceVerdictV1> {
-  let inventory: Awaited<ReturnType<ExecutionProvenanceStoreV1["scanInventory"]>>;
+  let inventory: Awaited<ReturnType<ExecutionProvenanceReads["scanInventory"]>>;
   try {
-    inventory = await store.scanInventory(root);
+    inventory = await reads.scanInventory();
   } catch (error) {
     return { verdict: "park", detail: `the preparation store could not be scanned: ${(error as Error).message}` };
   }
@@ -99,7 +154,7 @@ export async function verifyExecutionProvenanceWith(
   let unreadable = 0;
   for (const manifest of inventory.manifests) {
     if (manifest.plan.actionAuthority.actionId !== req.actionId) continue;
-    const outcome = await candidateOutcome(store, root, manifest, req, slug, pinnedDigest);
+    const outcome = await candidateOutcome(reads, manifest, req, slug, pinnedDigest);
     if (outcome === "vouches") {
       return { verdict: "pass", detail: `run ${manifest.runId} admitted the pinned bytes under output '${req.resultOutputId}'` };
     }
@@ -126,8 +181,9 @@ export async function verifyExecutionProvenanceWith(
  * @returns pass when a succeeded matching run admitted exactly these bytes under
  *   the declared output; park when the store could not be verified; deny otherwise.
  */
-export function verifyExecutionProvenance(
+export async function verifyExecutionProvenance(
   root: string, req: ExecutionProvenanceReq, slug: string, pinnedDigest: string,
 ): Promise<ExecutionProvenanceVerdictV1> {
-  return verifyExecutionProvenanceWith(PREPARATION_STORE, root, req, slug, pinnedDigest);
+  // `async` so that a throw while the disk reads are built REJECTS.
+  return verifyExecutionProvenanceFrom(diskExecutionProvenanceReads(root), req, slug, pinnedDigest);
 }

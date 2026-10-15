@@ -51,7 +51,8 @@ export const PRUNE_SWEEP_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
   mapRow("PLA-MAP-PRN03", "prune",
     "KNOWN RELAXATION, recorded rather than endorsed: eligibility is WAIVED once a unit has a signed planned receipt, so a resumed prune bypasses both the retention floor and the handoff-bundle check. What holds it is that the planned receipt binds kind, unit and operation — and, unlike the quarantine side, it does NOT bind `keyEpochId`",
     [at("pruneUnitStarted", "src/preparations/retention.ts"),
-     at("readVerifiedPruneReceipt", "src/preparations/lifecycle-fs/prune-protocol.ts")],
+     at("diskPruneUnitLeaves", "src/preparations/prune-delete.ts"),
+     at("verifiedPruneReceipt", "src/preparations/lifecycle-fs/prune-protocol.ts")],
     "authorize",
     "none — decision",
     "a planned receipt may exist without its deletes",
@@ -77,7 +78,7 @@ export const PRUNE_SWEEP_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-PRN05", "prune",
     "A verified COMPLETED receipt short-circuits the whole operation and is returned as-is, which is what makes prune and sweep idempotent under repetition",
-    [at("readVerifiedPruneReceipt", "src/preparations/lifecycle-fs/prune-protocol.ts"),
+    [at("verifiedPruneReceipt", "src/preparations/lifecycle-fs/prune-protocol.ts"),
      at("runTwoPhaseVerifiedDelete", "src/preparations/prune-delete.ts")],
     "observe",
     "none — read",
@@ -183,7 +184,7 @@ export const PRUNE_SWEEP_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-SWP02", "sweep",
     "Only a preparation whose run leaf is PROVABLY ABSENT is reclaimed; an owner that merely fails to read is `unavailable`, never `absent`, and is skipped — absence requires a trusted parent",
-    [at("enumerateSweepableOrphans", "src/preparations/retention.ts"),
+    [at("enumerateSweepableOrphansFrom", "src/preparations/retention.ts"),
      at("readPreparationManifest", "src/preparations/manifest-store.ts"),
      at("readPreparationRun", "src/preparations/run-store.ts")],
     "snapshot",

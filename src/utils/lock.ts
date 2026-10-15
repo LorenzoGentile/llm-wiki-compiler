@@ -27,19 +27,90 @@
  * to both hold the reclaim lock. The outer retry loop in acquireLock handles
  * convergence: first pass cleans up the stale reclaim lock, second pass
  * publishes it cleanly.
+ *
+ * STORAGE AND HOST. {@link acquireLockFrom}, {@link acquireLockBlockingFrom} and
+ * {@link releaseLockFrom} are THE ONE BODIES, over two separate capabilities they
+ * are handed and thread through every private helper: {@link LockIo}, the RAW
+ * physical file operations (the private-dir probes, the publication I/O, the
+ * root realpath and the capped owner read), and {@link LockHost}, the
+ * process-local concerns that are NOT storage (this process's id, the owner
+ * record's process identity, process liveness, the clock and sleep, scratch
+ * entropy, the process-local FIFO and its parked permits, and diagnostics). The
+ * bodies keep every decision: the lock path, the reclaim name, the two attempts,
+ * `null` owner means stale, the reclaim protocol, the PID-only release guard,
+ * the queue key fallback, every catch, every warning and its order. The root
+ * forms keep their signatures and pass {@link diskLockIo} and
+ * {@link localLockHost}, whose members call the incumbent functions at call time,
+ * so module spies and mocks still intercept them.
  */
 
-import { realpath, unlink } from "fs/promises";
-import { openFileNoFollow } from "./no-follow-open.js";
-import { constants as fsConstants } from "node:fs";
-import type { FileHandle } from "node:fs/promises";
 import path from "path";
+import { locationRealPath } from "../storage/disk-locations.js";
+import { readPrivateLeafText } from "../storage/disk-private-leaves.js";
+import type { CappedLeafRead } from "./confined-read.js";
 import { LOCK_FILE, MAX_LOCK_FILE_BYTES } from "./constants.js";
-import { resolveConfinedPrivateDir, resolveExistingConfinedPrivateDir } from "./private-dir.js";
-import { serializeOwner, parseOwner, isLockRecordStale } from "./lock-owner.js";
-import { publishLockRecord, type LockPublicationHooks } from "./lock-publication.js";
+import {
+  diskPrivateDirIo, resolveConfinedPrivateDirFrom, resolveExistingConfinedPrivateDirFrom, type PrivateDirIo,
+} from "./private-dir.js";
+import { serializeOwner, parseOwner, isLockRecordStale, type LockOwner } from "./lock-owner.js";
+import {
+  diskLockPublicationIo, hostScratchEntropy, publishLockRecordFrom,
+  type LockPublicationHooks, type LockPublicationIo, type ScratchEntropy,
+} from "./lock-publication.js";
 import { acquireKeyedFifo } from "./keyed-fifo.js";
 import * as output from "./output.js";
+
+/**
+ * The RAW physical I/O the project lock asks for: the private-dir probes, the
+ * publication I/O (whose `removeLeaf` also unlinks the lock and the reclaim
+ * lock), and two more members. Each gives a physical answer only and decides
+ * nothing; none is hosted, access-controlled, durable or in any package index.
+ */
+export interface LockIo extends PrivateDirIo, LockPublicationIo {
+  /** `location` with every link resolved. REJECTS raw. Disk: `locationRealPath(location)`. */
+  realPath(location: string): Promise<string>;
+  /**
+   * The hardened no-follow, regular-file-only, `maxBytes`-capped text read;
+   * `absent` (open `ENOENT`) and `unavailable` (every other refusal or failure)
+   * are values and it never rejects. Disk: `readPrivateLeafText(leaf, maxBytes)`.
+   */
+  readLeafCapped(leaf: string, maxBytes: number): Promise<CappedLeafRead>;
+}
+
+/** LOCAL DISK. The incumbent primitives, called at call time; no state, frozen. In no package index. */
+const diskLockIo: LockIo = Object.freeze({
+  ...diskPrivateDirIo,
+  ...diskLockPublicationIo,
+  realPath: (location: string) => locationRealPath(location),
+  readLeafCapped: (leaf: string, maxBytes: number) => readPrivateLeafText(leaf, maxBytes),
+});
+
+/**
+ * The HOST concerns the lock asks for, separate from storage. None reads or
+ * writes the lock's files; each is a property of THIS process or machine.
+ */
+export interface LockHost {
+  /** This process's id, read at call time. Local: `process.pid`. */
+  processId(): number;
+  /** The COMPLETE owner record naming `pid`, with its process identity. Local: `serializeOwner(pid)`. */
+  serializeOwner(pid: number): string;
+  /** Whether a PARSED owner's process is positively gone or reused. Local: `isLockRecordStale(owner)`. */
+  isOwnerProcessStale(owner: LockOwner): boolean;
+  /** Fresh scratch-name entropy for publication. Local: `hostScratchEntropy`. */
+  entropy: ScratchEntropy;
+  /** Milliseconds since the epoch. Local: `Date.now()`. */
+  now(): number;
+  /** Resolve after `ms` milliseconds. Local: a `setTimeout` promise. */
+  sleep(ms: number): Promise<void>;
+  /** Process-local FIFO admission for `key`. Local: `acquireKeyedFifo`. */
+  admit(key: string, timeoutMs: number, timeoutError: () => Error): Promise<() => void>;
+  /** Hold a granted queue permit for `key` until {@link LockHost.releaseParked}. Local: the process's permit map. */
+  park(key: string, release: () => void): void;
+  /** Release and forget the permit parked for `key`, if any. Local: the process's permit map. */
+  releaseParked(key: string): void;
+  /** Emit one status line. Local: `output.status(icon, message)`. */
+  status(icon: string, message: string): void;
+}
 
 /**
  * Derive the lock file path inside an already-confined private dir.
@@ -66,6 +137,28 @@ const DEFAULT_BLOCKING_INTERVAL_MS = 25;
 /** Queue permits held by successful blocking acquisitions until releaseLock. */
 const blockingQueueReleases = new Map<string, () => void>();
 
+/** Resolve after `ms` milliseconds (the poll backoff between acquire retries). */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** LOCAL HOST. The incumbent functions and this process's permit map, called at call time; frozen. In no package index. */
+const localLockHost: LockHost = Object.freeze({
+  processId: () => process.pid,
+  serializeOwner: (pid: number) => serializeOwner(pid),
+  isOwnerProcessStale: (owner: LockOwner) => isLockRecordStale(owner),
+  entropy: (bytes: number) => hostScratchEntropy(bytes),
+  now: () => Date.now(),
+  sleep: (ms: number) => delay(ms),
+  admit: (key: string, timeoutMs: number, timeoutError: () => Error) => acquireKeyedFifo(key, timeoutMs, timeoutError),
+  park: (key: string, release: () => void) => { blockingQueueReleases.set(key, release); },
+  releaseParked: (key: string) => {
+    blockingQueueReleases.get(key)?.();
+    blockingQueueReleases.delete(key);
+  },
+  status: (icon: string, message: string) => output.status(icon, message),
+});
+
 /** Options bounding a {@link acquireLockBlocking} retry loop. */
 export interface BlockingLockOptions {
   /** Maximum time without local-queue or filesystem-lock progress before throwing (ms). */
@@ -82,9 +175,9 @@ export class LockBusyError extends Error {
   }
 }
 
-/** Resolve after `ms` milliseconds (the poll backoff between acquire retries). */
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** The process-local queue key: the root's realpath, or its resolved spelling when that fails. */
+function lockQueueKey(io: LockIo, root: string): Promise<string> {
+  return io.realPath(root).catch(() => path.resolve(root));
 }
 
 /**
@@ -100,12 +193,19 @@ function delay(ms: number): Promise<void> {
  * @throws {LockBusyError} When the lock stays held past `timeoutMs`.
  */
 export async function acquireLockBlocking(root: string, options: BlockingLockOptions = {}): Promise<void> {
-  const queueKey = await realpath(root).catch(() => path.resolve(root));
+  return acquireLockBlockingFrom(diskLockIo, localLockHost, root, options);
+}
+
+/** THE ONE BODY of {@link acquireLockBlocking}, over the raw I/O and the host it is handed. */
+export async function acquireLockBlockingFrom(
+  io: LockIo, host: LockHost, root: string, options: BlockingLockOptions = {},
+): Promise<void> {
+  const queueKey = await lockQueueKey(io, root);
   const timeoutMs = options.timeoutMs ?? DEFAULT_BLOCKING_TIMEOUT_MS;
-  const releaseQueue = await acquireKeyedFifo(queueKey, timeoutMs, () => new LockBusyError(timeoutMs));
+  const releaseQueue = await host.admit(queueKey, timeoutMs, () => new LockBusyError(timeoutMs));
   try {
-    await pollForLock(root, options);
-    blockingQueueReleases.set(queueKey, releaseQueue);
+    await pollForLock(io, host, root, options);
+    host.park(queueKey, releaseQueue);
   } catch (error) {
     releaseQueue();
     throw error;
@@ -113,18 +213,18 @@ export async function acquireLockBlocking(root: string, options: BlockingLockOpt
 }
 
 /** Poll for the filesystem lock after this process's same-root waiters take their turn. */
-async function pollForLock(root: string, options: BlockingLockOptions): Promise<void> {
+async function pollForLock(io: LockIo, host: LockHost, root: string, options: BlockingLockOptions): Promise<void> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_BLOCKING_TIMEOUT_MS;
   const intervalMs = options.intervalMs ?? DEFAULT_BLOCKING_INTERVAL_MS;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = host.now() + timeoutMs;
   for (;;) {
     // Intermediate retries acquire QUIETLY: a held lock is the EXPECTED steady
     // state while we poll, so the per-attempt "Another compilation is running."
     // warning would spam SDK/MCP callers that retry by design. The final
     // LockBusyError is the clear signal on timeout.
-    if (await acquireLock(root, { quiet: true })) return;
-    if (Date.now() >= deadline) throw new LockBusyError(timeoutMs);
-    await delay(intervalMs);
+    if (await acquireLockFrom(io, host, root, { quiet: true })) return;
+    if (host.now() >= deadline) throw new LockBusyError(timeoutMs);
+    await host.sleep(intervalMs);
   }
 }
 
@@ -158,6 +258,13 @@ export interface AcquireLockOptions {
  *   silent). The fail-fast CLI path leaves it unset and still prints the warning.
  */
 export async function acquireLock(root: string, options: AcquireLockOptions = {}): Promise<boolean> {
+  return acquireLockFrom(diskLockIo, localLockHost, root, options);
+}
+
+/** THE ONE BODY of {@link acquireLock}, over the raw I/O and the host it is handed. */
+export async function acquireLockFrom(
+  io: LockIo, host: LockHost, root: string, options: AcquireLockOptions = {},
+): Promise<boolean> {
   // FAIL CLOSED on a `.llmwiki` (or ancestor) that symlinks outside the root:
   // resolving + creating the confined private dir throws on escape, so the lock
   // file is NEVER created out-of-tree (the lock writer runs FIRST in the page
@@ -165,33 +272,33 @@ export async function acquireLock(root: string, options: AcquireLockOptions = {}
   // itself, leaving the happy path byte-identical.
   let privateDir: string;
   try {
-    privateDir = await resolveConfinedPrivateDir(root);
+    privateDir = await resolveConfinedPrivateDirFrom(io, root);
   } catch {
-    if (!options.quiet) output.status("!", output.warn("Lock directory escapes project root — refusing to lock."));
+    if (!options.quiet) host.status("!", output.warn("Lock directory escapes project root — refusing to lock."));
     return false;
   }
   const lockPath = lockFileIn(privateDir);
 
   for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
     // Try create-only publication — fails if the name is already taken
-    const created = await tryCreateLock(lockPath, options.hooks);
+    const created = await tryCreateLock(io, host, lockPath, options.hooks);
     if (created) return true;
 
     // Lock exists. Check if the holding process is dead.
-    const stale = await isLockStale(lockPath);
+    const stale = await isLockStale(io, host, lockPath);
     if (!stale) {
-      if (!options.quiet) output.status("!", output.warn("Another compilation is running."));
+      if (!options.quiet) host.status("!", output.warn("Another compilation is running."));
       return false;
     }
 
     // Stale lock — serialize reclamation via a second lock.
-    const reclaimed = await reclaimStaleLock(root, lockPath);
+    const reclaimed = await reclaimStaleLock(io, host, lockPath);
     if (reclaimed) return true;
 
     // Reclamation failed (e.g. cleaned up stale reclaim lock). Retry.
   }
 
-  if (!options.quiet) output.status("!", output.warn("Could not acquire lock after retrying."));
+  if (!options.quiet) host.status("!", output.warn("Could not acquire lock after retrying."));
   return false;
 }
 
@@ -201,32 +308,31 @@ export async function acquireLock(root: string, options: AcquireLockOptions = {}
  * Acquires .llmwiki/lock.reclaim (via 'wx') so that only one process performs
  * the unlink + recreate sequence at a time. Re-verifies staleness under
  * the reclamation lock in case another process already fixed it.
- * @param root - Project root directory.
  * @param lockPath - Absolute path to the main lock file.
  */
-async function reclaimStaleLock(root: string, lockPath: string): Promise<boolean> {
+async function reclaimStaleLock(io: LockIo, host: LockHost, lockPath: string): Promise<boolean> {
   const reclaimPath = lockPath + RECLAIM_SUFFIX;
 
-  const gotReclaimLock = await acquireReclaimLock(reclaimPath);
+  const gotReclaimLock = await acquireReclaimLock(io, host, reclaimPath);
   if (!gotReclaimLock) return false;
 
   try {
     // Re-verify under exclusive reclamation access.
     // Another reclaimer may have already fixed the main lock.
-    if (!(await isLockStale(lockPath))) {
+    if (!(await isLockStale(io, host, lockPath))) {
       return false;
     }
 
     // Still stale. Safe to reclaim — we're the only reclaimer.
-    try { await unlink(lockPath); } catch { /* already gone */ }
+    try { await io.removeLeaf(lockPath); } catch { /* already gone */ }
 
-    const acquired = await tryCreateLock(lockPath);
+    const acquired = await tryCreateLock(io, host, lockPath);
     if (acquired) {
-      output.status("i", output.dim("Reclaimed stale lock from dead process."));
+      host.status("i", output.dim("Reclaimed stale lock from dead process."));
     }
     return acquired;
   } finally {
-    try { await unlink(reclaimPath); } catch { /* cleanup best-effort */ }
+    try { await io.removeLeaf(reclaimPath); } catch { /* cleanup best-effort */ }
   }
 }
 
@@ -243,15 +349,15 @@ async function reclaimStaleLock(root: string, lockPath: string): Promise<boolean
  * in acquireLock converges on the next attempt via a clean 'wx'.
  * @param reclaimPath - Absolute path to the reclamation lock file.
  */
-async function acquireReclaimLock(reclaimPath: string): Promise<boolean> {
-  if (await tryCreateLock(reclaimPath)) return true;
+async function acquireReclaimLock(io: LockIo, host: LockHost, reclaimPath: string): Promise<boolean> {
+  if (await tryCreateLock(io, host, reclaimPath)) return true;
 
   // Reclaim lock exists. If its holder is alive, back off.
-  if (!(await isLockStale(reclaimPath))) return false;
+  if (!(await isLockStale(io, host, reclaimPath))) return false;
 
   // Stale reclaim lock — clean it up but do NOT retry in this call.
   // Retrying here would reintroduce the unlink+create race.
-  try { await unlink(reclaimPath); } catch { /* already gone */ }
+  try { await io.removeLeaf(reclaimPath); } catch { /* already gone */ }
   return false;
 }
 
@@ -261,16 +367,17 @@ async function acquireReclaimLock(reclaimPath: string): Promise<boolean> {
  * recorded start time is the PID-reuse-safe liveness identity ({@link isLockRecordStale});
  * a leaf with no start time (legacy build) is read back compatibly.
  *
- * The record is linked into place COMPLETE — see {@link publishLockRecord}. The
+ * The record is linked into place COMPLETE — see {@link publishLockRecordFrom}. The
  * previous create-then-write left the authoritative name briefly zero-length,
  * and an empty leaf is precisely what {@link isLockStale} reports as stale, so a
  * contender could reclaim a lock from a process that was still taking it and
  * both would proceed. Shrinking that window was not enough; publication removes
  * it. The same rule serves the reclaim lock, which acquires through this
- * function too and is read by the identical staleness predicate.
+ * function too and is read by the identical staleness predicate. Publication
+ * runs over the SAME raw I/O and the host's entropy, never a root binding.
  */
-async function tryCreateLock(lockPath: string, hooks?: LockPublicationHooks): Promise<boolean> {
-  return publishLockRecord(lockPath, serializeOwner(process.pid), hooks);
+async function tryCreateLock(io: LockIo, host: LockHost, lockPath: string, hooks?: LockPublicationHooks): Promise<boolean> {
+  return publishLockRecordFrom(io, host.entropy, lockPath, host.serializeOwner(host.processId()), hooks);
 }
 
 /**
@@ -286,21 +393,16 @@ async function tryCreateLock(lockPath: string, hooks?: LockPublicationHooks): Pr
  * (stale check) and {@link releaseLock} (ownership guard), so neither follows nor
  * over-reads the leaf.
  */
-async function readLockOwner(lockPath: string): Promise<ReturnType<typeof parseOwner>> {
-  let handle: FileHandle;
+async function readLockOwner(io: LockIo, lockPath: string): Promise<ReturnType<typeof parseOwner>> {
+  // Absent (ENOENT), a symlinked leaf, a non-regular leaf, an oversize leaf and a
+  // failed stat or read are ALL "no readable owner": this reader has never told
+  // absent from unreadable, so both of the storage read's refusals map to null.
+  const read = await io.readLeafCapped(lockPath, MAX_LOCK_FILE_BYTES);
+  if (read.kind !== "ok") return null;
   try {
-    handle = await openFileNoFollow(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch {
-    return null; // absent (ENOENT) / symlinked leaf (ELOOP) → no readable owner
-  }
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_LOCK_FILE_BYTES) return null;
-    return parseOwner(await handle.readFile("utf-8"));
+    return parseOwner(read.body);
   } catch {
     return null;
-  } finally {
-    await handle.close().catch(() => {});
   }
 }
 
@@ -309,16 +411,17 @@ async function readLockOwner(lockPath: string): Promise<ReturnType<typeof parseO
  *
  * The leaf is read through {@link readLockOwner} (no-follow + fstat-capped), so a
  * `null` owner (absent / symlinked / oversize / non-regular / unparseable) is
- * stale. A readable owner is judged by {@link isLockRecordStale}: a dead PID is stale
- * (unchanged), AND — closing the PID-reuse wedge — a LIVE PID whose recorded start
- * time differs from the live process's current start time is ALSO stale. A legacy
- * leaf (bare PID, no start time) keeps the PID-only behavior. The reclaim flow is
- * unchanged — it still keys off this boolean.
+ * stale. A readable owner is judged by the host's liveness classifier
+ * ({@link isLockRecordStale} locally): a dead PID is stale (unchanged), AND —
+ * closing the PID-reuse wedge — a LIVE PID whose recorded start time differs from
+ * the live process's current start time is ALSO stale. A legacy leaf (bare PID, no
+ * start time) keeps the PID-only behavior. The reclaim flow is unchanged — it
+ * still keys off this boolean.
  */
-async function isLockStale(lockPath: string): Promise<boolean> {
-  const owner = await readLockOwner(lockPath);
+async function isLockStale(io: LockIo, host: LockHost, lockPath: string): Promise<boolean> {
+  const owner = await readLockOwner(io, lockPath);
   if (owner === null) return true;
-  return isLockRecordStale(owner);
+  return host.isOwnerProcessStale(owner);
 }
 
 /**
@@ -348,14 +451,16 @@ async function isLockStale(lockPath: string): Promise<boolean> {
  * @param root - Absolute project root.
  */
 export async function releaseLock(root: string): Promise<void> {
-  const queueKey = await realpath(root).catch(() => path.resolve(root));
-  const releaseQueue = (): void => {
-    blockingQueueReleases.get(queueKey)?.();
-    blockingQueueReleases.delete(queueKey);
-  };
+  return releaseLockFrom(diskLockIo, localLockHost, root);
+}
+
+/** THE ONE BODY of {@link releaseLock}, over the raw I/O and the host it is handed. Releases the parked queue permit on EVERY exit. */
+export async function releaseLockFrom(io: LockIo, host: LockHost, root: string): Promise<void> {
+  const queueKey = await lockQueueKey(io, root);
+  const releaseQueue = (): void => host.releaseParked(queueKey);
   let privateDir: string | null;
   try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
+    privateDir = await resolveExistingConfinedPrivateDirFrom(io, root);
   } catch {
     // `.llmwiki` (or an ancestor) escapes the root — refuse to follow it.
     releaseQueue();
@@ -366,13 +471,13 @@ export async function releaseLock(root: string): Promise<void> {
     return; // .llmwiki absent → nothing to release
   }
   const lockPath = lockFileIn(privateDir);
-  const owner = await readLockOwner(lockPath);
-  if (owner?.pid !== process.pid) {
+  const owner = await readLockOwner(io, lockPath);
+  if (owner?.pid !== host.processId()) {
     releaseQueue();
     return; // foreign / unreadable / symlinked / absent → no-op
   }
   try {
-    await unlink(lockPath);
+    await io.removeLeaf(lockPath);
   } catch {
     // Lock already removed or never existed
   } finally {

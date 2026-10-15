@@ -1,6 +1,13 @@
 /**
  * @file src/profile/templates/install.ts
  * @description Installs validated profile template packages into .llmwiki/profile.json.
+ *
+ * ONE LOCKED INSTALL BODY: {@link installPackageLockedWith} owns, under the held
+ * project lock, the force refusal, the corpus refusal and its wording, the profile
+ * serialization and byte cap BEFORE the write, and the advisory lock whose failure
+ * reports `lockWritten: false` without rolling back, over {@link TemplateInstallSteps}.
+ * Builtin/local/remote resolution, the tap-state lock and the remote re-check stay
+ * HOST work here, unchanged; the project lock is still taken before the tap lock.
  */
 import path from "node:path";
 import packageJson from "../../../package.json";
@@ -11,13 +18,14 @@ import { acquireMutationLockBlocking } from "../../operation-bundles/lock-gate.j
 import { atomicWrite } from "../../utils/markdown.js";
 import { profileDigest } from "../digest.js";
 import { loadProfile } from "../load.js";
-import { isTypedCorpusEmpty } from "./corpus.js";
+import { diskTypedCorpusReads, isTypedCorpusEmptyFrom, type TypedCorpusReads } from "./corpus.js";
 import { TEMPLATE_LOCK_FILE } from "./lock.js";
 import { getBuiltinTemplate } from "./registry.js";
 import { parseTemplateCoordinate } from "./signing/protocol.js";
 import { withTapStateLock } from "./taps/operator-lock.js";
 import { resolveRemotePackage, type ResolvedRemotePackage } from "./taps/package.js";
 import type { TapPaths } from "./taps/paths.js";
+import type { LoadedProfile } from "../types.js";
 import type {
   ProfileTemplatePackage,
   RemoteTemplateProvenance,
@@ -92,7 +100,7 @@ export async function installRemoteTemplate(
       const current = await resolveRemotePackage(paths, resolved.coordinate, { offline: true });
       assertSameRemoteResolution(resolved, current);
       const pkg = validatedRemotePackage(current, options.currentVersion ?? packageJson.version);
-      return installPackageLocked(root, pkg, remoteInstallOptions(options, current));
+      return installPackageLockedWith(localTemplateInstallSteps(root), pkg, remoteInstallOptions(options, current));
     });
   } finally {
     await releaseLock(root);
@@ -164,42 +172,75 @@ async function installPackage(
 ): Promise<TemplateInstallResult> {
   await acquireMutationLockBlocking(root, "ordinary");
   try {
-    return await installPackageLocked(root, pkg, options);
+    return await installPackageLockedWith(localTemplateInstallSteps(root), pkg, options);
   } finally {
     await releaseLock(root);
   }
 }
 
-async function installPackageLocked(
-  root: string,
+/** What the locked install asks of the project. No member takes a project root. */
+export interface TemplateInstallSteps {
+  /** The active profile. Local: `loadProfile(root)`. */
+  loadProfile(): Promise<LoadedProfile>;
+  /** The typed-corpus probe's reads. Local: `diskTypedCorpusReads(root)`. */
+  corpus: TypedCorpusReads;
+  /** Durably write the serialized active profile. Local: the confined atomic write. */
+  writeProfile(body: string): Promise<void>;
+  /** Durably write the advisory provenance lock. Local: {@link writeAdvisoryTemplateLock}. */
+  writeTemplateLock(lock: TemplateLock): Promise<void>;
+}
+
+/** LOCAL. The incumbent collaborators for one root, built per call; each called when asked. */
+function localTemplateInstallSteps(root: string): TemplateInstallSteps {
+  return {
+    loadProfile: () => loadProfile(root),
+    corpus: diskTypedCorpusReads(root),
+    writeProfile: (body) => writeProfileBody(root, body),
+    writeTemplateLock: (lock) => writeAdvisoryTemplateLock(root, lock),
+  };
+}
+
+/** Under the caller's held project lock: THE ONE INSTALL BODY. */
+export async function installPackageLockedWith(
+  steps: TemplateInstallSteps,
   pkg: ProfileTemplatePackage,
   options: InstallPackageOptions,
 ): Promise<TemplateInstallResult> {
-  const loaded = await loadProfile(root);
+  const loaded = await steps.loadProfile();
   if (loaded.loadedFrom !== null && !options.force) {
     throw new TemplateInstallError("A profile already exists. Re-run with --force only when the typed corpus is empty.");
   }
-  const probe = await isTypedCorpusEmpty(root, loaded, pkg.profile);
+  const probe = await isTypedCorpusEmptyFrom(steps.corpus, loaded, pkg.profile);
   if (!probe.empty) {
     throw new TemplateInstallError(`Refusing to replace the active profile: typed corpus is not empty.\n- ${probe.reasons.join("\n- ")}`);
   }
-  await writeInstalledProfile(root, pkg);
-  const lockWritten = await tryWriteLock(root, pkg, options);
+  await steps.writeProfile(installedProfileBody(pkg));
+  const lockWritten = await tryWriteLock(steps, pkg, options);
   return { kind: "installed", templateId: pkg.templateId, version: pkg.version, lockWritten };
 }
 
 /** Durably write one validated package profile under project confinement. */
 export async function writeInstalledProfile(root: string, pkg: ProfileTemplatePackage): Promise<void> {
+  await writeProfileBody(root, installedProfileBody(pkg));
+}
+
+/** The serialized active profile, refused above the profile byte cap before any write. */
+function installedProfileBody(pkg: ProfileTemplatePackage): string {
   const body = `${JSON.stringify(pkg.profile, null, 2)}\n`;
   if (Buffer.byteLength(body, "utf8") > MAX_PROFILE_BYTES) {
     throw new TemplateInstallError(`${PROFILE_FILE} would exceed the ${MAX_PROFILE_BYTES}-byte profile cap`);
   }
+  return body;
+}
+
+/** The confined, durable atomic write of the active profile's bytes. */
+async function writeProfileBody(root: string, body: string): Promise<void> {
   await atomicWrite(path.join(root, PROFILE_FILE), body, { confineRoot: root, durable: true });
 }
 
-async function tryWriteLock(root: string, pkg: ProfileTemplatePackage, options: InstallPackageOptions): Promise<boolean> {
+async function tryWriteLock(steps: TemplateInstallSteps, pkg: ProfileTemplatePackage, options: InstallPackageOptions): Promise<boolean> {
   try {
-    await writeAdvisoryTemplateLock(root, buildTemplateLock(pkg, options));
+    await steps.writeTemplateLock(buildTemplateLock(pkg, options));
     return true;
   } catch {
     return false;

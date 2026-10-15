@@ -11,24 +11,64 @@
  * Only TYPES are imported from `runner.ts` (the input + the internal test-fault
  * shape), so there is no runtime import cycle: the runner imports these functions
  * as values; this module imports nothing executable from the runner.
+ *
+ * ONE BODY EACH over {@link RunEvidenceBytes}, the verified evidence read at the
+ * run's own location: {@link readManifestBackFrom} and {@link readPayloadsBackFrom}.
+ * The input-taking forms keep their signatures and pass {@link diskRunEvidenceBytes},
+ * which asks the incumbent root reader; {@link runEvidenceBytesOver} asks the
+ * evidence store's own body over its leaf. Neither body sees a project root.
  */
 
-import { readPreparationEvidenceBytes } from "./evidence-store.js";
+import {
+  readPreparationEvidenceBytes, readPreparationEvidenceBytesFrom,
+  type PreparationEvidenceBytesRead, type PreparationEvidenceLeafReads, type PreparationEvidenceLocation,
+} from "./evidence-store.js";
 import {
   parseMaterializationManifest, toOperationEvidenceRef,
   type MaterializationResultV1, type PreparationHandoffMaterializationV1,
 } from "./materialization.js";
 import type { PreparationHandoffRequestV1 } from "./handoff.js";
-import type { PreparationRunV1 } from "./run-types.js";
+import type { PreparationRunBinding, PreparationRunV1 } from "./run-types.js";
 import type { RunPreparationInputV1, RunnerFaultsForTestV1 } from "./runner.js";
+
+/** One verified evidence read (bare digest, required cap) at the run's own location. No member takes a project root. */
+export type RunEvidenceBytes = (digest: string, maxBytes: number) => Promise<PreparationEvidenceBytesRead>;
+
+/** The evidence location a run binding names. */
+export function evidenceLocationOf(binding: PreparationRunBinding): PreparationEvidenceLocation {
+  return { workspaceId: binding.workspaceId, preparationId: binding.preparationId };
+}
+
+/**
+ * LOCAL DISK, for one read-back operation. The location is taken ONCE, when the
+ * operation's facade builds this reader, and the root is read lazily at each
+ * read: exactly the incumbent's timing, which took the location before its read
+ * (or before its payload loop) and the root at every call.
+ */
+function diskRunEvidenceBytes(input: RunPreparationInputV1): RunEvidenceBytes {
+  const location = evidenceLocationOf(input.binding);
+  return (digest, maxBytes) => readPreparationEvidenceBytes(input.root, location, digest, maxBytes);
+}
+
+/** The same read over the evidence store's own leaf, at `binding`'s location. Building it does no I/O. */
+export function runEvidenceBytesOver(leaves: PreparationEvidenceLeafReads, binding: PreparationRunBinding): RunEvidenceBytes {
+  const location = evidenceLocationOf(binding);
+  return (digest, maxBytes) => readPreparationEvidenceBytesFrom(leaves, location, digest, maxBytes);
+}
 
 /** R1-read the manifest bytes (prefixed run digest → bare CAS key) and parse. */
 export async function readManifestBack(
   input: RunPreparationInputV1, digest: string, cap: number,
 ): Promise<PreparationHandoffMaterializationV1 | string> {
+  return readManifestBackFrom(diskRunEvidenceBytes(input), digest, cap);
+}
+
+/** {@link readManifestBack} over {@link RunEvidenceBytes}: THE ONE BODY. */
+export async function readManifestBackFrom(
+  evidence: RunEvidenceBytes, digest: string, cap: number,
+): Promise<PreparationHandoffMaterializationV1 | string> {
   const bare = digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
-  const location = { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId };
-  const bytes = await readPreparationEvidenceBytes(input.root, location, bare, cap);
+  const bytes = await evidence(bare, cap);
   if (bytes.status !== "ok") return `manifest evidence ${bytes.status}`;
   try {
     return parseMaterializationManifest(bytes.bytes);
@@ -41,19 +81,25 @@ export async function readManifestBack(
 export async function readPayloadsBack(
   input: RunPreparationInputV1, body: MaterializationResultV1, cap: number,
 ): Promise<Map<string, Buffer> | string> {
-  const location = { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId };
+  return readPayloadsBackFrom(diskRunEvidenceBytes(input), body, cap);
+}
+
+/** {@link readPayloadsBack} over {@link RunEvidenceBytes}: THE ONE BODY. One read per payload, in manifest order; the first refusal stops. */
+export async function readPayloadsBackFrom(
+  evidence: RunEvidenceBytes, body: MaterializationResultV1, cap: number,
+): Promise<Map<string, Buffer> | string> {
   const payloads = new Map<string, Buffer>();
   for (const ref of body.payloadRefs) {
-    const bytes = await readPreparationEvidenceBytes(input.root, location, ref.digest, cap);
+    const bytes = await evidence(ref.digest, cap);
     if (bytes.status !== "ok") return `payload ${ref.digest} ${bytes.status}`;
     payloads.set(ref.digest, bytes.bytes);
   }
   return payloads;
 }
 
-/** Assemble the handoff request purely from persisted material plus capabilities. */
+/** Assemble the handoff request purely from persisted material plus capabilities. It reads no project root. */
 export function handoffRequest(
-  input: RunPreparationInputV1, run: PreparationRunV1,
+  input: Omit<RunPreparationInputV1, "root">, run: PreparationRunV1,
   manifest: PreparationHandoffMaterializationV1, payloads: Map<string, Buffer>,
   faults: RunnerFaultsForTestV1 | undefined,
 ): PreparationHandoffRequestV1 {

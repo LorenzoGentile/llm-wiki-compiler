@@ -8,19 +8,16 @@
  * the exact same renderer used for direct writes.
  */
 
-import { readdir } from "fs/promises";
-import path from "path";
 import {
   buildFrontmatter,
   parseFrontmatter,
 } from "../utils/markdown.js";
-import { readWikiPageContentOrWarn } from "./confined-wiki-read.js";
+import { asCompileAccess, type CompileAccess, type CompileProject } from "./compile-access.js";
 import { callClaude } from "../utils/llm.js";
 import { buildPagePrompt } from "./prompts.js";
 import { addObsidianMeta } from "./obsidian.js";
 import { addModelProvenanceMeta, addProvenanceMeta, reportContradictionWarnings } from "./provenance.js";
 import { normalizeCitationsInBody } from "./citation-normalize.js";
-import { CONCEPTS_DIR } from "../utils/constants.js";
 import type { SchemaConfig } from "../schema/index.js";
 import type { ExtractedConcept } from "../utils/types.js";
 
@@ -40,20 +37,21 @@ interface RenderableConcept {
 /**
  * Render a wiki page (frontmatter + body) for a merged concept by calling
  * the LLM with cross-referencing context from existing concept pages.
- * @param root - Project root directory.
+ * @param project - The project, as its access seam or a local root directory.
  * @param entry - The merged concept to render.
  * @param schema - Resolved schema config, used to stamp `kind` on frontmatter.
  * @returns Full markdown content (frontmatter + body, trailing newline).
  */
 export async function renderMergedPageContent(
-  root: string,
+  project: CompileProject,
   entry: RenderableConcept,
   schema: SchemaConfig,
 ): Promise<string> {
-  const existingPage = await readWikiPageContentOrWarn(
-    root, CONCEPTS_DIR, entry.slug, false /* new page — absence is normal */,
+  const access = asCompileAccess(project);
+  const existingPage = await access.readConceptPage(
+    entry.slug, false /* new page — absence is normal */,
   );
-  const relatedPages = await loadRelatedPages(root, entry.slug);
+  const relatedPages = await loadRelatedPages(access, entry.slug);
 
   const system = buildPagePrompt(
     entry.concept.concept,
@@ -116,19 +114,12 @@ function buildMergedFrontmatter(
  * Each per-file read is confined to `wiki/concepts`: a symlinked entry whose
  * target escapes that dir is dropped (warned, skipped) so its bytes never enter
  * the generation prompt.
- * @param root - Project root directory.
+ * @param access - The project's access seam.
  * @param excludeSlug - Slug of the current page to exclude.
- * @returns Concatenated related page contents (empty when concepts dir is missing).
+ * @returns Concatenated related page contents (empty when there are no concept pages).
  */
-async function loadRelatedPages(root: string, excludeSlug: string): Promise<string> {
-  const conceptsPath = path.join(root, CONCEPTS_DIR);
-  let files: string[];
-
-  try {
-    files = await readdir(conceptsPath);
-  } catch {
-    return "";
-  }
+async function loadRelatedPages(access: CompileAccess, excludeSlug: string): Promise<string> {
+  const files = await access.listConceptPageFiles();
 
   const related = files
     .filter((f) => f.endsWith(".md") && f !== `${excludeSlug}.md`)
@@ -136,7 +127,7 @@ async function loadRelatedPages(root: string, excludeSlug: string): Promise<stri
 
   const contents: string[] = [];
   for (const f of related) {
-    const content = await readWikiPageContentOrWarn(root, CONCEPTS_DIR, f.replace(/\.md$/, ""));
+    const content = await access.readConceptPage(f.replace(/\.md$/, ""));
     if (!content) continue;
     const { meta } = parseFrontmatter(content);
     if (meta.orphaned) continue;

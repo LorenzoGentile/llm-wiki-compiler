@@ -19,12 +19,28 @@
  * so a later lint/status surface (PR2) can report it. Callers that DEMAND an
  * intact chain run {@link verifyEventChain}/{@link verifyHeadAnchor} and throw
  * {@link EventStoreChainError} themselves.
+ *
+ * ONE BODY for the read: {@link readEvents} runs {@link readEventsFrom} over
+ * local-disk {@link EventReadSources}. The header, checksum, torn-tail, chain and
+ * anchor rules, the anchor's cap and its oversize error, the trim, and "no
+ * private directory or no leaf means no anchor" are decided in this file; the
+ * sources only look.
+ *
+ * ONE BODY for the append precondition too: {@link prepareEventStoreForAppendFrom}
+ * runs over local-disk {@link EventRepairSources}, which are the read sources plus ONE raw write, the
+ * whole-store replacement the repair truncates through. The verify-before-repair
+ * order, the head classification, the truncation bytes and the header version
+ * kept are decided here; the body still reads the anchor a second time, and
+ * nothing is remembered between reads.
  */
 
 import path from "path";
 import { EVENTS_FILE, EVENTS_HEAD_FILE, MAX_RELATION_STORE_BYTES, MAX_EVENT_HEAD_BYTES } from "../utils/constants.js";
 import { resolveExistingConfinedPrivateDir, PrivateDirConfinementError } from "../utils/private-dir.js";
-import { readConfinedGraphStore, splitStoreRecords } from "../utils/jsonl-store.js";
+import {
+  diskGraphStoreReads, openGraphFileRead, splitStoreRecords, type GraphStoreReads, type SymlinkErrorFactory,
+} from "../utils/jsonl-store.js";
+import { readOpenedTextWithinCap } from "../utils/no-follow-open.js";
 import { isOperationBinding } from "../utils/operation-binding.js";
 import { parseStoreHeaderVersion, splitStoreHeaderLine } from "../utils/store-header.js";
 import { atomicWrite } from "../utils/markdown.js";
@@ -40,7 +56,6 @@ import {
 } from "./types.js";
 import {
   eventChecksum,
-  openEventFileRead,
   serializeEventRecord,
   eventHeaderLine,
 } from "./store-record.js";
@@ -57,11 +72,96 @@ export interface ReadEventsResult {
   problems: string[];
 }
 
+/** What one look at the head-anchor leaf found: nothing there, a leaf over the cap (never read), or its text. */
+export type HeadLeafRead =
+  | { kind: "absent" }
+  | { kind: "oversize"; size: number }
+  | { kind: "text"; text: string };
+
+/**
+ * Everything {@link readEventsFrom} reads. OWNED BY THE EVENT READER: a narrow
+ * seam with one disk implementation; not `ProjectStore`, not a hosted or
+ * access-control contract, and it selects no backend. It carries NO meaning.
+ * Nothing ties the graph read to the private-directory looks; production builds
+ * all from one root.
+ */
+export interface EventReadSources {
+  /** The graph-store read, asked with THIS store's configuration (file name, cap and both error factories). */
+  graph: GraphStoreReads;
+  /** The existing private directory, resolved WITHOUT creating it, or `null` when there is none. REJECTS on a confinement fault and on any other failure. */
+  resolvePrivateDir(): Promise<string | null>;
+  /**
+   * One leaf of a resolved private directory, opened WITHOUT following a link.
+   * A link or a non-regular leaf REJECTS with what `makeSymlinkError` builds; a
+   * leaf over `maxBytes` is a value carrying its size and is never read; a
+   * failed read or close REJECTS raw.
+   */
+  readHeadLeaf(dir: string, name: string, maxBytes: number, makeSymlinkError: SymlinkErrorFactory): Promise<HeadLeafRead>;
+}
+
+/** The event store's typed link error, built here for the graph read and for the head-anchor leaf alike. */
+function eventSymlinkError(reason: string): Error {
+  return new EventStoreSymlinkError(reason);
+}
+
+/**
+ * LOCAL DISK. The head-anchor leaf look: the no-follow open (a link or a
+ * non-regular leaf fails closed), the size look, the read only when within the
+ * cap, and the close in `finally`, in that order. A close that fails wins over
+ * whatever the look had found, as it always did.
+ */
+async function readDiskHeadLeaf(file: string, maxBytes: number, makeSymlinkError: SymlinkErrorFactory): Promise<HeadLeafRead> {
+  const handle = await openGraphFileRead(file, makeSymlinkError);
+  if (handle === null) return { kind: "absent" };
+  return readOpenedTextWithinCap(handle, maxBytes);
+}
+
+/**
+ * LOCAL DISK. The event-read sources for the project at `root`. Building them
+ * does no I/O and no path work. `graph` defaults to this root's own graph-store
+ * read; a caller that already holds one for the same root may hand it in. In no
+ * package index.
+ */
+export function diskEventReadSources(root: string, graph: GraphStoreReads = diskGraphStoreReads(root)): EventReadSources {
+  return {
+    graph,
+    resolvePrivateDir: () => resolveExistingConfinedPrivateDir(root),
+    readHeadLeaf: (dir, name, maxBytes, makeSymlinkError) => readDiskHeadLeaf(path.join(dir, name), maxBytes, makeSymlinkError),
+  };
+}
+
+/**
+ * Everything {@link prepareEventStoreForAppendFrom} reads and writes: the read
+ * sources, plus the ONE raw write its repair asks for. Owned by the event store;
+ * not `ProjectStore`, not hosted, and it selects no backend.
+ */
+export interface EventRepairSources extends EventReadSources {
+  /**
+   * Replace the WHOLE store body with `body`. A reader sees the old or the new
+   * body; NOT durable against power loss. REJECTS raw. Disk: the confined
+   * `atomicWrite` of `<root>/wiki/graph/events.jsonl` (the root as given, not
+   * resolved), confined to the root.
+   */
+  replaceStore(body: string): Promise<void>;
+}
+
+/**
+ * LOCAL DISK. The repair sources for the project at `root`: the read sources
+ * and the incumbent `atomicWrite`, reached through `../utils/markdown.js` at
+ * call time. Building them does no I/O. In no package index.
+ */
+export function diskEventRepairSources(root: string): EventRepairSources {
+  return {
+    ...diskEventReadSources(root),
+    replaceStore: (body) => atomicWrite(path.join(root, EVENTS_FILE), body, { confineRoot: root }),
+  };
+}
+
 /** Read the raw store bytes, or null when absent — via the shared confined+capped reader. */
-function readStoreFile(root: string): Promise<string | null> {
-  return readConfinedGraphStore(root, {
+function readStoreFile(graph: GraphStoreReads): Promise<string | null> {
+  return graph.readStore({
     fileName: path.basename(EVENTS_FILE),
-    makeSymlinkError: (reason) => new EventStoreSymlinkError(reason),
+    makeSymlinkError: eventSymlinkError,
     maxBytes: MAX_RELATION_STORE_BYTES,
     makeOversizeError: (size) =>
       new EventStoreCorruptError(`store file ${size} bytes exceeds the ${MAX_RELATION_STORE_BYTES}-byte cap`),
@@ -69,12 +169,14 @@ function readStoreFile(root: string): Promise<string | null> {
 }
 
 /**
- * Read the exact raw store bytes (or null when absent) through the same confined,
- * no-follow, capped primitive the parser uses. The store-version upgrade seam
- * rewrites only the header while preserving every record byte and its order.
+ * Read the exact raw store bytes (or null when absent) through the graph-store
+ * read it is handed — the same confined, no-follow, capped read the parser uses,
+ * asked with THIS store's configuration. The store-version upgrade body rewrites
+ * only the header while preserving every record byte and its order. (It replaces
+ * the root-taking `readEventStoreRaw`, whose only caller was that upgrade.)
  */
-export function readEventStoreRaw(root: string): Promise<string | null> {
-  return readStoreFile(root);
+export function readEventStoreRawFrom(graph: GraphStoreReads): Promise<string | null> {
+  return readStoreFile(graph);
 }
 
 /** Parse and validate the header line, failing closed on an unknown future version. */
@@ -163,24 +265,23 @@ export function verifyEventChain(events: EventRecord[]): { ok: boolean; problem?
   return { ok: true };
 }
 
-/** Read the sealed head-anchor digest, or null when it is absent. Confined + no-follow + capped. */
-async function readHeadAnchor(root: string): Promise<string | null> {
-  const dir = await resolveExistingConfinedPrivateDir(root); // throws on .llmwiki symlink escape
+/**
+ * Read the sealed head-anchor digest, or null when it is absent, over
+ * {@link EventReadSources}: THE ONE BODY. No private
+ * directory and no leaf each mean no anchor; a leaf over the cap is this store's
+ * corrupt error and was never read; the text is trimmed here.
+ */
+async function readHeadAnchorFrom(sources: EventReadSources): Promise<string | null> {
+  const dir = await sources.resolvePrivateDir(); // throws on .llmwiki symlink escape
   if (dir === null) return null; // absent .llmwiki → no head anchor, clean project
-  const file = path.join(dir, path.basename(EVENTS_HEAD_FILE));
-  const handle = await openEventFileRead(file); // no-follow; symlink → fail closed
-  if (handle === null) return null;
-  try {
-    const size = (await handle.stat()).size;
-    if (size > MAX_EVENT_HEAD_BYTES) {
-      throw new EventStoreCorruptError(
-        `head anchor file ${size} bytes exceeds the ${MAX_EVENT_HEAD_BYTES}-byte cap`,
-      );
-    }
-    return (await handle.readFile("utf-8")).trim();
-  } finally {
-    await handle.close();
+  const read = await sources.readHeadLeaf(dir, path.basename(EVENTS_HEAD_FILE), MAX_EVENT_HEAD_BYTES, eventSymlinkError);
+  if (read.kind === "absent") return null;
+  if (read.kind === "oversize") {
+    throw new EventStoreCorruptError(
+      `head anchor file ${read.size} bytes exceeds the ${MAX_EVENT_HEAD_BYTES}-byte cap`,
+    );
   }
+  return read.text.trim();
 }
 
 /**
@@ -201,17 +302,25 @@ export async function verifyHeadAnchor(
   root: string,
   events: EventRecord[],
 ): Promise<{ ok: boolean; problem?: string }> {
-  const anchor = await readHeadAnchor(root);
+  return verifyHeadAnchorFrom(diskEventReadSources(root), events);
+}
+
+/** {@link verifyHeadAnchor} over {@link EventReadSources}: one anchor read, then the comparison. */
+async function verifyHeadAnchorFrom(
+  sources: EventReadSources,
+  events: EventRecord[],
+): Promise<{ ok: boolean; problem?: string }> {
+  const anchor = await readHeadAnchorFrom(sources);
   const expected = events.length === 0 ? null : eventPrevHash(events[events.length - 1]);
   if (anchor === expected) return { ok: true };
   return { ok: false, problem: `head anchor ${anchor ?? "<absent>"} does not match last event` };
 }
 
 /** Append chain + head-anchor problems (non-fatal) onto `problems`. */
-async function appendChainProblems(root: string, events: EventRecord[], problems: string[]): Promise<void> {
+async function appendChainProblems(sources: EventReadSources, events: EventRecord[], problems: string[]): Promise<void> {
   const chain = verifyEventChain(events);
   if (!chain.ok && chain.problem) problems.push(chain.problem);
-  const anchor = await verifyHeadAnchor(root, events);
+  const anchor = await verifyHeadAnchorFrom(sources, events);
   if (!anchor.ok && anchor.problem) problems.push(anchor.problem);
 }
 
@@ -224,7 +333,16 @@ async function appendChainProblems(root: string, events: EventRecord[], problems
  * @returns The events in append order and a list of problems.
  */
 export async function readEvents(root: string): Promise<ReadEventsResult> {
-  const raw = await readStoreFile(root); // throws on symlink/too-new/corrupt
+  return readEventsFrom(diskEventReadSources(root));
+}
+
+/**
+ * {@link readEvents} over {@link EventReadSources}: THE ONE BODY. The store is
+ * asked first; then the anchor is ALWAYS asked, for an absent or header-only
+ * store too. Nothing is caught, so a rejection leaves as the same error.
+ */
+export async function readEventsFrom(sources: EventReadSources): Promise<ReadEventsResult> {
+  const raw = await readStoreFile(sources.graph); // throws on symlink/too-new/corrupt
   const recordLines = splitStoreRecords(raw, parseHeader);
   // An ABSENT or header-only log yields ZERO events — but if the sealed head
   // anchor still points at a real digest, a prior log was TRUNCATED to empty
@@ -232,12 +350,12 @@ export async function readEvents(root: string): Promise<ReadEventsResult> {
   // truncation surfaces as a head-mismatch problem instead of a healthy empty.
   if (recordLines === null) {
     const emptyProblems: string[] = [];
-    await appendChainProblems(root, [], emptyProblems);
+    await appendChainProblems(sources, [], emptyProblems);
     return { events: [], problems: emptyProblems };
   }
   const problems: string[] = [];
   const events = parseRecords(recordLines, problems);
-  await appendChainProblems(root, events, problems);
+  await appendChainProblems(sources, events, problems);
   return { events, problems };
 }
 
@@ -249,14 +367,14 @@ export async function readEvents(root: string): Promise<ReadEventsResult> {
  * does not fire on it — the caller decides whether a torn tail is tolerated (read)
  * or repaired before verification (write).
  *
- * @param root - Absolute project root (for the head-anchor read).
+ * @param sources - The read sources (for the head-anchor read).
  * @param events - Events in append order.
  * @throws {EventStoreChainError} When the chain is broken or the head anchor mismatches.
  */
-async function verifyChainAndHead(root: string, events: EventRecord[]): Promise<void> {
+async function verifyChainAndHeadFrom(sources: EventReadSources, events: EventRecord[]): Promise<void> {
   const chain = verifyEventChain(events);
   if (!chain.ok) throw new EventStoreChainError(chain.problem ?? "chain verification failed");
-  const anchor = await verifyHeadAnchor(root, events);
+  const anchor = await verifyHeadAnchorFrom(sources, events);
   if (!anchor.ok) throw new EventStoreChainError(anchor.problem ?? "head anchor mismatch");
 }
 
@@ -273,8 +391,18 @@ async function verifyChainAndHead(root: string, events: EventRecord[]): Promise<
  * @throws {EventStoreChainError} When the chain is broken or the head anchor mismatches.
  */
 export async function readEventsStrict(root: string): Promise<EventRecord[]> {
-  const { events } = await readEvents(root);
-  await verifyChainAndHead(root, events);
+  return readEventsStrictFrom(diskEventReadSources(root));
+}
+
+/**
+ * {@link readEventsStrict} over {@link EventReadSources}: THE ONE BODY. The whole
+ * read first ({@link readEventsFrom}: the store, then the anchor), then the strict
+ * verification: the chain, then a SECOND, fresh head-anchor read. Every error
+ * leaves unchanged; a torn trailing line alone is tolerated.
+ */
+export async function readEventsStrictFrom(sources: EventReadSources): Promise<EventRecord[]> {
+  const { events } = await readEventsFrom(sources);
+  await verifyChainAndHeadFrom(sources, events);
   return events;
 }
 
@@ -290,11 +418,13 @@ function hasTornTail(problems: string[]): boolean {
  * hardened write discipline — no new unconfined write is introduced. The shared
  * truncation primitive for both torn-tail repair and one-ahead crash recovery; it
  * is only ever called on an UNCOMMITTED (un-sealed) tail, so it loses nothing.
+ * The header version is read through the sources' graph read FIRST, then the
+ * body is handed to their one whole-store replacement.
  */
-async function truncateToRecords(root: string, kept: EventRecord[]): Promise<void> {
-  const version = await currentEventHeaderVersion(root);
+async function truncateToRecordsFrom(sources: EventRepairSources, kept: EventRecord[]): Promise<void> {
+  const version = await currentEventHeaderVersionFrom(sources.graph);
   const body = eventHeaderLine(version) + kept.map((e) => serializeEventRecord(stripChecksum(e))).join("");
-  await atomicWrite(path.join(root, EVENTS_FILE), body, { confineRoot: root });
+  await sources.replaceStore(body);
 }
 
 /**
@@ -302,8 +432,8 @@ async function truncateToRecords(root: string, kept: EventRecord[]): Promise<voi
  * preserves it (a v2 store carrying operation-bound records is never downgraded
  * to v1). An absent or malformed header defaults to the ordinary base version.
  */
-async function currentEventHeaderVersion(root: string): Promise<number> {
-  const raw = await readEventStoreRaw(root);
+async function currentEventHeaderVersionFrom(graph: GraphStoreReads): Promise<number> {
+  const raw = await readStoreFile(graph);
   if (raw === null) return EVENT_STORE_BASE_WRITE_VERSION;
   const split = splitStoreHeaderLine(raw);
   const version = split === null ? null : parseStoreHeaderVersion(split.headerLine, "event-store-header");
@@ -367,27 +497,33 @@ function classifyHeadState(anchor: string | null, events: EventRecord[]): HeadSt
  *  - `tamper` → genuine head/log mismatch (incl. two-ahead, head-without-log) →
  *    throw with the file BYTE-IDENTICAL.
  *
- * @param root - Absolute project root.
+ * THE ONE BODY, over {@link EventRepairSources} (locally `diskEventRepairSources(root)`,
+ * which the event store's own write sources spread). The whole read (store, then
+ * anchor), the strict chain check, a SECOND
+ * anchor read for the classification, then at most one truncation. A refusal
+ * writes nothing; nothing is caught, so every rejection leaves as the same error.
+ *
+ * @param sources - The read sources plus the whole-store replacement.
  * @returns The verified events (for chaining the next record's `prevHash`).
  * @throws {EventStoreChainError} When the chain is broken or the head anchor mismatches.
  */
-export async function prepareEventStoreForAppend(root: string): Promise<EventRecord[]> {
-  const { events, problems } = await readEvents(root); // throws on corrupt/too-new/symlink
+export async function prepareEventStoreForAppendFrom(sources: EventRepairSources): Promise<EventRecord[]> {
+  const { events, problems } = await readEventsFrom(sources); // throws on corrupt/too-new/symlink
   // VERIFY BEFORE REPAIR: a broken/reordered chain must be rejected with the file
   // left BYTE-IDENTICAL — never truncate (write to) a store we are about to refuse.
   const chain = verifyEventChain(events);
   if (!chain.ok) throw new EventStoreChainError(chain.problem ?? "chain verification failed");
-  const state = classifyHeadState(await readHeadAnchor(root), events);
+  const state = classifyHeadState(await readHeadAnchorFrom(sources), events);
   if (state === "tamper") {
     throw new EventStoreChainError(`head anchor does not match a committable store state`);
   }
   if (state === "one-ahead") {
     // Drop the single UNCOMMITTED trailing record; the head already seals the prefix.
     const kept = events.slice(0, events.length - 1);
-    await truncateToRecords(root, kept);
+    await truncateToRecordsFrom(sources, kept);
     return kept;
   }
   // healthy: repair only an uncommitted torn tail (no committed event is lost).
-  if (hasTornTail(problems)) await truncateToRecords(root, events);
+  if (hasTornTail(problems)) await truncateToRecordsFrom(sources, events);
   return events;
 }

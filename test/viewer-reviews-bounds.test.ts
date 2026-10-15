@@ -9,7 +9,11 @@
  *
  * Capping the RESPONSE alone would not remove it: the files would still be read
  * and parsed before being sliced away. So these tests assert on the read path
- * itself — `safeReadFile` is spied on, and only the served slice may reach it.
+ * itself: the disk read primitive is spied on, and only the served slice may
+ * reach it. The tolerant candidate read goes through the local record-directory
+ * binding, whose disk leaf reads with `readFile` from `node:fs/promises`
+ * (`src/storage/disk-local-record-dirs.ts`), so that is the call counted. The
+ * real implementation stays beneath the spy; nothing is stubbed.
  * They also pin the ordering guarantee the bounded loader actually provides
  * (ascending candidate file id, NOT `generatedAt`) so it cannot drift back into
  * an undocumented promise.
@@ -19,19 +23,19 @@ import { describe, expect, it, vi } from "vitest";
 import { makeTempRoot } from "./fixtures/temp-root.js";
 import { CANDIDATES_DIR } from "../src/utils/constants.js";
 
-vi.mock("../src/utils/markdown.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/utils/markdown.js")>();
-  return { ...actual, safeReadFile: vi.fn(actual.safeReadFile) };
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readFile: vi.fn(actual.readFile) };
 });
 
-import { safeReadFile } from "../src/utils/markdown.js";
+import { readFile } from "node:fs/promises";
 import { listCandidatePage, writeFreshCandidate } from "../src/compiler/candidates.js";
 
 /** Candidate files read from disk since the counter was last reset. */
 function candidateReadCount(): number {
   return vi
-    .mocked(safeReadFile)
-    .mock.calls.filter(([file]) => file.includes(CANDIDATES_DIR)).length;
+    .mocked(readFile)
+    .mock.calls.filter(([file]) => typeof file === "string" && file.includes(CANDIDATES_DIR)).length;
 }
 
 /**
@@ -53,7 +57,7 @@ async function seedQueue(count: number): Promise<string> {
       body: `---\ntitle: Candidate ${i}\n---\n\nBody ${i}.`,
     });
   }
-  vi.mocked(safeReadFile).mockClear();
+  vi.mocked(readFile).mockClear();
   return root;
 }
 
@@ -82,7 +86,7 @@ describe("listCandidatePage — bounded disk I/O", () => {
 
   it("reads nothing when no candidates directory exists", async () => {
     const root = await makeTempRoot("reviews-bounds-empty");
-    vi.mocked(safeReadFile).mockClear();
+    vi.mocked(readFile).mockClear();
     expect(await listCandidatePage(root, 5)).toEqual({ candidates: [], total: 0 });
     expect(candidateReadCount()).toBe(0);
   });

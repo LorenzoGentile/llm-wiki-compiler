@@ -3,13 +3,23 @@
  * @description Read-only template provenance and profile-drift status.
  * Advisory lock fields locate a release; independently resolved release bytes
  * determine whether the active profile matches what was installed.
+ *
+ * ONE BODY. {@link collectTemplateStatus} keeps its signature and runs
+ * {@link collectTemplateStatusFrom} over the incumbent root readers of the
+ * PROJECT's three reads (profile, template lock, journal);
+ * {@link templateStatusReadsOver} is the same three reads over their own
+ * seams. The tap paths and remote tap state are the USER's host state, not the
+ * project's, and stay as they are. Neither form is a hosted store, and neither
+ * is in a package index.
  */
 import { profileDigest } from "../digest.js";
-import { journalHealth } from "../../trust/journal-health.js";
-import { loadProfile } from "../load.js";
+import { journalHealth, journalHealthFrom, type JournalHealthStatus } from "../../trust/journal-health.js";
+import type { JournalReadSources } from "../../trust/journal-classify.js";
+import { loadProfile, loadProfileFrom, type EffectiveProfileSources } from "../load.js";
+import type { LoadedProfile } from "../types.js";
 import { getBuiltinTemplate } from "./registry.js";
 import { compareTemplateVersions } from "./registry.js";
-import { readTemplateLock, type TemplateLockRead } from "./lock.js";
+import { readTemplateLock, readTemplateLockFrom, type TemplateLockRead } from "./lock.js";
 import { parseTemplateCoordinate } from "./signing/protocol.js";
 import { remoteCoordinateFromLock } from "./remote-lifecycle.js";
 import { loadAcceptedIndex } from "./taps/evidence.js";
@@ -46,11 +56,38 @@ export interface TemplateStatus {
   updateAvailable?: string | null;
 }
 
+/** The project's three reads, in the order the body makes them. No member takes a project root. */
+export interface TemplateStatusReads {
+  /** The effective profile. */
+  profile(): Promise<LoadedProfile>;
+  /** The advisory template lock. */
+  lock(): Promise<TemplateLockRead>;
+  /** The project journal's health. */
+  journal(): Promise<{ status: JournalHealthStatus }>;
+}
+
+/** LOCAL DISK. The incumbent root readers, each called when asked. */
+function diskTemplateStatusReads(root: string): TemplateStatusReads {
+  return { profile: () => loadProfile(root), lock: () => readTemplateLock(root), journal: () => journalHealth(root) };
+}
+
+/** The same reads over the profile loader's sources, the lock reader's two looks and the journal's sources. */
+export function templateStatusReadsOver(sources: {
+  profile: EffectiveProfileSources; lock: Parameters<typeof readTemplateLockFrom>[0]; journal: JournalReadSources;
+}): TemplateStatusReads {
+  return { profile: () => loadProfileFrom(sources.profile), lock: () => readTemplateLockFrom(sources.lock), journal: () => journalHealthFrom(sources.journal) };
+}
+
 /** Collect status without allowing advisory provenance to affect profile load. */
 export async function collectTemplateStatus(root: string, paths: TapPaths = resolveTapPaths()): Promise<TemplateStatus> {
-  const loaded = await loadProfile(root);
-  const lockRead = await readTemplateLock(root);
-  const journal = await journalHealth(root);
+  return collectTemplateStatusFrom(diskTemplateStatusReads(root), paths);
+}
+
+/** THE ONE BODY of {@link collectTemplateStatus}: profile, lock, journal, then the journal gate, the lock's base status, and the release comparison. */
+export async function collectTemplateStatusFrom(reads: TemplateStatusReads, paths: TapPaths): Promise<TemplateStatus> {
+  const loaded = await reads.profile();
+  const lockRead = await reads.lock();
+  const journal = await reads.journal();
   if (journal.status !== "ok") return journalStatus(loaded.profile.profileId, loaded.digest, lockRead, journal.status);
   const base = baseStatus(loaded.profile.profileId, loaded.digest, lockRead);
   if (base) return base;

@@ -6,13 +6,20 @@
  * under the project lock, so concurrent connector runs cannot both pass the
  * interval check. Reads route through the confined leaf reader and writes through
  * the confined atomic writer — a symlinked connectors directory fails closed.
+ *
+ * Disk access: {@link enforceRequestInterval} takes the project lock and then
+ * runs {@link updateRateStampLockedFrom} over the two local-disk bindings for the
+ * project root: one capped confined read and one confined atomic write. The
+ * lock, the parse, the clock and the decision stay in this module.
  */
 
 import path from "node:path";
-import { atomicWrite } from "../utils/markdown.js";
 import { releaseLock } from "../utils/lock.js";
 import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
-import { readConfinedLeaf } from "../utils/confined-read.js";
+import { diskLocalCappedReads } from "../storage/disk-local-reads.js";
+import { diskLocalRecords } from "../storage/disk-local-records.js";
+import type { LegacyLocalCappedReads } from "../storage/legacy-local-reads.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
 import type { ConnectorRuntimeConfig } from "./config.js";
 import type { RunConnectorResult } from "./run.js";
 
@@ -30,27 +37,45 @@ export async function enforceRequestInterval(
     return { kind: "unavailable", reason: "connector rate state locked" };
   }
   try {
-    return await updateRateStampLocked(root, connectorId, config.minRequestIntervalMs, now);
+    return await updateRateStampLockedFrom(
+      diskLocalCappedReads(root), diskLocalRecords(root), connectorId, config.minRequestIntervalMs, now,
+    );
   } finally {
     await releaseLock(root);
   }
 }
 
-/** Read/update the connector's last-request timestamp while the project lock is held. */
-async function updateRateStampLocked(
-  root: string,
+/**
+ * Read/update the connector's last-request timestamp through `reads` and
+ * `records`: exactly one capped read, then at most one atomic write.
+ *
+ * THE CALLER MUST HOLD THE PROJECT MUTATION LOCK. Nothing here takes it or
+ * checks it, so two unlocked callers can both pass the interval check. The
+ * caller also owns `connectorId`: it goes into the stamp's path as it is given
+ * and is not validated here. This is an internal seam over the legacy local
+ * bindings. It confers no authority and is not a hosted or public contract.
+ *
+ * @param reads - Where the stamp is read from, capped and confined.
+ * @param records - Where the stamp is written, atomically and confined.
+ * @param connectorId - The connector whose stamp this is; trusted as given.
+ * @param minIntervalMs - The floor between two requests, in milliseconds.
+ * @param now - The clock; read once, after the stamp, and only when it is usable.
+ */
+export async function updateRateStampLockedFrom(
+  reads: LegacyLocalCappedReads,
+  records: Pick<LegacyLocalRecords, "writeAtomic">,
   connectorId: string,
   minIntervalMs: number,
   now?: () => Date,
 ): Promise<RunConnectorResult | null> {
-  const stamp = await readRateStamp(root, connectorId);
+  const stamp = await readRateStamp(reads, connectorId);
   if (stamp.kind === "unavailable") return stamp;
   const current = (now ? now() : new Date()).getTime();
   if (stamp.kind === "ok" && current - stamp.atMs < minIntervalMs) {
     return { kind: "refused", reason: "connector minimum request interval has not elapsed" };
   }
   try {
-    await writeRateStamp(root, connectorId, current);
+    await writeRateStamp(records, connectorId, current);
   } catch {
     return { kind: "unavailable", reason: "connector rate state unavailable" };
   }
@@ -59,11 +84,10 @@ async function updateRateStampLocked(
 
 /** Read the prior connector request timestamp, preserving unavailable as fail-closed. */
 async function readRateStamp(
-  root: string,
+  reads: LegacyLocalCappedReads,
   connectorId: string,
 ): Promise<{ kind: "ok"; atMs: number } | { kind: "absent" } | { kind: "unavailable"; reason: string }> {
-  const file = rateStampPath(root, connectorId);
-  const read = await readConfinedLeaf(root, file, path.dirname(file), RATE_STAMP_MAX_BYTES);
+  const read = await reads.readCappedText(rateStampPath(connectorId), RATE_STAMP_MAX_BYTES);
   if (read.kind === "absent") return { kind: "absent" };
   if (read.kind === "unavailable") return { kind: "unavailable", reason: "connector rate state unavailable" };
   return parseRateStamp(read.body);
@@ -81,12 +105,15 @@ function parseRateStamp(raw: string): { kind: "ok"; atMs: number } | { kind: "un
 }
 
 /** Persist the current connector request timestamp under the project root. */
-async function writeRateStamp(root: string, connectorId: string, atMs: number): Promise<void> {
-  const file = rateStampPath(root, connectorId);
-  await atomicWrite(file, `${JSON.stringify({ atMs })}\n`, { confineRoot: root });
+async function writeRateStamp(
+  records: Pick<LegacyLocalRecords, "writeAtomic">,
+  connectorId: string,
+  atMs: number,
+): Promise<void> {
+  await records.writeAtomic(rateStampPath(connectorId), `${JSON.stringify({ atMs })}\n`);
 }
 
-/** The host-owned request-interval marker for one connector. */
-function rateStampPath(root: string, connectorId: string): string {
-  return path.join(root, ".llmwiki", "connectors", `${connectorId}.last-fetch.json`);
+/** The host-owned request-interval marker for one connector, relative to the project root. */
+function rateStampPath(connectorId: string): string {
+  return path.join(".llmwiki", "connectors", `${connectorId}.last-fetch.json`);
 }

@@ -20,12 +20,13 @@
  * unreadable/absent backing state.
  */
 
-import { readOperationKey } from "../../operation-bundles/key-epoch.js";
-import { readOperationRun, type OperationRunRead } from "../../operation-bundles/run-store.js";
+import { scanOperationInventoryFrom, type OperationInventory, type OperationInventoryReads } from "../../operation-bundles/capacity.js";
+import { readOperationKey, readOperationKeyFrom, type OperationKeyLeafReads, type OperationKeyRead } from "../../operation-bundles/key-epoch.js";
+import { readOperationRun, readOperationRunFrom, type OperationRunLeafReads, type OperationRunRead } from "../../operation-bundles/run-store.js";
 import { createCliOperationRuntime } from "../../operation-bundles/runtime-factory.js";
 import type { ApproveOperationBundleRequest } from "../../operation-bundles/executor.js";
 import type { OperationGrant, OperationPrincipal } from "../../operation-bundles/principal.js";
-import type { OperationRun } from "../../operation-bundles/run-types.js";
+import type { OperationRun, OperationRunBinding } from "../../operation-bundles/run-types.js";
 import type { OperationDigest } from "../../operation-bundles/types.js";
 import {
   loadOperationInventory, resolveTarget, type ResolvedTarget,
@@ -41,10 +42,23 @@ export {
 } from "../../operation-bundles/bundle-target.js";
 import { CLI_OPERATOR_ID } from "../../cli/shared.js";
 
+/** The key epoch of one key read, or null when the key is not readable. */
+const keyEpochOf = (key: OperationKeyRead): OperationDigest | null => (key.status === "ok" ? key.keyEpochId : null);
+
+/** The run binding of a resolved target under `keyEpochId`. */
+function runBindingFor(resolved: ResolvedTarget, keyEpochId: OperationDigest): OperationRunBinding {
+  return {
+    runId: resolved.runId,
+    bundleId: resolved.bundleId,
+    manifestDigest: resolved.manifestDigest,
+    workspaceId: resolved.workspaceId,
+    keyEpochId,
+  };
+}
+
 /** Read the project key epoch, or null when no key leaf is readable. */
 export async function readKeyEpoch(root: string): Promise<OperationDigest | null> {
-  const key = await readOperationKey(root);
-  return key.status === "ok" ? key.keyEpochId : null;
+  return keyEpochOf(await readOperationKey(root));
 }
 
 /** Read one manifest's run leaf under the given key epoch. */
@@ -53,13 +67,35 @@ export function readRunForTarget(
   resolved: ResolvedTarget,
   keyEpochId: OperationDigest,
 ): Promise<OperationRunRead> {
-  return readOperationRun(root, {
-    runId: resolved.runId,
-    bundleId: resolved.bundleId,
-    manifestDigest: resolved.manifestDigest,
-    workspaceId: resolved.workspaceId,
-    keyEpochId,
-  });
+  return readOperationRun(root, runBindingFor(resolved, keyEpochId));
+}
+
+/** The three reads one target resolution makes. No member takes a project root. */
+export interface TargetRunReads {
+  /** The operation inventory. */
+  inventory(): Promise<OperationInventory>;
+  /** The key epoch, or null when the key is not readable. */
+  keyEpoch(): Promise<OperationDigest | null>;
+  /** The resolved target's run under `keyEpochId`. */
+  run(resolved: ResolvedTarget, keyEpochId: OperationDigest): Promise<OperationRunRead>;
+}
+
+/** LOCAL DISK. The incumbent root readers, each called when asked. */
+export function diskTargetRunReads(root: string): TargetRunReads {
+  return {
+    inventory: () => loadOperationInventory(root),
+    keyEpoch: () => readKeyEpoch(root),
+    run: (resolved, keyEpochId) => readRunForTarget(root, resolved, keyEpochId),
+  };
+}
+
+/** The same reads over the inventory's, the key's and the run store's own leaf seams; in no package index. */
+export function targetRunReadsOver(leaves: { inventory: OperationInventoryReads; key: OperationKeyLeafReads; runs: OperationRunLeafReads }): TargetRunReads {
+  return {
+    inventory: () => scanOperationInventoryFrom(leaves.inventory),
+    keyEpoch: async () => keyEpochOf(await readOperationKeyFrom(leaves.key)),
+    run: (resolved, keyEpochId) => readOperationRunFrom(leaves.runs, runBindingFor(resolved, keyEpochId)),
+  };
 }
 
 /** A resolved target paired with its authenticated run, or a bounded error message. */
@@ -80,12 +116,17 @@ function runReadError(resolved: ResolvedTarget, read: Exclude<OperationRunRead, 
  * @param target - A run id or bundle id.
  */
 export async function resolveTargetRun(root: string, target: string): Promise<TargetRun> {
-  const inventory = await loadOperationInventory(root);
+  return resolveTargetRunFrom(diskTargetRunReads(root), target);
+}
+
+/** THE ONE BODY of {@link resolveTargetRun}: inventory, the pure target match, the key epoch, then the run, each refusal its own message. */
+export async function resolveTargetRunFrom(reads: TargetRunReads, target: string): Promise<TargetRun> {
+  const inventory = await reads.inventory();
   const resolved = resolveTarget(inventory, target);
   if (resolved === null) return { error: `No operation bundle or run matches "${target}".` };
-  const keyEpochId = await readKeyEpoch(root);
+  const keyEpochId = await reads.keyEpoch();
   if (keyEpochId === null) return { error: `No readable operation key for ${resolved.runId}.` };
-  const read = await readRunForTarget(root, resolved, keyEpochId);
+  const read = await reads.run(resolved, keyEpochId);
   if (read.status !== "ok") return { error: runReadError(resolved, read) };
   return { resolved, run: read.run };
 }

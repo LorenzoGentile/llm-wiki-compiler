@@ -23,16 +23,24 @@
  * is what stops facts verified under profile B from merging with roster A. After the
  * build, both authorities are RE-READ; a mid-build drift retries for a stable pass and,
  * after {@link MAX_BUILD_ATTEMPTS}, degrades to recorded-only rather than splice.
+ *
+ * ONE BODY. {@link buildWorkflowRunProjectionWith} owns the attempts, the anchor,
+ * the projection and the drift check over {@link RunProjectionReads} (the run read
+ * and the profile load), and takes any provider as a caller-bound HOST callback
+ * ({@link LiveStageHost}). {@link buildWorkflowRunProjection} keeps its signature
+ * and passes the incumbent root readers plus a host that hands the provider the
+ * root, exactly as before; {@link runProjectionReadsOver} composes the two reads
+ * from each one's root-free body. In no package index.
  */
 
 import type { ServerResponse } from "http";
-import { readRun } from "../workflow-history/store.js";
+import { readRun, readRunFrom, type WorkflowRunReads } from "../workflow-history/store.js";
 import { classifyRun, type RunClassification } from "../workflow-history/status.js";
 import { lookupWorkflowDef } from "../workflow-history/definition.js";
 import { workflowDefDigest } from "../profile/workflow-digest.js";
 import { parseGate } from "../workflow-history/gates.js";
 import type { GateKind } from "../workflow-history/gates.js";
-import { loadProfile } from "../profile/load.js";
+import { loadProfile, loadProfileFrom, type EffectiveProfileSources } from "../profile/load.js";
 import { applyLiveStageProvider } from "./workflow-run-facts.js";
 import type { WorkflowRun, WorkflowActorKind, WorkflowEvent } from "../workflow-history/types.js";
 import type { WorkflowDef } from "../profile/types.js";
@@ -325,9 +333,38 @@ type ProjectionAttempt =
       readonly recordedOnly: WorkflowRunProjectionEnvelope;
     };
 
+/** The two reads one projection makes, each asked once per attempt and again for the drift check. No member takes a project root. */
+export interface RunProjectionReads {
+  /** One run, authenticated. */
+  readRun(runId: string): ReturnType<typeof readRun>;
+  /** The effective profile. */
+  loadProfile(): ReturnType<typeof loadProfile>;
+}
+
+/** A caller-bound live provider: verify the recorded rows against the attempt's anchor, within `timeoutMs`. */
+export type LiveStageHost = (
+  recorded: readonly StageProjection[], run: WorkflowRun, anchor: RunProjectionAnchor, timeoutMs: number,
+) => ReturnType<typeof applyLiveStageProvider>;
+
+/** LOCAL DISK. The incumbent root readers for `root`, each called when asked. */
+function diskRunProjectionReads(root: string): RunProjectionReads {
+  return { readRun: (runId) => readRun(root, runId), loadProfile: () => loadProfile(root) };
+}
+
+/** The same reads over the run store's and the profile loader's own seams. Building it does no I/O. */
+export function runProjectionReadsOver(sources: { runs: WorkflowRunReads; profile: EffectiveProfileSources }): RunProjectionReads {
+  return { readRun: (runId) => readRunFrom(sources.runs, runId), loadProfile: () => loadProfileFrom(sources.profile) };
+}
+
+/** The local host for an injected provider: the provider receives `root`, as it always did. */
+function localLiveStageHost(root: string, provider: LiveStageProjectionProvider | undefined): LiveStageHost | undefined {
+  return provider === undefined ? undefined
+    : (recorded, run, anchor, timeoutMs) => applyLiveStageProvider(recorded, provider, root, run, anchor, timeoutMs);
+}
+
 /** True when the run version + profile digest are UNCHANGED since the anchor was taken. */
-async function isStillFresh(root: string, runId: string, anchor: RunProjectionAnchor): Promise<boolean> {
-  const [read, loaded] = await Promise.all([readRun(root, runId), loadProfile(root)]);
+async function isStillFresh(reads: RunProjectionReads, runId: string, anchor: RunProjectionAnchor): Promise<boolean> {
+  const [read, loaded] = await Promise.all([reads.readRun(runId), reads.loadProfile()]);
   return read.status === "ok" && read.run.stateVersion === anchor.stateVersion && loaded.digest === anchor.profileDigest;
 }
 
@@ -338,10 +375,10 @@ async function isStillFresh(root: string, runId: string, anchor: RunProjectionAn
  * recorded-only envelope are returned so the caller can fall back without re-projecting.
  */
 async function projectRunOnce(
-  root: string, workflowId: string, runId: string,
-  provider: LiveStageProjectionProvider | undefined, timeoutMs: number | undefined,
+  reads: RunProjectionReads, workflowId: string, runId: string,
+  live: LiveStageHost | undefined, timeoutMs: number | undefined,
 ): Promise<ProjectionAttempt> {
-  const read = await readRun(root, runId);
+  const read = await reads.readRun(runId);
   if (read.status !== "ok") {
     const detail = read.status === "unavailable" ? read.detail : read.status;
     return { kind: "problem", problem: { workflowId, runId, problem: `run is not readable (${detail})` } };
@@ -350,7 +387,7 @@ async function projectRunOnce(
   if (run.workflowId !== workflowId) {
     return { kind: "problem", problem: { workflowId, runId, problem: `run belongs to workflow "${run.workflowId}", not "${workflowId}"` } };
   }
-  const loaded = await loadProfile(root);
+  const loaded = await reads.loadProfile();
   const anchor: RunProjectionAnchor = { stateVersion: run.stateVersion, profileDigest: loaded.digest };
   const classification = classifyRun(run, loaded.profile);
   const def = lookupWorkflowDef(loaded.profile.workflows, run.workflowId);
@@ -360,8 +397,7 @@ async function projectRunOnce(
   const unlogged = classification === "historical" ? "unknown" : "pending";
   const recorded = stageRoster(run, def).map((entry) => projectRecordedStage(entry.stageId, entry.gate, run, unlogged));
   const providerTimeoutMs = timeoutMs ?? providerTimeoutMsForStageCount(run.stageLog.length);
-  const applied = provider === undefined ? undefined
-    : await applyLiveStageProvider(recorded, provider, root, run, anchor, providerTimeoutMs);
+  const applied = live === undefined ? undefined : await live(recorded, run, anchor, providerTimeoutMs);
   const base = {
     workflowId, runId, stateVersion: run.stateVersion, classification,
     generatedAt: new Date().toISOString(), ...projectedProcessAuthority(run),
@@ -369,7 +405,7 @@ async function projectRunOnce(
   const envelope = applied === undefined ? { ...base, stages: recorded } : { ...base, stages: applied.stages, live: applied.live };
   const drifted: LiveProjectionOutcome = { outcome: "drifted" };
   const recordedOnly = { ...base, stages: recorded, ...(applied === undefined ? {} : { live: drifted }) };
-  return { kind: "ok", stable: await isStillFresh(root, runId, anchor), envelope, recordedOnly };
+  return { kind: "ok", stable: await isStillFresh(reads, runId, anchor), envelope, recordedOnly };
 }
 
 /**
@@ -384,9 +420,17 @@ export async function buildWorkflowRunProjection(
   root: string, workflowId: string, runId: string,
   provider?: LiveStageProjectionProvider, timeoutMs?: number,
 ): Promise<WorkflowRunProjectionEnvelope | WorkflowRunProblem> {
+  return buildWorkflowRunProjectionWith(diskRunProjectionReads(root), workflowId, runId, localLiveStageHost(root, provider), timeoutMs);
+}
+
+/** {@link buildWorkflowRunProjection} over {@link RunProjectionReads}: THE ONE BODY. */
+export async function buildWorkflowRunProjectionWith(
+  reads: RunProjectionReads, workflowId: string, runId: string,
+  live?: LiveStageHost, timeoutMs?: number,
+): Promise<WorkflowRunProjectionEnvelope | WorkflowRunProblem> {
   let recordedFallback: WorkflowRunProjectionEnvelope | undefined;
   for (let attempt = 0; attempt < MAX_BUILD_ATTEMPTS; attempt++) {
-    const outcome = await projectRunOnce(root, workflowId, runId, provider, timeoutMs);
+    const outcome = await projectRunOnce(reads, workflowId, runId, live, timeoutMs);
     if (outcome.kind === "problem") return outcome.problem;
     if (outcome.stable) return outcome.envelope;
     recordedFallback = outcome.recordedOnly;

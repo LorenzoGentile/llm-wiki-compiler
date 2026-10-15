@@ -18,9 +18,16 @@
  * either profile cannot be read, so it is surfaced as a blocking
  * `ProfileDiffProblem` instead of being silently skipped — mirroring
  * `collectEntityPages`. A diff you cannot trust must not look clean.
+ *
+ * ONE BODY: {@link diffProfilesFrom} scans through the shared entity scan's own
+ * {@link LegacyLocalEntityScans} binding ({@link scanEntityDirFrom}); the union
+ * iteration, classification, problems, sort, tally and digests are unchanged.
+ * {@link diffProfiles} keeps its signature and passes the local disk scans.
  */
 
-import { scanEntityDir, type RawEntityScan } from "../wiki/collect.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { scanEntityDirFrom, type RawEntityScan } from "../wiki/collect.js";
 import { isSlugSafe } from "./identity.js";
 import { profileDigest } from "./digest.js";
 import type { ProfilePack, EntityTypeDef } from "./types.js";
@@ -147,13 +154,13 @@ function ownerOf(directory: string, ctx: DiffContext): string {
  * an unreadable directory would look clean when it is not.
  */
 async function classifyDirectory(
-  root: string,
+  source: LegacyLocalEntityScans,
   directory: string,
   ctx: DiffContext,
   pages: PageDisposition[],
   problems: ProfileDiffProblem[],
 ): Promise<void> {
-  const { scans, dirStatus } = await scanEntityDir(root, directory);
+  const { scans, dirStatus } = await scanEntityDirFrom(source, directory);
   if (dirStatus === "invalid") {
     const entityType = ownerOf(directory, ctx);
     problems.push({
@@ -191,6 +198,15 @@ export async function diffProfiles(
   oldProfile: ProfilePack,
   newProfile: ProfilePack,
 ): Promise<ProfileDiffReport> {
+  return diffProfilesFrom(diskLocalEntityScans(root), oldProfile, newProfile);
+}
+
+/** {@link diffProfiles} over the entity scans: THE ONE BODY. Pure read. */
+export async function diffProfilesFrom(
+  source: LegacyLocalEntityScans,
+  oldProfile: ProfilePack,
+  newProfile: ProfilePack,
+): Promise<ProfileDiffReport> {
   const oldOwners = directoryOwners(oldProfile);
   const newOwners = directoryOwners(newProfile);
   const newTypeToDir = new Map([...newOwners].map(([dir, type]) => [type, dir]));
@@ -198,7 +214,7 @@ export async function diffProfiles(
   const pages: PageDisposition[] = [];
   const problems: ProfileDiffProblem[] = [];
   for (const directory of unionDirectories(oldOwners, newOwners)) {
-    await classifyDirectory(root, directory, ctx, pages, problems);
+    await classifyDirectory(source, directory, ctx, pages, problems);
   }
   pages.sort((a, b) => a.directory.localeCompare(b.directory) || a.stem.localeCompare(b.stem));
   const oldDigest = profileDigest(oldProfile);

@@ -14,10 +14,20 @@
  * marker and this path refuses — deleting authority-adjacent state to unblock a queue
  * would be a worse defect than the block.
  *
- * Every unit is classified BEFORE anything is mutated, and the mutation order is
- * chosen so the intent marker is the commit point: the empty `bytes/` directory goes
- * first, so a failure there leaves the unit fully intact and still supersedable,
- * rather than stranding a half-cleared unit whose marker is already gone.
+ * The pass is SEQUENTIAL, one unit at a time, in listing order: each unit is
+ * classified and, only if it is intent-only under the supplied confirmation, cleared
+ * before the next unit is classified. (An earlier version of this header claimed every
+ * unit was classified before ANY mutation; the loop never did that, and the order is
+ * deliberately unchanged here.) Within one unit the mutation order makes the intent
+ * marker the commit point: the empty `bytes/` directory goes first, so a failure there
+ * leaves that unit fully intact and still supersedable, rather than stranding a
+ * half-cleared unit whose marker is already gone.
+ *
+ * ONE BODY. `supersedeIntentOnlyUnitsWith` owns the listing refusal, the per-unit
+ * classification over the observed names, bytes state and self-bound intent, the
+ * confirmation check and the sequence, over {@link IntentSupersessionSteps}. The
+ * observation and the clear (bytes first, intent last) stay physical operations in
+ * `lifecycle-fs/reset-operations`, reached through the local steps.
  */
 
 import {
@@ -52,9 +62,28 @@ function readSelfBoundIntent(
   }
 }
 
+/** What the supersession pass asks of the quarantine registry. No member takes a project root. */
+export interface IntentSupersessionSteps {
+  /** Every quarantine-unit directory id. Local: `listQuarantineUnits(root)`. */
+  listUnits(): ReturnType<typeof listQuarantineUnits>;
+  /** One unit's entry names, `bytes/` state and intent bytes, without mutating. Local: `observeResetIntentUnit`. */
+  observeUnit(unitId: string): Promise<ResetIntentUnitObservation>;
+  /** Clear one intent-only unit: the empty `bytes/` first (when present), the marker last. Local: `clearResetIntentUnit`. */
+  clearUnit(unitId: string, hasEmptyBytesDirectory: boolean): Promise<void>;
+}
+
+/** The local supersession steps for one root, built per call. In no package index. */
+function localIntentSupersessionSteps(root: string): IntentSupersessionSteps {
+  return {
+    listUnits: () => listQuarantineUnits(root),
+    observeUnit: (unitId) => observeResetIntentUnit(root, unitId),
+    clearUnit: (unitId, hasEmptyBytesDirectory) => clearResetIntentUnit(root, unitId, hasEmptyBytesDirectory),
+  };
+}
+
 /** Classify one candidate unit without mutating anything. */
-async function classifyUnit(root: string, unitId: string): Promise<SupersedableUnit> {
-  const observation = await observeResetIntentUnit(root, unitId);
+async function classifyUnit(steps: IntentSupersessionSteps, unitId: string): Promise<SupersedableUnit> {
+  const observation = await steps.observeUnit(unitId);
   if (observation.status !== "ok") return { kind: "unavailable" };
   if (!observation.names.includes(PRE_PLAN_INTENT_LEAF)) return { kind: "materialized" };
   const extra = observation.names.filter((name) =>
@@ -66,15 +95,6 @@ async function classifyUnit(root: string, unitId: string): Promise<SupersedableU
   const intent = readSelfBoundIntent(observation, unitId);
   if (intent === null) return { kind: "unavailable" };
   return { kind: "intent-only", intent, hasEmptyBytesDirectory };
-}
-
-/**
- * Clear one classified intent-only unit. The empty `bytes/` directory is removed
- * first and the intent marker last, so the marker's absence is the single durable
- * signal that this unit was superseded.
- */
-async function clearIntentOnlyUnit(root: string, unitId: string, hasEmptyBytesDirectory: boolean): Promise<void> {
-  await clearResetIntentUnit(root, unitId, hasEmptyBytesDirectory);
 }
 
 /**
@@ -91,17 +111,30 @@ export async function supersedeIntentOnlyUnitsLocked(
   confirmation: string,
   requiredConfirmationFor: (reason: ResetIntentV1["reason"]) => string,
 ): Promise<string[]> {
-  const listing = await listQuarantineUnits(root);
+  return supersedeIntentOnlyUnitsWith(localIntentSupersessionSteps(root), confirmation, requiredConfirmationFor);
+}
+
+/**
+ * {@link supersedeIntentOnlyUnitsLocked} over the supersession steps: the one body.
+ * The empty `bytes/` directory is cleared first and the intent marker last (inside the
+ * clear step), so the marker's absence is the single durable signal of supersession.
+ */
+export async function supersedeIntentOnlyUnitsWith(
+  steps: IntentSupersessionSteps,
+  confirmation: string,
+  requiredConfirmationFor: (reason: ResetIntentV1["reason"]) => string,
+): Promise<string[]> {
+  const listing = await steps.listUnits();
   if (listing.status !== "ok") throw new Error("quarantine registry is unreadable; refusing to supersede");
   const superseded: string[] = [];
   for (const unitId of listing.unitIds) {
-    const unit = await classifyUnit(root, unitId);
+    const unit = await classifyUnit(steps, unitId);
     if (unit.kind !== "intent-only") continue;
     // The marker's own confirmation/reason pairing is the PARSER's contract, so an
     // inconsistent marker never reaches here as intent-only. What remains for this
     // caller is that they supplied the destructive confirmation the reason demands.
     if (confirmation !== requiredConfirmationFor(unit.intent.reason)) continue;
-    await clearIntentOnlyUnit(root, unitId, unit.hasEmptyBytesDirectory);
+    await steps.clearUnit(unitId, unit.hasEmptyBytesDirectory);
     superseded.push(unitId);
   }
   return superseded;

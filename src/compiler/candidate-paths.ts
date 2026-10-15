@@ -16,6 +16,7 @@
 
 import { Buffer } from "node:buffer";
 import { confinedCandidateFilePath } from "./candidate-store-paths.js";
+import type { LegacyLocalRecordDirs, LocalRecordLeaf } from "../storage/legacy-local-record-dirs.js";
 import { isSafeFilenameComponent } from "../profile/identity.js";
 import { isWellFormedUnicode } from "../utils/well-formed-unicode.js";
 import {
@@ -95,6 +96,21 @@ function unsafeCandidateId(id: string): Error {
 async function resolveCandidatePath(root: string, dir: string, id: string): Promise<string> {
   assertCandidateId(id);
   return confinedCandidateFilePath(root, dir, id, unsafeCandidateId);
+}
+
+/** Extension of a candidate's JSON leaf. */
+const CANDIDATE_LEAF_EXT = ".json";
+
+/**
+ * A pending candidate's leaf, resolved through `dirs` with the same checks, in
+ * the same order, as {@link candidatePath}: the id assertion, the filename
+ * check, then the directory check and confinement the binding owns. A failed
+ * resolution rejects; it is never reported as a missing candidate.
+ */
+export async function candidateLeafFrom(dirs: LegacyLocalRecordDirs, id: string): Promise<LocalRecordLeaf> {
+  assertCandidateId(id);
+  if (!isSafeFilenameComponent(id)) throw unsafeCandidateId(id);
+  return dirs.leaf(CANDIDATES_DIR, `${id}${CANDIDATE_LEAF_EXT}`);
 }
 
 /** Absolute confined path to a candidate's JSON file. */

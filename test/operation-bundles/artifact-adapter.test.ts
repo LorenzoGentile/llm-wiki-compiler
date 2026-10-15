@@ -13,27 +13,12 @@ import { artifactAdapter } from "../../src/operation-bundles/adapters/artifact.j
 import { appendBoundEventLocked } from "../../src/events/store.js";
 import { artifactPaths, hashArtifactBody, writeArtifactFiles, type ArtifactManifest } from "../../src/artifacts/store.js";
 import { writeProfileFile } from "../fixtures/profile-fixtures.js";
-import type { ProfilePack } from "../../src/profile/types.js";
-import type { ArtifactOperationMutation } from "../../src/operation-bundles/types.js";
-import { digestOf, makeBinding, makeContext, publishPayload, type BindingSet } from "./adapter-fixtures.js";
+import {
+  ARTIFACT_BODY as BODY, ARTIFACT_PROFILE as PROFILE, artifactMutation, makeBinding, makeContext, publishPayload, type BindingSet,
+} from "./adapter-fixtures.js";
 
-const PROFILE: ProfilePack = {
-  schemaVersion: 1, profileId: "research", entities: { note: { directory: "wiki/note" } },
-  artifacts: { note: { fileName: "note.txt", contentKind: "text", maxBytes: 65_536 } },
-};
-
-const BODY = "note contents\n";
 const TYPE = "note";
 const SLUG = "a";
-
-function artifactMutation(set: BindingSet): ArtifactOperationMutation {
-  return {
-    kind: "artifact", index: 0, mutationId: set.onDisk.mutationId, dependsOn: [], reconciliationRefs: [],
-    operation: "create", target: { artifactType: TYPE, logicalId: SLUG }, payloadRef: hashArtifactBody(BODY),
-    precondition: { kind: "absent" },
-    postcondition: { digest: digestOf(Buffer.from(BODY, "utf8")), manifestDigest: digestOf(Buffer.from("m")), auditDigest: digestOf(Buffer.from("a")) },
-  };
-}
 
 let root = "";
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "art-adapter-")); await writeProfileFile(root, PROFILE); });

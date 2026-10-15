@@ -25,6 +25,15 @@
  * resolver closes this via (1) lexical + ancestor confine, (2) mkdir, (3) TOCTOU
  * re-check of the post-mkdir realpath. The read resolver applies (1) + a TOCTOU
  * re-check after the lstat-based existence probe, but never runs (2).
+ *
+ * STORAGE. Each resolver has ONE body, `…From(io, root)`, over the raw probes of
+ * {@link PrivateDirIo}; the exported root forms keep their signatures and pass
+ * {@link diskPrivateDirIo}, whose members call the incumbent primitives at call
+ * time, so module spies and mocks still intercept them. The bodies keep every
+ * decision: the typed error, the `ENOENT`-means-absent rule, the realpath root
+ * fallback and the post-existence re-check. The escape verdict of the lexical +
+ * ancestor confine stays inside the shared `confineUnderRoot` primitive, reached
+ * through the same `confineTarget` probe the page and journal contracts use.
  */
 
 import { mkdir } from "fs/promises";
@@ -47,6 +56,34 @@ export class PrivateDirConfinementError extends Error {
   }
 }
 
+/**
+ * The RAW probes the two resolvers ask for. Each gives a physical answer only
+ * and REJECTS raw (`safeRealPath` answers null instead); none is hosted,
+ * access-controlled or durable, and none is in any package index.
+ */
+export interface PrivateDirIo {
+  /**
+   * `target` resolved under the realpath of `root`, lexically and against its
+   * nearest existing ancestor, without requiring it to exist. REJECTS when it,
+   * or a linked ancestor, escapes. Disk: `confineUnderRoot(target, root, { mustExist: false })`.
+   */
+  confineTarget(target: string, root: string): Promise<string>;
+  /** `dir` and any missing parents. REJECTS raw. Disk: `mkdir(dir, { recursive: true })`. */
+  makeDirectoryTree(dir: string): Promise<void>;
+  /** `location` with every link resolved, or null on ANY failure. Disk: `safeRealpath(location)`, no options. */
+  safeRealPath(location: string): Promise<string | null>;
+  /** Resolves when ANYTHING is at `location`, a final link NOT followed; REJECTS raw, `ENOENT` included. Disk: `lstat(location)`. */
+  probeEntryNoFollow(location: string): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent primitives, called at call time; no state, frozen. In no package index. */
+export const diskPrivateDirIo: PrivateDirIo = Object.freeze({
+  confineTarget: (target: string, root: string) => confineUnderRoot(target, root, { mustExist: false }),
+  makeDirectoryTree: async (dir: string) => { await mkdir(dir, { recursive: true }); },
+  safeRealPath: (location: string) => safeRealpath(location),
+  probeEntryNoFollow: async (location: string) => { await lstat(location); },
+});
+
 // `confineUnderRoot` resolves its target via `path.resolve(realpath(root), target)`,
 // so the target is passed RELATIVE to root (not as an absolute path built from the
 // pre-realpath root) — an absolute `<unrealpath-root>/.llmwiki` would be judged
@@ -58,9 +95,9 @@ export class PrivateDirConfinementError extends Error {
  * confined absolute path. Throws {@link PrivateDirConfinementError} on escape.
  * Shared by both resolvers so the confinement logic is never duplicated.
  */
-async function confineLlmwikiDir(root: string): Promise<string> {
+async function confineLlmwikiDir(io: PrivateDirIo, root: string): Promise<string> {
   try {
-    return await confineUnderRoot(LLMWIKI_DIR, root, { mustExist: false });
+    return await io.confineTarget(LLMWIKI_DIR, root);
   } catch (err) {
     throw new PrivateDirConfinementError((err as Error).message);
   }
@@ -71,8 +108,8 @@ async function confineLlmwikiDir(root: string): Promise<string> {
  * `confined` dir still sits inside `realRoot`. A symlink swapped in between
  * the lstat/mkdir and this check would escape — fail closed.
  */
-async function recheckRealpath(confined: string, realRoot: string): Promise<string> {
-  const realDir = await safeRealpath(confined);
+async function recheckRealpath(io: PrivateDirIo, confined: string, realRoot: string): Promise<string> {
+  const realDir = await io.safeRealPath(confined);
   if (realDir === null || !isInsideDir(realDir, realRoot)) {
     throw new PrivateDirConfinementError(`path escapes project root: ${LLMWIKI_DIR}`);
   }
@@ -92,10 +129,15 @@ async function recheckRealpath(confined: string, realRoot: string): Promise<stri
  * @throws {PrivateDirConfinementError} When `.llmwiki` (or an ancestor) escapes the project root.
  */
 export async function resolveConfinedPrivateDir(root: string): Promise<string> {
-  const confined = await confineLlmwikiDir(root);
-  await mkdir(confined, { recursive: true });
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
-  return recheckRealpath(confined, realRoot);
+  return resolveConfinedPrivateDirFrom(diskPrivateDirIo, root);
+}
+
+/** THE ONE BODY of {@link resolveConfinedPrivateDir}, over the raw probes it is handed. */
+export async function resolveConfinedPrivateDirFrom(io: PrivateDirIo, root: string): Promise<string> {
+  const confined = await confineLlmwikiDir(io, root);
+  await io.makeDirectoryTree(confined);
+  const realRoot = (await io.safeRealPath(root)) ?? path.resolve(root);
+  return recheckRealpath(io, confined, realRoot);
 }
 
 /**
@@ -117,13 +159,18 @@ export async function resolveConfinedPrivateDir(root: string): Promise<string> {
  * @throws {PrivateDirConfinementError} When `.llmwiki` (or an ancestor) escapes the project root.
  */
 export async function resolveExistingConfinedPrivateDir(root: string): Promise<string | null> {
-  const confined = await confineLlmwikiDir(root);
+  return resolveExistingConfinedPrivateDirFrom(diskPrivateDirIo, root);
+}
+
+/** THE ONE BODY of {@link resolveExistingConfinedPrivateDir}, over the raw probes it is handed. */
+export async function resolveExistingConfinedPrivateDirFrom(io: PrivateDirIo, root: string): Promise<string | null> {
+  const confined = await confineLlmwikiDir(io, root);
   try {
-    await lstat(confined); // do NOT follow symlinks
+    await io.probeEntryNoFollow(confined); // do NOT follow symlinks
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
-  const realRoot = (await safeRealpath(root)) ?? path.resolve(root);
-  return recheckRealpath(confined, realRoot);
+  const realRoot = (await io.safeRealPath(root)) ?? path.resolve(root);
+  return recheckRealpath(io, confined, realRoot);
 }

@@ -20,6 +20,14 @@
  * and the transition is re-drivable — the evidence store is create-only and
  * content-addressed, so an identical re-derivation lands as `"same"` and the
  * append proceeds from the unchanged `running` predecessor.
+ *
+ * ONE BODY, {@link finalizePreparationForHandoffWith}, over {@link FinalizationSteps}
+ * (the blocking lock, the run, the cancellation poll, the plan's manifest, the
+ * evidence writer, the projected append) and an input that carries no root. The
+ * lock is the one MECHANISM the steps carry. The root form keeps its signature,
+ * captures its input exactly as before and passes the local steps for the
+ * captured root, which call the incumbents when asked;
+ * {@link finalizationStepsOver} composes them from each one's own body.
  */
 
 import { createHash } from "node:crypto";
@@ -29,19 +37,31 @@ import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
 import type { Sha256Digest } from "../capability-providers/types.js";
 import { releaseLock } from "../utils/lock.js";
 import { assertCompletenessPermitsSuccess, toRunCompletenessRecord, type PreparationCompletenessV1 } from "./completeness.js";
-import { preparationCancellationRequested } from "./cancellation.js";
-import { writePreparationEvidenceCreateOnly } from "./evidence-store.js";
+import {
+  preparationCancellationRequested, preparationCancellationRequestedFrom,
+  type PreparationCancelLeaves, type PreparationCancellationProbe,
+} from "./cancellation.js";
+import {
+  writePreparationEvidenceCreateOnly, writePreparationEvidenceCreateOnlyWith,
+  type EvidenceWriteResult, type PreparationEvidenceLocation, type PreparationEvidenceWriteSteps,
+} from "./evidence-store.js";
 import { ownerProcessIsLive } from "./attempts/lease.js";
 import {
   MATERIALIZATION_MANIFEST_KIND, serializeMaterializationManifest,
   type MaterializationResultV1, type PreparationHandoffMaterializationV1,
 } from "./materialization.js";
-import { readPreparationManifest } from "./manifest-store.js";
+import {
+  readPreparationManifest, readPreparationManifestFrom, type PreparationManifestLeafReads, type PreparationManifestRead,
+} from "./manifest-store.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
-import { appendProjectedTransitionLocked, readPreparationRun } from "./run-store.js";
+import {
+  appendPreparationTransitionWith, appendProjectedTransitionLocked, readPreparationRun, readPreparationRunFrom,
+  type PreparationRunContentProjector, type PreparationRunLeafReads, type PreparationRunRead, type PreparationRunWriteSteps,
+} from "./run-store.js";
 import type { EvidenceRefV1 } from "./types.js";
 import type {
-  PhaseSummaryV1, PreparationPrincipalV1, PreparationRunBinding, PreparationRunV1,
+  AppendPreparationTransitionInput, PhaseSummaryV1, PreparationPrincipalV1, PreparationRunBinding,
+  PreparationRunPredecessor, PreparationRunV1,
 } from "./run-types.js";
 
 /** Input to one finalization: durable identities plus the captured material. */
@@ -67,6 +87,55 @@ export type FinalizationResultV1 =
   | { readonly status: "finalized"; readonly run: PreparationRunV1; readonly manifestDigest: string }
   | { readonly status: "refused"; readonly reason: string };
 
+/** What the finalization body reads off its input: everything but the project root. */
+export type FinalizationBodyInputV1 = Omit<FinalizationInputV1, "root">;
+
+/** What one finalization asks for, in order. No member takes a project root. */
+export interface FinalizationSteps {
+  /** The blocking project lock: a MECHANISM, no decision. */
+  readonly lock: { acquire(): Promise<void>; release(): Promise<void> };
+  /** The run at `binding`, authenticated. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** Whether a valid cancellation is requested for the run. */
+  readonly cancellationRequested: PreparationCancellationProbe;
+  /** The plan's immutable manifest. */
+  readManifest(workspaceId: string, preparationId: PreparationRunBinding["preparationId"]): Promise<PreparationManifestRead>;
+  /** Create one immutable evidence object, or prove its exact replay. */
+  writeEvidence(location: PreparationEvidenceLocation, bytes: Buffer): Promise<EvidenceWriteResult>;
+  /** The projected append fenced to `expected`. */
+  appendProjected(
+    binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+    input: AppendPreparationTransitionInput, project: PreparationRunContentProjector,
+  ): Promise<PreparationRunV1>;
+}
+
+/** LOCAL DISK. The incumbent lock, readers and writers for `root`, each called when asked. */
+function diskFinalizationSteps(root: string): FinalizationSteps {
+  return {
+    lock: { acquire: () => acquireMutationLockBlocking(root, "ordinary"), release: () => releaseLock(root) },
+    readRun: (binding) => readPreparationRun(root, binding),
+    cancellationRequested: (workspaceId, runId) => preparationCancellationRequested(root, workspaceId, runId),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    writeEvidence: (location, bytes) => writePreparationEvidenceCreateOnly(root, location, bytes),
+    appendProjected: (binding, expected, input, project) => appendProjectedTransitionLocked(root, binding, expected, input, project),
+  };
+}
+
+/** The same steps over each store's own body, under the caller's `lock`. Building it does no I/O. */
+export function finalizationStepsOver(sources: {
+  runs: PreparationRunLeafReads; advisories: PreparationCancelLeaves; manifests: PreparationManifestLeafReads;
+  evidence: PreparationEvidenceWriteSteps; writes: PreparationRunWriteSteps;
+}, lock: FinalizationSteps["lock"]): FinalizationSteps {
+  return {
+    lock,
+    readRun: (binding) => readPreparationRunFrom(sources.runs, binding),
+    cancellationRequested: (workspaceId, runId) => preparationCancellationRequestedFrom(sources.advisories, workspaceId, runId),
+    readManifest: (workspaceId, preparationId) => readPreparationManifestFrom(sources.manifests, workspaceId, preparationId),
+    writeEvidence: (location, bytes) => writePreparationEvidenceCreateOnlyWith(sources.evidence, location, bytes),
+    appendProjected: (binding, expected, input, project) => appendPreparationTransitionWith(sources.writes, binding, expected, input, project),
+  };
+}
+
 /** Phase-summary states that permit finalization (settled without fault). */
 const FINALIZABLE_PHASE_STATES = new Set<PhaseSummaryV1["state"]>([
   "succeeded", "succeeded-with-warnings", "skipped-optional",
@@ -90,10 +159,31 @@ function blocksFinalization(summary: PhaseSummaryV1): boolean {
 export async function finalizePreparationForHandoff(
   callerInput: FinalizationInputV1,
 ): Promise<FinalizationResultV1> {
-  // Capture identities SYNCHRONOUSLY before the first await: the manifest
-  // stamps grantDigest and actor from these, and a caller mutating a retained
-  // principal after invocation must not change what durable evidence records.
-  const input: FinalizationInputV1 = {
+  // The root comes off the SAME synchronous capture the body takes, read once.
+  const input = capturedFinalizationInput(callerInput);
+  return finalizePreparationForHandoffWith(diskFinalizationSteps(input.root), input);
+}
+
+/** {@link finalizePreparationForHandoff} over {@link FinalizationSteps}: THE ONE BODY. */
+export async function finalizePreparationForHandoffWith(
+  steps: FinalizationSteps, callerInput: FinalizationBodyInputV1,
+): Promise<FinalizationResultV1> {
+  const input = capturedFinalizationInput(callerInput);
+  await steps.lock.acquire();
+  try {
+    return await finalizeLocked(steps, input);
+  } finally {
+    await steps.lock.release();
+  }
+}
+
+/**
+ * Capture identities SYNCHRONOUSLY before the first await: the manifest stamps
+ * grantDigest and actor from these, and a caller mutating a retained principal
+ * after invocation must not change what durable evidence records.
+ */
+function capturedFinalizationInput<T extends FinalizationBodyInputV1>(callerInput: T): T {
+  return {
     ...callerInput,
     binding: { ...callerInput.binding },
     principal: { ...callerInput.principal },
@@ -103,23 +193,17 @@ export async function finalizePreparationForHandoff(
     },
     payloads: new Map(callerInput.payloads),
   };
-  await acquireMutationLockBlocking(input.root, "ordinary");
-  try {
-    return await finalizeLocked(input);
-  } finally {
-    await releaseLock(input.root);
-  }
 }
 
 /** The locked body: precondition sweep, evidence persist, transition append. */
-async function finalizeLocked(input: FinalizationInputV1): Promise<FinalizationResultV1> {
-  const read = await readPreparationRun(input.root, input.binding);
+async function finalizeLocked(steps: FinalizationSteps, input: FinalizationBodyInputV1): Promise<FinalizationResultV1> {
+  const read = await steps.readRun(input.binding);
   if (read.status !== "ok") return refusal(`run unreadable: ${read.status}`);
   const run = read.run;
-  const refused = await finalizationRefusal(input, run);
+  const refused = await finalizationRefusal(steps, input, run);
   if (refused !== null) return refused;
 
-  const limits = await declaredLimits(input);
+  const limits = await declaredLimits(steps, input);
   if ("status" in limits) return limits;
   const manifest = coreStampedManifest(input, run.runId);
   const bytes = serializeMaterializationManifest(manifest);
@@ -130,12 +214,12 @@ async function finalizeLocked(input: FinalizationInputV1): Promise<FinalizationR
 
   for (const [digest, payload] of input.payloads) {
     void digest;
-    await writePreparationEvidenceCreateOnly(input.root, evidenceLocation(input), payload);
+    await steps.writeEvidence(evidenceLocation(input), payload);
   }
-  await writePreparationEvidenceCreateOnly(input.root, evidenceLocation(input), bytes);
+  await steps.writeEvidence(evidenceLocation(input), bytes);
   const manifestDigest = createHash("sha256").update(bytes).digest("hex");
-  const next = await appendProjectedTransitionLocked(
-    input.root, input.binding, preparationRunPredecessor(run),
+  const next = await steps.appendProjected(
+    input.binding, preparationRunPredecessor(run),
     { type: "handoff-ready", stateAfter: "handoff-ready", payload: { kind: "none" }, actor: input.principal, at: input.at },
     finalizationProjector(input, manifestDigest, bytes.byteLength),
   );
@@ -144,14 +228,14 @@ async function finalizeLocked(input: FinalizationInputV1): Promise<FinalizationR
 
 /** Every precondition, re-checked under the lock; `null` means clear to go. */
 async function finalizationRefusal(
-  input: FinalizationInputV1, run: PreparationRunV1,
+  steps: FinalizationSteps, input: FinalizationBodyInputV1, run: PreparationRunV1,
 ): Promise<FinalizationResultV1 | null> {
   if (run.state !== "running") return refusal(`run state is ${run.state}, not running`);
   if (run.executionOwner !== undefined) {
     return refusal(ownerProcessIsLive(run.executionOwner)
       ? "an attempt lease is live" : "a dead attempt lease awaits recovery");
   }
-  if (await preparationCancellationRequested(input.root, input.binding.workspaceId, run.runId)) {
+  if (await steps.cancellationRequested(input.binding.workspaceId, run.runId)) {
     return refusal("a cancellation is pending");
   }
   if (run.phaseSummaries.length === 0) return refusal("no phase has settled");
@@ -169,9 +253,9 @@ async function finalizationRefusal(
 
 /** The plan's declared materialization limits; refusal when not runner-managed. */
 async function declaredLimits(
-  input: FinalizationInputV1,
+  steps: FinalizationSteps, input: FinalizationBodyInputV1,
 ): Promise<{ manifestBytes: number; payloadRefs: number; payloadBytes: number } | FinalizationResultV1> {
-  const manifest = await readPreparationManifest(input.root, input.binding.workspaceId, input.binding.preparationId);
+  const manifest = await steps.readManifest(input.binding.workspaceId, input.binding.preparationId);
   if (manifest.status !== "ok") return refusal(`preparation manifest unreadable: ${manifest.status}`);
   const capacity = manifest.manifest.plan.outputContract.handoffCapacity;
   const manifestBytes = capacity?.maximumMaterializationManifestBytes;
@@ -185,7 +269,7 @@ async function declaredLimits(
 
 /** Enforce the declared limits again at write time — never an over-budget write. */
 function budgetRefusal(
-  bytes: Buffer, input: FinalizationInputV1,
+  bytes: Buffer, input: FinalizationBodyInputV1,
   limits: { manifestBytes: number; payloadRefs: number; payloadBytes: number },
 ): FinalizationResultV1 | null {
   if (bytes.byteLength > limits.manifestBytes) {
@@ -208,7 +292,7 @@ function budgetRefusal(
  * extra entry would be evidence bytes the declared budget never accounted for
  * (adversarial round 2: a 100 KB orphan rode past a 64 KB budget this way).
  */
-function payloadCoverageRefusal(input: FinalizationInputV1): FinalizationResultV1 | null {
+function payloadCoverageRefusal(input: FinalizationBodyInputV1): FinalizationResultV1 | null {
   const referenced = new Set(input.result.payloadRefs.map((ref) => ref.digest));
   for (const supplied of input.payloads.keys()) {
     if (!referenced.has(supplied)) return refusal(`payload ${supplied} is supplied but unreferenced`);
@@ -226,7 +310,7 @@ function payloadCoverageRefusal(input: FinalizationInputV1): FinalizationResultV
 
 /** Build the manifest with the two core-stamped authority fields (§6). */
 function coreStampedManifest(
-  input: FinalizationInputV1, runId: string,
+  input: FinalizationBodyInputV1, runId: string,
 ): PreparationHandoffMaterializationV1 {
   return {
     schemaVersion: 1,
@@ -245,8 +329,8 @@ function coreStampedManifest(
 
 /** Attach the manifest ref, payload refs, completeness, and warnings. */
 function finalizationProjector(
-  input: FinalizationInputV1, manifestDigest: string, manifestBytes: number,
-): Parameters<typeof appendProjectedTransitionLocked>[4] {
+  input: FinalizationBodyInputV1, manifestDigest: string, manifestBytes: number,
+): PreparationRunContentProjector {
   const completeness = input.result.completeness as PreparationCompletenessV1;
   return (next) => ({
     ...next,
@@ -265,7 +349,7 @@ function finalizationProjector(
 
 /** The manifest's own evidence ref — the exactly-one restart anchor. */
 function manifestRef(
-  digest: string, byteCount: number, input: FinalizationInputV1,
+  digest: string, byteCount: number, input: FinalizationBodyInputV1,
 ): EvidenceRefV1 {
   // Run-attached refs carry the PREFIXED canonical digest form (the run
   // parser enforces it); the bare hex remains the evidence store's CAS key.
@@ -280,7 +364,7 @@ function manifestRef(
 
 /** One payload object's evidence ref, mirrored from its materialized ref. */
 function payloadEvidenceRef(
-  ref: MaterializationResultV1["payloadRefs"][number], input: FinalizationInputV1,
+  ref: MaterializationResultV1["payloadRefs"][number], input: FinalizationBodyInputV1,
 ): EvidenceRefV1 {
   return {
     kind: "materialization-payload", mediaType: ref.mediaType,
@@ -292,7 +376,7 @@ function payloadEvidenceRef(
 }
 
 /** Evidence location for this run's preparation. */
-function evidenceLocation(input: FinalizationInputV1): { workspaceId: string; preparationId: PreparationRunBinding["preparationId"] } {
+function evidenceLocation(input: FinalizationBodyInputV1): { workspaceId: string; preparationId: PreparationRunBinding["preparationId"] } {
   return { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId };
 }
 

@@ -10,19 +10,25 @@
  * compensator is a closed function on the core adapter object (never manifest
  * code); its outcome is durable by `opc_` identity and observed before and after,
  * so a crash resumes idempotently and a conflict or unavailable read parks.
+ *
+ * ONE BODY. {@link compensateOperationBundleWith} owns the gate and the reverse
+ * order over the session's `OperationRunStores` (`run-session.ts`): every
+ * transition, evidence blob and the advisory removal go through them, none
+ * taking a project root. {@link compensateOperationBundleLocked} keeps its
+ * signature and passes the disk stores. The compensators and observers are the
+ * injected runtime's adapters.
  */
 
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { requireOperationAdapter } from "./adapter-registry.js";
-import { removeCancelRequestLocked } from "./cancel-request.js";
 import type { AdapterContext } from "./adapter-types.js";
 import { currentApplyOwner } from "./apply-owner.js";
 import type { OperationAuthoritySnapshot } from "./authority.js";
-import { writeRunEvidenceCreateOnly } from "./evidence-store.js";
+import { buildAdapterContext, computeAuthoritySnapshot } from "./executor.js";
 import {
-  appendRunStep, buildAdapterContext, computeAuthoritySnapshot, loadRunSession, runResult,
-  type ApproveOperationBundleRequest, type OperationActionResult, type RunSession,
-} from "./executor.js";
+  appendRunStep, diskOperationRunStores, loadRunSessionWith, runResult,
+  type ApproveOperationBundleRequest, type OperationActionResult, type OperationRunStores, type RunSession,
+} from "./run-session.js";
 import { compensationId, type CompensationId } from "./ids.js";
 import type { OperationEvidenceReference, OperationRun } from "./run-types.js";
 import type { OperationMutation } from "./types.js";
@@ -53,7 +59,7 @@ function hasCompensator(run: OperationRun, session: RunSession, mutation: Operat
 /** Persist bounded compensation evidence out-of-line for a durable outcome. */
 async function compensationEvidence(session: RunSession, mutation: OperationMutation, status: "completed" | "failed"): Promise<OperationEvidenceReference> {
   const bytes = canonicalBytes({ compensationId: compensationId(mutation.mutationId), mutationId: mutation.mutationId, status });
-  return writeRunEvidenceCreateOnly(session.root, {
+  return session.stores.writeEvidence({
     workspaceId: session.manifest.workspaceId, runId: session.binding.runId, type: mutation.kind, provenance: "compensate",
   }, Buffer.from(bytes));
 }
@@ -125,7 +131,14 @@ async function runOneCompensation(session: RunSession, snapshot: OperationAuthor
  * run without a partial or false compensation.
  */
 export async function compensateOperationBundleLocked(root: string, request: ApproveOperationBundleRequest, trigger: CompensationTrigger): Promise<OperationActionResult> {
-  const loaded = await loadRunSession(root, request);
+  return compensateOperationBundleWith(diskOperationRunStores(root), request, trigger);
+}
+
+/** {@link compensateOperationBundleLocked} over {@link OperationRunStores}: THE ONE BODY. The caller holds the project lock. */
+export async function compensateOperationBundleWith(
+  stores: OperationRunStores, request: ApproveOperationBundleRequest, trigger: CompensationTrigger,
+): Promise<OperationActionResult> {
+  const loaded = await loadRunSessionWith(stores, request);
   if (loaded.status === "problem") return loaded.result;
   const { session } = loaded;
   let run = loaded.run;
@@ -149,6 +162,6 @@ export async function compensateOperationBundleLocked(root: string, request: App
   }
   run = await appendRunStep(session, run, { kind: "compensated" });
   // Settlement complete: the lock holder removes the non-authoritative advisory file.
-  if (trigger === "cancellation") await removeCancelRequestLocked(session.root, session.manifest.workspaceId, session.binding.runId);
+  if (trigger === "cancellation") await session.stores.removeCancel(session.manifest.workspaceId, session.binding.runId);
   return runResult(run);
 }

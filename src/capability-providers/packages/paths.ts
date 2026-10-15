@@ -400,3 +400,22 @@ function existsOrThrow(error: unknown): void {
 function rootError(): Error {
   return new Error("provider operator root is unavailable or unauthorized");
 }
+
+/**
+ * Create (or re-verify) one owner-private directory outside any project, under
+ * the same ancestor-ownership and no-symlink rules the provider roots use.
+ *
+ * Exported for host-authoritative state that is NOT a provider store but needs
+ * the same guarantee: every existing ancestor is a real directory owned by this
+ * user (or root) and not writable by others, and the leaf is `0700`.
+ *
+ * @param target - Absolute path of the directory to create or verify.
+ * @returns The directory's real path.
+ */
+export async function ensureOwnerPrivateDirectory(target: string): Promise<string> {
+  if (!path.isAbsolute(target)) throw rootError();
+  await validateAncestorChain(target);
+  await createPrivateRoot(target, await captureNearestAncestor(target));
+  await validateAncestorChain(target);
+  return realpath(target);
+}

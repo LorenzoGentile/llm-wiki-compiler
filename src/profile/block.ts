@@ -12,26 +12,46 @@
  * omits the `profile` key entirely and its default envelope is unchanged. The
  * built-in is identified by `loadedFrom === null` (never by `profileId`), with
  * a digest cross-check as defense-in-depth against a future loader change.
+ *
+ * ONE BODY: {@link collectProfileSummary} runs {@link collectProfileSummaryFrom}
+ * over local-disk {@link ProfileSummarySources}. The default gate, the order of
+ * the reads, which failure becomes which problem and which rejects, the cap and
+ * every "omit when empty" rule are decided in this file; the sources only look.
+ * Artifact health is read through sources too: it scans, reads the relation
+ * store and asks for the real path through the same objects. What a pinned
+ * ref resolves to is worked out by the resolver's one body over the artifact
+ * store's leaf reads, {@link ProfileSummarySources.artifacts}. Whether a run
+ * vouches for it is worked out by the verifier's one body over the
+ * preparation store's leaf reads, {@link ProfileSummarySources.provenance}.
+ * The lifecycle read under them stays ROOT-BOUND DISK AUTHORITY on disk: a
+ * named deferment, not made neutral.
  */
 
-import { loadProfile } from "./load.js";
-import { collectEntityPages, collectEntitySummary } from "./collect.js";
+import { diskEffectiveProfileSources, loadProfileFrom, type EffectiveProfileSources } from "./load.js";
+import { collectEntityPagesFrom, collectEntitySummaryFrom } from "./collect.js";
 import type { EntityProblem } from "./collect.js";
 import { DEFAULT_PROFILE } from "./default.js";
 import { profileDigest } from "./digest.js";
 import { toEntityProblemView } from "./types.js";
-import { collectStandingRelationProblems } from "./relation-standing.js";
-import { artifactProblemViews, collectArtifactRefPageSources } from "./artifact-lint.js";
+import { collectStandingRelationProblemsFrom } from "./relation-standing.js";
+import { diskEntityPageReads, type EntityPageReads } from "./lifecycle-read.js";
+import {
+  artifactProblemViewsFrom, collectArtifactRefPageSourcesFrom, diskArtifactHealthSources,
+} from "./artifact-lint.js";
+import type { ArtifactStoreReads } from "../artifacts/resolve.js";
+import type { PreparationStoreLeafReads } from "../preparations/store-leaf-reads.js";
 import type { EntityPage, EntityProblemView, EntityTypeDef, LoadedProfile } from "./types.js";
-import { scanEntityDir } from "../wiki/collect.js";
+import { scanEntityDirFrom } from "../wiki/collect.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
 import { safeRealpath } from "../utils/path-confine.js";
-import { readRelations } from "../relations/store-read.js";
+import { readRelationsFrom } from "../relations/store-read.js";
 import { validateRelationAgainstProfile } from "../relations/relation-contract.js";
 import { RelationStoreCorruptError, RelationStoreTooNewError, RelationStoreSymlinkError } from "../relations/types.js";
-import { GraphDirConfinementError } from "../utils/jsonl-store.js";
+import { diskGraphStoreReads, GraphDirConfinementError, type GraphStoreReads } from "../utils/jsonl-store.js";
 import { PrivateDirConfinementError } from "../utils/private-dir.js";
 import type { RelationRef } from "../relations/types.js";
-import { readEvents } from "../events/store-read.js";
+import { diskEventReadSources, readEventsFrom, type EventReadSources } from "../events/store-read.js";
 import { EventStoreCorruptError, EventStoreTooNewError, EventStoreSymlinkError, EventStoreFullError } from "../events/types.js";
 
 /**
@@ -56,7 +76,15 @@ import { EventStoreCorruptError, EventStoreTooNewError, EventStoreSymlinkError, 
 export async function loadNonDefaultProfile(
   root: string,
 ): Promise<LoadedProfile | undefined> {
-  const loaded = await loadProfile(root);
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return loadNonDefaultProfileFrom(diskEffectiveProfileSources(root));
+}
+
+/** {@link loadNonDefaultProfile} over the profile sources: THE ONE BODY. One load, then the one gate. */
+export async function loadNonDefaultProfileFrom(
+  sources: EffectiveProfileSources,
+): Promise<LoadedProfile | undefined> {
+  const loaded = await loadProfileFrom(sources);
   const isBuiltInDefault =
     loaded.loadedFrom === null && loaded.digest === profileDigest(DEFAULT_PROFILE);
   return isBuiltInDefault ? undefined : loaded;
@@ -64,23 +92,6 @@ export async function loadNonDefaultProfile(
 
 /** A profile pre-resolved by a caller: a {@link LoadedProfile}, or `null` for the built-in default. */
 export type PreloadedProfile = LoadedProfile | null;
-
-/**
- * Resolve the active non-default profile, REUSING a caller-`preloaded` result when
- * one is given (a `LoadedProfile`, or `null` meaning the built-in default), else
- * loading it via {@link loadNonDefaultProfile}. Lets one lock-free surface —
- * {@link ../context/build.js buildContextPack} — load the profile ONCE and thread
- * it through the pool-augmentation and tier-projection steps instead of each
- * re-loading (and re-validating) it, so a single pack cannot be assembled against
- * two different mid-swapped profiles. `undefined` preloaded → load here.
- */
-export async function resolveNonDefaultProfile(
-  root: string,
-  preloaded: PreloadedProfile | undefined,
-): Promise<LoadedProfile | undefined> {
-  if (preloaded !== undefined) return preloaded ?? undefined;
-  return loadNonDefaultProfile(root);
-}
 
 /**
  * The maximum number of structured `problems` the count-only status/viewer
@@ -160,22 +171,62 @@ export async function collectEntityPagesWithMessages(
   root: string,
   loaded: LoadedProfile,
 ): Promise<{ pages: EntityPage[]; problems: EntityProblemView[] }> {
-  const { pages, problems } = await collectEntityPages(root, loaded.profile);
-  return { pages, problems: await toProblemViews(problems, root) };
+  return collectEntityPagesWithMessagesFrom(diskEntityPagesWithMessagesSources(root), loaded);
 }
 
 /**
- * Map structured collector problems to public, path-safe problem views,
- * relativizing each `filePath` against the CANONICAL root. The collector
- * resolves every `filePath` through `safeRealpath`, so a non-canonical input
- * `root` (e.g. a `/var` path whose real form is `/private/var`) would otherwise
- * yield a misleading `../…` traversal instead of a clean project-relative path.
+ * What {@link collectEntityPagesWithMessagesFrom} reads through, and the one
+ * identity value it uses. Naming these selects no backend and rules on no
+ * mechanism.
  */
-async function toProblemViews(
+export interface EntityPagesWithMessagesSources {
+  /** The entity directories: every declared type's directory is scanned WITH bodies, in declaration order. */
+  scans: LegacyLocalEntityScans;
+  /** The project root's real path, or `null` when it cannot be resolved. Asked ONCE, AFTER the collection, and ALWAYS, with no problems too. */
+  realRoot(): Promise<string | null>;
+  /**
+   * The root as the caller gave it. NOT READ THROUGH: it is a label that
+   * problem paths are made relative to when `realRoot` answers `null`, and it
+   * authorizes no read.
+   */
+  root: string;
+}
+
+/** LOCAL DISK. The sources for the project at `root`, private to this module. Building them does no I/O. */
+function diskEntityPagesWithMessagesSources(root: string): EntityPagesWithMessagesSources {
+  return { scans: diskLocalEntityScans(root), realRoot: () => safeRealpath(root), root };
+}
+
+/**
+ * {@link collectEntityPagesWithMessages} over its sources: THE ONE BODY. The
+ * collection first (the default profile throws there, before any scan and
+ * before the real-path look); then the problems are mapped to views. `loaded`
+ * is used as given: nothing is reloaded and nothing is remembered.
+ *
+ * Each problem's `filePath` is made relative to the CANONICAL root. The
+ * collector's file paths are resolved paths, so a non-canonical root as given
+ * (e.g. a `/var` path whose real form is `/private/var`) would otherwise yield
+ * a misleading `../…` traversal instead of a clean project-relative path.
+ */
+export async function collectEntityPagesWithMessagesFrom(
+  sources: EntityPagesWithMessagesSources,
+  loaded: LoadedProfile,
+): Promise<{ pages: EntityPage[]; problems: EntityProblemView[] }> {
+  const { pages, problems } = await collectEntityPagesFrom(sources.scans, loaded.profile);
+  return { pages, problems: await toProblemViewsOver(problems, () => sources.realRoot(), sources.root) };
+}
+
+/**
+ * Structured collector problems as public, path-safe views, over a real-path
+ * look: THE ONE BODY. The look is ALWAYS made, for an empty list too; when it
+ * answers `null` the root as given is used.
+ */
+async function toProblemViewsOver(
   problems: EntityProblem[],
+  realRoot: () => Promise<string | null>,
   root: string,
 ): Promise<EntityProblemView[]> {
-  const canonicalRoot = (await safeRealpath(root)) ?? root;
+  const canonicalRoot = (await realRoot()) ?? root;
   return problems.map((problem) => toEntityProblemView(problem, canonicalRoot));
 }
 
@@ -277,11 +328,11 @@ function tallyValidRelations(relations: RelationRef[], loaded: LoadedProfile): R
  * fail-closed read OR when stored relations are no longer profile-valid (the
  * invalid ones are retained on disk, never counted as live).
  *
- * @param root - Absolute project root directory.
+ * @param graph - The graph-store read the relation store is asked through.
  * @param loaded - The loaded non-default profile (its `relations` block gates).
  * @returns The valid relation counts/total and/or a problem.
  */
-async function summarizeRelations(root: string, loaded: LoadedProfile): Promise<RelationSummary> {
+async function summarizeRelations(graph: GraphStoreReads, loaded: LoadedProfile): Promise<RelationSummary> {
   // The store is read even when the profile declares NO `relations` block: a
   // relation-less project has no `wiki/graph` store, so the read returns empty
   // (→ `{}`, byte-identical), but a project whose `relations` block was REMOVED
@@ -289,7 +340,7 @@ async function summarizeRelations(root: string, loaded: LoadedProfile): Promise<
   // rather than silently vanishing.
   let relations;
   try {
-    ({ relations } = await readRelations(root));
+    ({ relations } = await readRelationsFrom(graph));
   } catch (error) {
     return { problem: relationReadProblem(error) };
   }
@@ -350,13 +401,13 @@ function summarizeReadEvents(read: { events: { length: number }; problems: strin
  * symlink) OR a broken/truncated chain — in which case the count is suppressed
  * rather than reported as a healthy total.
  *
- * @param root - Absolute project root directory.
+ * @param events - The event-read sources (the store, then its head anchor).
  * @returns The event count and/or a problem.
  */
-async function summarizeEvents(root: string): Promise<EventSummary> {
+async function summarizeEvents(events: EventReadSources): Promise<EventSummary> {
   let read;
   try {
-    read = await readEvents(root);
+    read = await readEventsFrom(events);
   } catch (error) {
     return { problem: eventReadProblem(error) };
   }
@@ -374,11 +425,11 @@ async function summarizeEvents(root: string): Promise<EventSummary> {
  *   string value (so the caller omits this type's key).
  */
 async function tallyLifecycleStates(
-  root: string,
+  source: LegacyLocalEntityScans,
   def: EntityTypeDef,
   field: string,
 ): Promise<Record<string, number> | undefined> {
-  const { scans } = await scanEntityDir(root, def.directory, { includeBody: false });
+  const { scans } = await scanEntityDirFrom(source, def.directory, { includeBody: false });
   const counts: Record<string, number> = {};
   for (const scan of scans) {
     const value = scan.frontmatter[field];
@@ -394,39 +445,55 @@ async function tallyLifecycleStates(
  * has any enrolled page (so the `lifecycleStates` key is OMITTED — the
  * default and lifecycle-less envelopes stay byte-identical).
  *
- * @param root - Absolute project root directory.
+ * @param source - The entity-scan binding the lifecycle directories are scanned through.
  * @param loaded - The loaded non-default profile (its entity `lifecycle` gates).
  * @returns The `{ entityType: { state: count } }` tally, or `undefined`.
  */
 async function summarizeLifecycleStates(
-  root: string,
+  source: LegacyLocalEntityScans,
   loaded: LoadedProfile,
 ): Promise<Record<string, Record<string, number>> | undefined> {
   const states: Record<string, Record<string, number>> = {};
   for (const [entityType, def] of Object.entries(loaded.profile.entities) as [string, EntityTypeDef][]) {
     if (def.lifecycle === undefined) continue;
-    const tally = await tallyLifecycleStates(root, def, def.lifecycle.field);
+    const tally = await tallyLifecycleStates(source, def, def.lifecycle.field);
     if (tally) states[entityType] = tally;
   }
   return Object.keys(states).length > 0 ? states : undefined;
 }
 
 /**
+ * Whether the profile declares any artifact type: THE ONE GATE on the artifact
+ * contribution. An artifact-less profile skips it entirely, so the
+ * default/artifact-less status/viewer envelope stays byte-identical.
+ */
+function declaresArtifacts(loaded: LoadedProfile): boolean {
+  const declared = loaded.profile.artifacts;
+  return !!declared && Object.keys(declared).length > 0;
+}
+
+/**
  * Resolve every hash-pinned artifactRef reachable from a non-default profile's
  * pages/relations and reduce it to the additive summary contribution: the
- * path-safe problem views for any non-`ok` health. OMITTED work for an
- * artifact-less profile — {@link collectArtifactRefPageSources} is skipped
- * entirely, so the default/artifact-less status/viewer envelope stays
- * byte-identical.
+ * path-safe problem views for any non-`ok` health. It is called ONLY for a
+ * profile that declares artifact types ({@link declaresArtifacts}, checked by the
+ * summary body), with the profile that body already loaded: no profile is read
+ * here. It reads THROUGH THE SUMMARY'S SOURCES and remembers nothing: every
+ * declared entity directory again (frontmatter only), the relation store again
+ * when the profile declares relations, one resolve per ref occurrence, one
+ * provenance check per armed requirement, and its own real-path look when it
+ * has results (the summary still asks again, last).
  *
- * @param root - Absolute project root directory.
- * @param loaded - The loaded non-default profile (its `artifacts` block gates).
+ * @param sources - The summary's sources.
+ * @param loaded - The already-loaded non-default profile.
  * @returns The artifact-ref health problems (possibly empty).
  */
-async function summarizeArtifacts(root: string, loaded: LoadedProfile): Promise<EntityProblemView[]> {
-  if (!loaded.profile.artifacts || Object.keys(loaded.profile.artifacts).length === 0) return [];
-  const pages = await collectArtifactRefPageSources(root, loaded.profile);
-  return artifactProblemViews(root, pages, loaded.profile);
+async function summarizeArtifacts(sources: ProfileSummarySources, loaded: LoadedProfile): Promise<EntityProblemView[]> {
+  const pages = await collectArtifactRefPageSourcesFrom(sources.scans, loaded.profile);
+  return artifactProblemViewsFrom(
+    { graph: sources.graph, artifacts: sources.artifacts, provenance: sources.provenance }, pages, loaded.profile,
+    { realRoot: () => sources.realRoot(), asGiven: sources.profile.activeProduct.root },
+  );
 }
 
 /**
@@ -471,20 +538,90 @@ function problemEnvelope(views: EntityProblemView[]): Pick<ProfileSummaryBlock, 
 export async function collectProfileSummary(
   root: string,
 ): Promise<ProfileSummaryBlock | undefined> {
-  const loaded = await loadNonDefaultProfile(root);
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return collectProfileSummaryFrom(diskProfileSummarySources(root));
+}
+
+/**
+ * Everything {@link collectProfileSummaryFrom} reads. OWNED BY THE SUMMARY: a
+ * narrow seam; not `ProjectStore`, not a hosted or access-control contract, and
+ * it selects no backend. Every contribution and the real-path look are read
+ * through the sources below. `artifacts` is the artifact store's leaf reads;
+ * `provenance` is the preparation store's leaf reads, whose `lifecycle`
+ * member stays root-bound disk authority on disk.
+ * NOTHING TIES THESE OBJECTS TO ONE PROJECT, and nothing makes two reads of one
+ * store agree. Production builds them all from one root
+ * ({@link diskProfileSummarySources}).
+ */
+export interface ProfileSummarySources {
+  /** The effective profile, loaded FIRST; the built-in default ends the summary. Its `activeProduct.root` is the root as given, used when the real path is unknown. */
+  profile: EffectiveProfileSources;
+  /** Entity directories, frontmatter only: the counts, the lifecycle tallies, the standing check's gated pages, and every directory once more for artifact health. */
+  scans: LegacyLocalEntityScans;
+  /** The relation store: the counts, once more for the standing check, and once more for artifact health when relations are declared. */
+  graph: GraphStoreReads;
+  /** The event store and its head anchor. */
+  events: EventReadSources;
+  /** One confined page per distinct relation endpoint, for the standing check. */
+  pages: EntityPageReads;
+  /** The artifact store's leaf reads, for what a pinned ref resolves to. Asked only for a profile that declares artifact types, once per ref occurrence. */
+  artifacts: ArtifactStoreReads;
+  /** The preparation store's leaf reads, for whether a run vouches for a gated page's pinned artifact. Asked once per armed requirement that has a right-typed ref. */
+  provenance: PreparationStoreLeafReads;
+  /** The project root's real path, or `null` when it cannot be resolved. Asked LAST and ALWAYS; artifact health asks once before that, only when it has a finding. */
+  realRoot(): Promise<string | null>;
+}
+
+/**
+ * LOCAL DISK. The summary sources for the project at `root`: THE ONE BUILDER,
+ * used by {@link collectProfileSummary}, the viewer snapshot, the status
+ * composition and the JSON export's profile block (which reads all but the
+ * event store). Building
+ * them does no I/O and no path work. The relation and event reads share one
+ * graph-store read object. The artifact store reads and the preparation
+ * store reads come from THE ONE health builder
+ * ({@link diskArtifactHealthSources}). In no package index.
+ */
+export function diskProfileSummarySources(root: string): ProfileSummarySources {
+  const graph = diskGraphStoreReads(root);
+  const health = diskArtifactHealthSources(root);
+  return {
+    profile: diskEffectiveProfileSources(root),
+    scans: diskLocalEntityScans(root),
+    graph,
+    events: diskEventReadSources(root, graph),
+    pages: diskEntityPageReads(root),
+    artifacts: health.artifacts,
+    provenance: health.provenance,
+    realRoot: () => safeRealpath(root),
+  };
+}
+
+/**
+ * {@link collectProfileSummary} over {@link ProfileSummarySources}: THE ONE BODY.
+ * One step after another, never together: the profile; counts; relations;
+ * events; lifecycle states; the standing check; artifact health (only when
+ * artifact types are declared); the real-path look.
+ */
+export async function collectProfileSummaryFrom(
+  sources: ProfileSummarySources,
+): Promise<ProfileSummaryBlock | undefined> {
+  const loaded = await loadNonDefaultProfileFrom(sources.profile);
   if (loaded === undefined) return undefined;
-  const { counts, problems } = await collectEntitySummary(root, loaded.profile);
-  const { relationCounts, relationTotal, problem } = await summarizeRelations(root, loaded);
-  const { eventCount, problem: eventProblem } = await summarizeEvents(root);
-  const lifecycleStates = await summarizeLifecycleStates(root, loaded);
+  const { counts, problems } = await collectEntitySummaryFrom(sources.scans, loaded.profile);
+  const { relationCounts, relationTotal, problem } = await summarizeRelations(sources.graph, loaded);
+  const { eventCount, problem: eventProblem } = await summarizeEvents(sources.events);
+  const lifecycleStates = await summarizeLifecycleStates(sources.scans, loaded);
   // Re-evaluate every page CURRENTLY in a gated lifecycle state against the live
   // relation graph (READ-ONLY, LOCK-FREE, one relation read): a precondition met at
   // write time can drift as relations are superseded/compacted/dangling or the
   // profile changes. A non-gated/default profile reads nothing and adds none.
-  const standingProblems = await collectStandingRelationProblems(root, loaded.profile);
-  const artifactProblems = await summarizeArtifacts(root, loaded);
+  const standingProblems = await collectStandingRelationProblemsFrom(
+    { scans: sources.scans, graph: sources.graph, pages: sources.pages }, loaded.profile);
+  const artifactProblems = declaresArtifacts(loaded) ? await summarizeArtifacts(sources, loaded) : [];
   const storeProblems = [...(problem ? [problem] : []), ...(eventProblem ? [eventProblem] : []), ...artifactProblems];
-  const views = orderProblemViews(await toProblemViews(problems, root), storeProblems, standingProblems);
+  const entityViews = await toProblemViewsOver(problems, () => sources.realRoot(), sources.profile.activeProduct.root);
+  const views = orderProblemViews(entityViews, storeProblems, standingProblems);
   return {
     profileId: loaded.profile.profileId,
     digest: loaded.digest,

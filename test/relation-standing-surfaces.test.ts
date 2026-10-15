@@ -34,7 +34,7 @@ import { buildViewerSnapshot } from "../src/viewer/snapshot.js";
 import { buildContextPack } from "../src/context/build.js";
 import { collectStandingRelationProblems } from "../src/profile/relation-standing.js";
 import { DEFAULT_PROFILE } from "../src/profile/default.js";
-import { writeProfileFile, writeMarkdownPage, appendRelation, gatedResearchProfile } from "./fixtures/profile-fixtures.js";
+import { writeProfileFile, writeMarkdownPage, appendRelation, gatedResearchProfile, genericGatedProfile } from "./fixtures/profile-fixtures.js";
 import { RELATIONS_FILE, WIKI_GRAPH_DIR } from "../src/utils/constants.js";
 
 const UNMET = "lifecycle-relation-requirement-unmet";
@@ -51,32 +51,11 @@ interface StandingEntry {
 const gatedProfile = gatedResearchProfile;
 
 /**
- * A GENERIC profile with NO research vocabulary: an `alpha.mode` lifecycle whose
- * `sealed` state requires 1 `bonds` relation to a `beta`, over a union-endpoint
- * relation (from/to both accept alpha|beta). Proves the check is domain-neutral.
+ * The GENERIC gated profile with NO research vocabulary, from the shared fixture
+ * (`alpha.mode` `sealed` gated on 1 `bonds` relation to a `beta`). Proves the
+ * check is domain-neutral.
  */
-function genericProfile(): ProfilePack {
-  return {
-    schemaVersion: 1,
-    profileId: "generic-gated",
-    entities: {
-      beta: { directory: "wiki/beta", fields: {} },
-      alpha: {
-        directory: "wiki/alpha",
-        requiredFields: ["mode"],
-        fields: { title: { type: "string" }, mode: { type: "enum", enum: ["open", "sealed"] } },
-        lifecycle: {
-          field: "mode",
-          initial: "open",
-          terminal: ["sealed"],
-          transitions: { open: ["sealed"] },
-          transitionRelationRequirements: { sealed: [{ relationType: "bonds", role: "from", otherTypes: ["beta"], minCount: 1 }] },
-        },
-      },
-    },
-    relations: { bonds: { from: ["alpha", "beta"], to: ["alpha", "beta"], direction: "directed", attributes: {} } },
-  } as ProfilePack;
-}
+const genericProfile = genericGatedProfile;
 
 /** Map a surface's problem/warning list to standing entries only (unmet + unverifiable). */
 function pickStanding(items: Array<{ kind?: string; code?: string; message: string }> | undefined): StandingEntry[] {

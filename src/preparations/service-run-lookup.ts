@@ -20,14 +20,28 @@
  * wedged, and a wedged project is exactly the one whose key may be unreadable.
  * So the manifest lookup stands alone, and the run read is layered on top of it
  * by the operations that genuinely need durable state.
+ *
+ * ONE BODY PER QUESTION, OVER THE LOOKUP'S OWN READS. Each `…From` function is
+ * the single body; it takes `PreparationRunLookupReads` and no project root. The
+ * four root-named functions keep their signatures and delegate to it over the
+ * private local-disk reads, built on each call. What is bound here is THIS
+ * FILE'S decisions: the miss taxonomy, the read order, and the sealed-input
+ * decoding. The four reads under it are NOT made storage-neutral by being
+ * named: the inventory scan, the key read, the run read (which authenticates the
+ * leaf against the key it reads itself) and the evidence read (cap and digest)
+ * each decide things of their own and each still takes a project root. Nothing
+ * here selects a backend.
  */
 
 import { scanPreparationInventory } from "./capacity.js";
+import type { PreparationInventory } from "./capacity.js";
 import { readPreparationEvidenceBytes } from "./evidence-store.js";
-import { readPreparationKey } from "./key-epoch.js";
+import type { PreparationEvidenceBytesRead, PreparationEvidenceLocation } from "./evidence-store.js";
+import { readPreparationKeyEpoch } from "./key-epoch.js";
 import type { PreparationManifestV1 } from "./manifest-parse.js";
 import { bindingFor } from "./references.js";
 import { readPreparationRun } from "./run-store.js";
+import type { PreparationRunRead } from "./run-store.js";
 import type { PreparationRunBinding, PreparationRunV1 } from "./run-types.js";
 
 /**
@@ -68,6 +82,42 @@ export type PreparationRunLookupV1 =
 
 /** One classified miss, as every failing leg below returns it. */
 type LookupMiss = Extract<PreparationRunLookupV1, { ok: false }>;
+
+/**
+ * What the run lookup asks of the preparation store. Owned by the lookup; no
+ * read takes a project root.
+ */
+export interface PreparationRunLookupReads {
+  /** The store's manifests and its scan problems. */
+  scanInventory(): Promise<Pick<PreparationInventory, "manifests" | "problems">>;
+  /** Whether the preparation key can be read, and its epoch. NEVER the key bytes. */
+  readKeyEpoch(): Promise<
+    | { status: "ok"; keyEpochId: PreparationRunBinding["keyEpochId"] }
+    | { status: "absent" }
+    | { status: "unavailable" }
+  >;
+  /** One run leaf by its binding, authenticated by whatever answers. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** One evidence object's bytes by location and hex digest, refused above `maxBytes`. */
+  readEvidenceBytes(
+    location: PreparationEvidenceLocation, digest: string, maxBytes: number,
+  ): Promise<PreparationEvidenceBytesRead>;
+}
+
+/**
+ * The local-disk reads for one project root, built per call: each closure calls
+ * the imported store function when it is asked, never earlier. Exported for the
+ * page-evidence bound witness; internal, in no package index and not package API.
+ */
+export function diskPreparationRunLookupReads(root: string): PreparationRunLookupReads {
+  return {
+    scanInventory: () => scanPreparationInventory(root),
+    readKeyEpoch: () => readPreparationKeyEpoch(root),
+    readRun: (binding) => readPreparationRun(root, binding),
+    readEvidenceBytes: (location, digest, maxBytes) =>
+      readPreparationEvidenceBytes(root, location, digest, maxBytes),
+  };
+}
 
 /**
  * Why a manifest miss is not evidence of absence.
@@ -115,7 +165,14 @@ function missReason(problemCount: number, manifestCount: number): LookupMiss {
 export async function locatePreparationManifest(
   root: string, runId: string,
 ): Promise<PreparationManifestLookupV1> {
-  const inventory = await scanPreparationInventory(root);
+  return locatePreparationManifestFrom(diskPreparationRunLookupReads(root), runId);
+}
+
+/** {@link locatePreparationManifest} over the lookup's reads: the one body. */
+export async function locatePreparationManifestFrom(
+  reads: PreparationRunLookupReads, runId: string,
+): Promise<PreparationManifestLookupV1> {
+  const inventory = await reads.scanInventory();
   const manifest = inventory.manifests.find((candidate) => candidate.runId === runId);
   return manifest === undefined
     ? missReason(inventory.problems.length, inventory.manifests.length)
@@ -124,9 +181,9 @@ export async function locatePreparationManifest(
 
 /** Read one bound run, carrying the typed reason when it cannot be read. */
 async function readBoundRun(
-  root: string, binding: PreparationRunBinding,
+  reads: PreparationRunLookupReads, binding: PreparationRunBinding,
 ): Promise<PreparationRunLookupV1> {
-  const read = await readPreparationRun(root, binding);
+  const read = await reads.readRun(binding);
   // THE SUBSTRATE ALREADY SPLIT THESE and this leg collapsed them back. An absent
   // leaf is the store saying the run is not there; every other non-ok status is a
   // corrupt or unreadable leaf, which is this observer failing to read a run that
@@ -157,7 +214,14 @@ async function readBoundRun(
 export async function readPreparationRunForManifest(
   root: string, manifest: PreparationManifestV1,
 ): Promise<PreparationRunLookupV1> {
-  const key = await readPreparationKey(root);
+  return readPreparationRunForManifestFrom(diskPreparationRunLookupReads(root), manifest);
+}
+
+/** {@link readPreparationRunForManifest} over the lookup's reads: the one body. */
+export async function readPreparationRunForManifestFrom(
+  reads: PreparationRunLookupReads, manifest: PreparationManifestV1,
+): Promise<PreparationRunLookupV1> {
+  const key = await reads.readKeyEpoch();
   // UNAVAILABLE FOR BOTH NON-OK STATUSES, absent included. A key that is missing
   // while a manifest sits beside it is a torn store, not evidence about the run —
   // absence of the thing that authenticates a binding says nothing about whether
@@ -171,7 +235,7 @@ export async function readPreparationRunForManifest(
   if (key.status !== "ok") {
     return { ok: false, failure: "unavailable", reason: `preparation key is ${key.status}` };
   }
-  return readBoundRun(root, bindingFor(manifest, key.keyEpochId));
+  return readBoundRun(reads, bindingFor(manifest, key.keyEpochId));
 }
 
 /**
@@ -184,8 +248,15 @@ export async function readPreparationRunForManifest(
 export async function resolvePreparationRun(
   root: string, runId: string,
 ): Promise<PreparationRunLookupV1> {
-  const located = await locatePreparationManifest(root, runId);
-  return located.ok ? readPreparationRunForManifest(root, located.manifest) : located;
+  return resolvePreparationRunFrom(diskPreparationRunLookupReads(root), runId);
+}
+
+/** {@link resolvePreparationRun} over the lookup's reads: one scan, then the run read. */
+export async function resolvePreparationRunFrom(
+  reads: PreparationRunLookupReads, runId: string,
+): Promise<PreparationRunLookupV1> {
+  const located = await locatePreparationManifestFrom(reads, runId);
+  return located.ok ? readPreparationRunForManifestFrom(reads, located.manifest) : located;
 }
 
 /** A run's sealed initial input, decoded — or why it could not be read. */
@@ -201,9 +272,16 @@ export type PreparationInitialInputLookupV1 =
 export async function readPreparationInitialInput(
   root: string, manifest: PreparationManifestV1,
 ): Promise<PreparationInitialInputLookupV1> {
+  return readPreparationInitialInputFrom(diskPreparationRunLookupReads(root), manifest);
+}
+
+/** {@link readPreparationInitialInput} over the lookup's reads: the one body. */
+export async function readPreparationInitialInputFrom(
+  reads: PreparationRunLookupReads, manifest: PreparationManifestV1,
+): Promise<PreparationInitialInputLookupV1> {
   const inputSet = manifest.plan.initialInputSet;
-  const read = await readPreparationEvidenceBytes(
-    root, { workspaceId: manifest.workspaceId, preparationId: manifest.preparationId },
+  const read = await reads.readEvidenceBytes(
+    { workspaceId: manifest.workspaceId, preparationId: manifest.preparationId },
     inputSet.digest.replace(/^sha256:/, ""), inputSet.byteCount);
   if (read.status !== "ok") return { ok: false, reason: `sealed input is ${read.status}` };
   try {

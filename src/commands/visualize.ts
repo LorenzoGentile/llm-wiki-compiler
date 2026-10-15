@@ -17,6 +17,12 @@
  * THE INTERACTIVE GRAPH IS NOT THIS COMMAND'S JOB. §4.9 asks that exploration
  * be served by the local app rather than a standalone HTML file, so this points
  * at `llmwiki view` instead of emitting a viewer of its own.
+ *
+ * ONE BODY, NO ROOT. {@link visualizeCommandWith} owns the decisions (the
+ * focused-graph selection and its refusal, the profile's entity types, which two
+ * artifacts are written and under which names) over {@link VisualizeSteps}. The
+ * default export keeps its signature and passes the local steps, which call the
+ * incumbent snapshot, profile load and exclusive-create write when asked.
  */
 
 import path from "node:path";
@@ -41,9 +47,28 @@ export interface VisualizeOptions {
   depth?: string;
 }
 
+/** The project steps one visualize run takes. No member takes a project root. */
+export interface VisualizeSteps {
+  /** The viewer's snapshot of the wiki. */
+  snapshot(): ReturnType<typeof buildViewerSnapshot>;
+  /** The effective profile. */
+  loadProfile(): ReturnType<typeof loadProfile>;
+  /** Create one derived artifact at the project-relative path, keeping an existing one. */
+  writeArtifact(relativePath: string, body: string): Promise<ArtifactWriteResultV1>;
+}
+
+/** LOCAL DISK. The incumbent snapshot, profile load and exclusive-create write for `root`, each called when asked. */
+function localVisualizeSteps(root: string): VisualizeSteps {
+  return {
+    snapshot: () => buildViewerSnapshot(root),
+    loadProfile: () => loadProfile(root),
+    writeArtifact: (relativePath, body) => writeDerivedArtifact(root, relativePath, body),
+  };
+}
+
 /** The profile's declared entity types, or none for a default project. */
-async function declaredEntityTypes(root: string): Promise<string[]> {
-  const { profile, loadedFrom } = await loadProfile(root);
+async function declaredEntityTypes(steps: VisualizeSteps): Promise<string[]> {
+  const { profile, loadedFrom } = await steps.loadProfile();
   if (loadedFrom === null) return [];
   return Object.keys((profile as { entities?: Record<string, unknown> }).entities ?? {});
 }
@@ -81,18 +106,23 @@ function reportWrite(result: ArtifactWriteResultV1): void {
 export default async function visualizeCommand(
   root: string, options: VisualizeOptions = {},
 ): Promise<number> {
+  return visualizeCommandWith(localVisualizeSteps(root), options);
+}
+
+/** `visualizeCommand` over {@link VisualizeSteps}: THE ONE BODY. Returns the exit code. */
+export async function visualizeCommandWith(steps: VisualizeSteps, options: VisualizeOptions = {}): Promise<number> {
   output.header("Regenerating navigation artifacts");
-  const snapshot = await buildViewerSnapshot(root);
+  const snapshot = await steps.snapshot();
   const graph = selectedGraph(snapshot.graph, options);
   if (options.focus !== undefined && graph.nodes.length === 0) {
     output.status("!", output.error(`no node named ${options.focus} — nothing to focus on`));
     return 1;
   }
-  const entityTypes = await declaredEntityTypes(root);
-  reportWrite(await writeDerivedArtifact(
-    root, OBSIDIAN_CONFIG, `${JSON.stringify(obsidianGraphConfig(entityTypes), null, 2)}\n`));
-  reportWrite(await writeDerivedArtifact(
-    root, path.join(CANVAS_DIR, canvasName(options)),
+  const entityTypes = await declaredEntityTypes(steps);
+  reportWrite(await steps.writeArtifact(
+    OBSIDIAN_CONFIG, `${JSON.stringify(obsidianGraphConfig(entityTypes), null, 2)}\n`));
+  reportWrite(await steps.writeArtifact(
+    path.join(CANVAS_DIR, canvasName(options)),
     `${JSON.stringify(canvasDocument(graph), null, 2)}\n`));
   output.status("i", output.dim(
     `${graph.nodes.length} node(s), ${graph.edges.length} edge(s). `

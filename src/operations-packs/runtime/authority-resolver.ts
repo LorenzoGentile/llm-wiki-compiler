@@ -38,20 +38,33 @@
  * absent, over-cap, unreadable, or whose bytes no longer hash to their content
  * address, resolves `unavailable` with a distinct reason — the attempt parks
  * rather than sealing an exposure the host could not confirm.
+ *
+ * ONE BODY. {@link createPackAuthorityResolverFrom} owns every decision above
+ * over {@link PackAuthorityReads}: the run's manifest and evidence reads and the
+ * three sealed-evidence spec builders ({@link PackEvidenceBuilders}, shared with
+ * the leg builder in `runner-input.ts`), none of which takes a project root.
+ * {@link createPackAuthorityResolver} keeps its signature and passes the local
+ * reads, which call the incumbent root readers and builders when asked;
+ * {@link packAuthorityReadsOver} composes the same reads from their bodies.
  */
 
 import { canonicalDigest } from "../../profile/templates/signing/canonical.js";
 import { parseSha256Digest } from "../../capability-providers/ids.js";
-import { readPreparationEvidence, readPreparationEvidenceBytes } from "../../preparations/evidence-store.js";
-import { readPreparationManifest } from "../../preparations/manifest-store.js";
+import {
+  readPreparationEvidence, readPreparationEvidenceBytes, readPreparationEvidenceBytesFrom, readPreparationEvidenceFrom,
+  type PreparationEvidenceLeafReads,
+} from "../../preparations/evidence-store.js";
+import { readPreparationManifest, readPreparationManifestFrom, type PreparationManifestLeafReads } from "../../preparations/manifest-store.js";
 import { MAX_PREPARED_INPUT_OBJECT_BYTES } from "../../preparations/inputs.js";
 import type { PreparationRunBinding } from "../../preparations/run-types.js";
 import type { EvidenceRefV1 } from "../../preparations/types.js";
 import { providerInputSpecsContentExposureDigest } from "../../preparations/attempts/provider.js";
 import type { PhaseExecutorV1 } from "../../preparations/plan-types.js";
-import { buildSourceEvidenceSpecs } from "./source-evidence.js";
-import { buildArtifactEvidenceSpecs } from "./artifact-evidence.js";
-import { buildPageEvidenceSpecs } from "./page-evidence.js";
+import { buildSourceEvidenceSpecs, buildSourceEvidenceSpecsFrom } from "./source-evidence.js";
+import { buildArtifactEvidenceSpecs, buildArtifactEvidenceSpecsFrom, type ArtifactEvidenceSpecReads } from "./artifact-evidence.js";
+import { buildPageEvidenceSpecs, buildPageEvidenceSpecsFrom } from "./page-evidence.js";
+import type { PageEvidenceReads } from "../../products/page-evidence-forms.js";
+import type { SourceLeafReads } from "../../utils/flat-source-leaf.js";
 import type {
   AttemptAuthorityResolutionV1, AttemptAuthorityResolverV1,
 } from "../../preparations/attempts/types.js";
@@ -67,6 +80,71 @@ const SHA256_PREFIX = "sha256:";
 /** What one pack authority resolver is bound to for the life of a run. */
 export interface PackAuthorityResolverInputV1 {
   readonly root: string;
+  readonly binding: PreparationRunBinding;
+}
+
+/** The three sealed-evidence spec builders, ONE kind per phase. No member takes a project root. */
+export interface PackEvidenceBuilders {
+  source(...args: DropRoot<Parameters<typeof buildSourceEvidenceSpecs>>): ReturnType<typeof buildSourceEvidenceSpecs>;
+  artifact(...args: DropRoot<Parameters<typeof buildArtifactEvidenceSpecs>>): ReturnType<typeof buildArtifactEvidenceSpecs>;
+  page(...args: DropRoot<Parameters<typeof buildPageEvidenceSpecs>>): ReturnType<typeof buildPageEvidenceSpecs>;
+}
+
+/** A root-taking signature's arguments after the root. */
+type DropRoot<Args extends readonly unknown[]> = Args extends readonly [string, ...infer Rest] ? Rest : never;
+
+/** LOCAL DISK. The incumbent root builders for `root`, each called when asked. */
+export function diskPackEvidenceBuilders(root: string): PackEvidenceBuilders {
+  return {
+    source: (descriptor, value) => buildSourceEvidenceSpecs(root, descriptor, value),
+    artifact: (descriptor, value) => buildArtifactEvidenceSpecs(root, descriptor, value),
+    page: (descriptor, value) => buildPageEvidenceSpecs(root, descriptor, value),
+  };
+}
+
+/** The same builders over each one's own body and seam. Building them does no I/O. */
+export function packEvidenceBuildersOver(seams: {
+  sourceLeaves: SourceLeafReads; artifacts: ArtifactEvidenceSpecReads; pages: PageEvidenceReads;
+}): PackEvidenceBuilders {
+  return {
+    source: (descriptor, value) => buildSourceEvidenceSpecsFrom(seams.sourceLeaves, descriptor, value),
+    artifact: (descriptor, value) => buildArtifactEvidenceSpecsFrom(seams.artifacts, descriptor, value),
+    page: (descriptor, value) => buildPageEvidenceSpecsFrom(seams.pages, descriptor, value),
+  };
+}
+
+/** What one resolution reads: the run's manifest and evidence objects, and the spec builders. No member takes a project root. */
+export interface PackAuthorityReads extends PackEvidenceBuilders {
+  readManifest(...args: DropRoot<Parameters<typeof readPreparationManifest>>): ReturnType<typeof readPreparationManifest>;
+  readEvidence(...args: DropRoot<Parameters<typeof readPreparationEvidence>>): ReturnType<typeof readPreparationEvidence>;
+  readEvidenceBytes(...args: DropRoot<Parameters<typeof readPreparationEvidenceBytes>>): ReturnType<typeof readPreparationEvidenceBytes>;
+}
+
+/** LOCAL DISK. The incumbent root readers and builders for `root`, each called when asked with its old arguments. */
+function diskPackAuthorityReads(root: string): PackAuthorityReads {
+  return {
+    ...diskPackEvidenceBuilders(root),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    readEvidence: (location, digest) => readPreparationEvidence(root, location, digest),
+    readEvidenceBytes: (location, digest, maxBytes) => readPreparationEvidenceBytes(root, location, digest, maxBytes),
+  };
+}
+
+/** The same reads over the manifest and evidence leaves and the builders' seams. Building them does no I/O. */
+export function packAuthorityReadsOver(seams: {
+  manifests: PreparationManifestLeafReads; evidence: PreparationEvidenceLeafReads; builders: PackEvidenceBuilders;
+}): PackAuthorityReads {
+  return {
+    ...seams.builders,
+    readManifest: (workspaceId, preparationId) => readPreparationManifestFrom(seams.manifests, workspaceId, preparationId),
+    readEvidence: (location, digest) => readPreparationEvidenceFrom(seams.evidence, location, digest),
+    readEvidenceBytes: (location, digest, maxBytes) => readPreparationEvidenceBytesFrom(seams.evidence, location, digest, maxBytes),
+  };
+}
+
+/** One resolver's pinned binding and the reads it recomputes from. */
+interface PinnedAuthorityV1 {
+  readonly reads: PackAuthorityReads;
   readonly binding: PreparationRunBinding;
 }
 
@@ -89,10 +167,10 @@ function bareDigest(digest: string): string {
 
 /** Read one declared initial input back and pair its declaration with the truth. */
 async function exposureRow(
-  input: PackAuthorityResolverInputV1, ref: EvidenceRefV1,
+  input: PinnedAuthorityV1, ref: EvidenceRefV1,
 ): Promise<ExposureRowV1 | { readonly unavailable: string }> {
   const location = { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId };
-  const read = await readPreparationEvidence(input.root, location, bareDigest(ref.digest));
+  const read = await input.reads.readEvidence(location, bareDigest(ref.digest));
   if (read.status !== "ok") return { unavailable: `initial-input-${read.status}` };
   return {
     kind: ref.kind, mediaType: ref.mediaType, provenanceLabel: ref.provenanceLabel,
@@ -103,7 +181,7 @@ async function exposureRow(
 
 /** Read every declared initial input back, failing closed on the first refusal. */
 async function exposureRows(
-  input: PackAuthorityResolverInputV1, refs: readonly EvidenceRefV1[],
+  input: PinnedAuthorityV1, refs: readonly EvidenceRefV1[],
 ): Promise<readonly ExposureRowV1[] | { readonly unavailable: string }> {
   const rows: ExposureRowV1[] = [];
   for (const ref of refs) {
@@ -118,10 +196,9 @@ async function exposureRows(
 
 /** Recompute the exposure digest from persisted state, or say why it cannot be. */
 async function resolveExposure(
-  input: PackAuthorityResolverInputV1,
+  input: PinnedAuthorityV1,
 ): Promise<AttemptAuthorityResolutionV1> {
-  const manifest = await readPreparationManifest(
-    input.root, input.binding.workspaceId, input.binding.preparationId);
+  const manifest = await input.reads.readManifest(input.binding.workspaceId, input.binding.preparationId);
   if (manifest.status !== "ok") return { status: "unavailable", reason: `manifest-${manifest.status}` };
   const rows = await exposureRows(input, manifest.manifest.initialEvidence);
   if ("unavailable" in rows) return { status: "unavailable", reason: rows.unavailable };
@@ -147,7 +224,7 @@ async function resolveExposure(
  * which is the entire point of resolving twice.
  */
 async function resolveProviderAuthority(
-  input: PackAuthorityResolverInputV1, executor: ProviderExecutor,
+  input: PinnedAuthorityV1, executor: ProviderExecutor,
 ): Promise<AttemptAuthorityResolutionV1> {
   const descriptor = executor.sourceEvidenceDescriptor;
   const artifactDescriptor = executor.artifactEvidenceDescriptor;
@@ -168,10 +245,10 @@ async function resolveProviderAuthority(
   // ONE evidence kind per phase (compile-refused otherwise): the exposure
   // digest is computed over whichever builder the sealed executor names.
   const built = descriptor !== undefined
-    ? await buildSourceEvidenceSpecs(input.root, descriptor, value.value)
+    ? await input.reads.source(descriptor, value.value)
     : artifactDescriptor !== undefined
-      ? await buildArtifactEvidenceSpecs(input.root, artifactDescriptor, value.value)
-      : await buildPageEvidenceSpecs(input.root, pageDescriptor!, value.value);
+      ? await input.reads.artifact(artifactDescriptor, value.value)
+      : await input.reads.page(pageDescriptor!, value.value);
   if (built.status !== "ok") return { status: "unavailable", reason: built.reason };
   return {
     status: "ok",
@@ -185,10 +262,9 @@ async function resolveProviderAuthority(
  * store verifies them against their content address before returning them.
  */
 async function frozenActionInputValue(
-  input: PackAuthorityResolverInputV1,
+  input: PinnedAuthorityV1,
 ): Promise<{ value: Record<string, unknown> } | { unavailable: string }> {
-  const manifest = await readPreparationManifest(
-    input.root, input.binding.workspaceId, input.binding.preparationId);
+  const manifest = await input.reads.readManifest(input.binding.workspaceId, input.binding.preparationId);
   if (manifest.status !== "ok") return { unavailable: `manifest-${manifest.status}` };
   const ref = manifest.manifest.initialEvidence.find((entry) => entry.kind === ACTION_INPUT_EVIDENCE_KIND);
   if (ref === undefined) return { unavailable: "action-input-evidence-missing" };
@@ -196,8 +272,7 @@ async function frozenActionInputValue(
   // The read cap IS the prepared-input contract's own object cap: a private
   // smaller constant here parked schema-valid staged actions (a 1.05 MiB input
   // compiled and staged, then failed resolution as action-input-over-cap).
-  const read = await readPreparationEvidenceBytes(
-    input.root, location, bareDigest(ref.digest), MAX_PREPARED_INPUT_OBJECT_BYTES);
+  const read = await input.reads.readEvidenceBytes(location, bareDigest(ref.digest), MAX_PREPARED_INPUT_OBJECT_BYTES);
   if (read.status !== "ok") return { unavailable: `action-input-${read.status}` };
   try {
     const parsed: unknown = JSON.parse(read.bytes.toString("utf8"));
@@ -228,12 +303,19 @@ const ACTION_INPUT_EVIDENCE_KIND = "pack-action-input";
 export function createPackAuthorityResolver(
   input: PackAuthorityResolverInputV1,
 ): AttemptAuthorityResolverV1 {
-  const pinned: PackAuthorityResolverInputV1 = {
-    root: input.root,
+  return createPackAuthorityResolverFrom(diskPackAuthorityReads(input.root), input.binding);
+}
+
+/** {@link createPackAuthorityResolver} over {@link PackAuthorityReads}: THE ONE BODY. The binding is copied field by field here. */
+export function createPackAuthorityResolverFrom(
+  reads: PackAuthorityReads, binding: PreparationRunBinding,
+): AttemptAuthorityResolverV1 {
+  const pinned: PinnedAuthorityV1 = {
+    reads,
     binding: {
-      runId: input.binding.runId, preparationId: input.binding.preparationId,
-      manifestDigest: input.binding.manifestDigest, workspaceId: input.binding.workspaceId,
-      keyEpochId: input.binding.keyEpochId,
+      runId: binding.runId, preparationId: binding.preparationId,
+      manifestDigest: binding.manifestDigest, workspaceId: binding.workspaceId,
+      keyEpochId: binding.keyEpochId,
     },
   };
   return {

@@ -42,9 +42,9 @@ import type { OperationAdapterMap } from "../../operation-bundles/adapter-regist
 import type { OperationPrincipal } from "../../operation-bundles/principal.js";
 import { hostHandlerLegRunner } from "../../preparations/attempts/host-handler.js";
 import { providerLegRunner, type ProviderInvokeFn, type ProviderLegInputV1 } from "../../preparations/attempts/provider.js";
-import { buildSourceEvidenceSpecs } from "./source-evidence.js";
-import { buildArtifactEvidenceSpecs } from "./artifact-evidence.js";
-import { buildPageEvidenceSpecs } from "./page-evidence.js";
+import type { buildSourceEvidenceSpecs } from "./source-evidence.js";
+import type { buildArtifactEvidenceSpecs } from "./artifact-evidence.js";
+import type { buildPageEvidenceSpecs } from "./page-evidence.js";
 import type { ProviderInputSpecV1 } from "../../capability-providers/runtime/inputs.js";
 import type {
   AttemptClockV1, AttemptLegOutcomeV1, AttemptLegRunnerV1, HostHandlerRefV1,
@@ -55,7 +55,7 @@ import type { PreparationPrincipalV1, PreparationRunBinding } from "../../prepar
 import type { RunPreparationInputV1 } from "../../preparations/runner.js";
 import type { CompiledPackActionV1 } from "../compiler-types.js";
 import { createHostHandlerRegistry } from "../handlers/registry.js";
-import { createPackAuthorityResolver } from "./authority-resolver.js";
+import { createPackAuthorityResolver, diskPackEvidenceBuilders, type PackEvidenceBuilders } from "./authority-resolver.js";
 import { actionInputFrame, createPackHostHandlerRegistry } from "./host-registry.js";
 import { renderTemplate } from "../handlers/render-template.js";
 
@@ -189,27 +189,28 @@ function sealedRefOf(phase: NormalizedPhaseV1 | undefined): HostHandlerRefV1 | n
  * Build whichever sealed evidence context the executor names — source,
  * artifact, or page evidence (ONE kind per phase; the compiler refuses more).
  * Downstream (tokens, mounts, exposure digest) the three are
- * indistinguishable. A build refusal returns its reason as a string.
+ * indistinguishable. A build refusal returns its reason as a string. THE ONE
+ * BODY over {@link PackEvidenceBuilders}; the leg passes the local builders.
  */
-async function builtEvidenceContext(
-  root: string, executor: { sourceEvidenceDescriptor?: Parameters<typeof buildSourceEvidenceSpecs>[1]; artifactEvidenceDescriptor?: Parameters<typeof buildArtifactEvidenceSpecs>[1]; pageEvidenceDescriptor?: Parameters<typeof buildPageEvidenceSpecs>[1] } & Record<string, unknown>,
+export async function builtEvidenceContextFrom(
+  builders: PackEvidenceBuilders, executor: { sourceEvidenceDescriptor?: Parameters<typeof buildSourceEvidenceSpecs>[1]; artifactEvidenceDescriptor?: Parameters<typeof buildArtifactEvidenceSpecs>[1]; pageEvidenceDescriptor?: Parameters<typeof buildPageEvidenceSpecs>[1] } & Record<string, unknown>,
   value: Parameters<typeof buildSourceEvidenceSpecs>[2],
 ): Promise<PackSourceEvidenceContextV1 | undefined | string> {
   const source = executor.sourceEvidenceDescriptor;
   if (source !== undefined) {
-    const built = await buildSourceEvidenceSpecs(root, source, value);
+    const built = await builders.source(source, value);
     if (built.status !== "ok") return built.reason;
     return { specs: built.built.specs, pathTable: built.built.pathTable, pathTableKey: source.pathTableKey };
   }
   const artifact = executor.artifactEvidenceDescriptor;
   if (artifact !== undefined) {
-    const built = await buildArtifactEvidenceSpecs(root, artifact, value);
+    const built = await builders.artifact(artifact, value);
     if (built.status !== "ok") return built.reason;
     return { specs: built.built.specs, pathTable: built.built.pathTable, pathTableKey: artifact.pathTableKey };
   }
   const page = executor.pageEvidenceDescriptor;
   if (page !== undefined) {
-    const built = await buildPageEvidenceSpecs(root, page, value);
+    const built = await builders.page(page, value);
     if (built.status !== "ok") return built.reason;
     return { specs: built.built.specs, pathTable: built.built.pathTable, pathTableKey: page.pathTableKey };
   }
@@ -236,7 +237,7 @@ function providerLegForPhase(
     // ready. A build refusal parks the leg with its reason — running the
     // provider with no sources under a plan that sealed some would answer a
     // different question than the operator approved.
-    const evidence = await builtEvidenceContext(ctx.root, executor, action.initialInput.value);
+    const evidence = await builtEvidenceContextFrom(diskPackEvidenceBuilders(ctx.root), executor, action.initialInput.value);
     if (typeof evidence === "string") return failedEvidenceLeg(evidence);
     const sourceEvidence = evidence;
     const legInput = await capability.legInputFor(executor, phase, request, {

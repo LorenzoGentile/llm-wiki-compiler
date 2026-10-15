@@ -47,6 +47,15 @@
  * different path than the executor's. So `applied` means the bundle IS applied,
  * a second apply is idempotent, and the counters describe the run that settled
  * it rather than this call.
+ *
+ * ONE BODY. {@link applyProductBundleWith} owns the sequence (request capture,
+ * inventory target resolution, the gated lock and its refusal classification, the
+ * approve-and-apply, the release, the outcome projection) over
+ * {@link ProductApplySteps}, none of which takes a project root. The lock and the
+ * executor stay capabilities the host supplies. {@link applyProductBundle} keeps
+ * its signature and passes the local steps, which call the incumbent root forms
+ * when asked; {@link productApplyStepsOver} reads the inventory through the
+ * capacity scan's own body and keeps the supplied lock and executor as given.
  */
 
 import type { OperationRuntime } from "../operation-bundles/adapter-registry.js";
@@ -54,7 +63,10 @@ import {
   loadOperationInventory, resolveTarget, type ResolvedTarget,
 } from "../operation-bundles/bundle-target.js";
 import {
-  approveAndApplyOperationBundleLocked, type OperationActionResult,
+  scanOperationInventoryFrom, type OperationInventory, type OperationInventoryReads,
+} from "../operation-bundles/capacity.js";
+import {
+  approveAndApplyOperationBundleLocked, type ApproveOperationBundleRequest, type OperationActionResult,
 } from "../operation-bundles/executor.js";
 import { acquireMutationLock, RecoveryGateError } from "../operation-bundles/lock-gate.js";
 import type { OperationPrincipal } from "../operation-bundles/principal.js";
@@ -222,11 +234,11 @@ function applyOutcome(result: OperationActionResult): ProductApplyResultV1 {
  * Any other error is a statement about this process and stays visible.
  */
 async function underApplyLock(
-  root: string, action: () => Promise<OperationActionResult>,
+  steps: ProductApplySteps, action: () => Promise<OperationActionResult>,
 ): Promise<ProductApplyResultV1> {
   let acquired: boolean;
   try {
-    acquired = await acquireMutationLock(root, APPLY_LOCK_INTENT);
+    acquired = await steps.acquireLock();
   } catch (error) {
     if (error instanceof RecoveryGateError || error instanceof JournalUnsafeError) {
       return { status: "refused", reason: error.message };
@@ -237,15 +249,15 @@ async function underApplyLock(
   try {
     return applyOutcome(await action());
   } finally {
-    await releaseLock(root);
+    await steps.releaseLock();
   }
 }
 
 /** Resolve the named target from the durable inventory, or say it matched nothing. */
 async function resolveApplyTarget(
-  root: string, bundle: string,
+  steps: ProductApplySteps, bundle: string,
 ): Promise<ResolvedTarget | { readonly reason: string }> {
-  const resolved = resolveTarget(await loadOperationInventory(root), bundle);
+  const resolved = resolveTarget(await steps.loadInventory(), bundle);
   return resolved ?? { reason: `No operation bundle or run matches "${bundle}".` };
 }
 
@@ -270,19 +282,77 @@ async function resolveApplyTarget(
 export async function applyProductBundle(
   deps: ProductApplyDependenciesV1, request: ProductApplyRequestV1,
 ): Promise<ProductApplyResultV1> {
+  return applyProductBundleWith(diskProductApplySteps(deps), deps, request);
+}
+
+/** The project steps one product apply takes, in order. No member takes a project root. */
+export interface ProductApplySteps {
+  /** The whole operation inventory the target is resolved against. */
+  loadInventory(): Promise<OperationInventory>;
+  /** The host's gated project lock under the apply intent: true when taken; a gate refusal THROWS its typed error. */
+  acquireLock(): Promise<boolean>;
+  /** Release the project lock. */
+  releaseLock(): Promise<void>;
+  /** The host's locked approve-and-apply executor, for the resolved target under the host's authority (read as given). */
+  approveAndApply(target: ApplyTargetV1, authority: ApplyAuthorityV1): Promise<OperationActionResult>;
+}
+
+/** The resolved identities one approve-and-apply names. */
+type ApplyTargetV1 = Pick<ApproveOperationBundleRequest, "workspaceId" | "bundleId" | "manifestDigest">;
+/** The host's principal and runtime, as the host supplied them. */
+type ApplyAuthorityV1 = Pick<ProductApplyDependenciesV1, "principal" | "runtime">;
+
+/**
+ * LOCAL DISK AND HOST. The incumbent root forms for the host's root, each called
+ * when asked with its old arguments and `deps.root` read exactly when the facade
+ * read it: once for the inventory; ONCE when the lock is taken, that same value
+ * released; and afresh by the executor's call, before its request is built.
+ * Built per apply, so the lock's root is never shared between two applies.
+ */
+function diskProductApplySteps(deps: Pick<ProductApplyDependenciesV1, "root">): ProductApplySteps {
+  let lockRoot: string | undefined;
+  return {
+    loadInventory: () => loadOperationInventory(deps.root),
+    acquireLock: () => {
+      lockRoot = deps.root;
+      return acquireMutationLock(lockRoot, APPLY_LOCK_INTENT);
+    },
+    releaseLock: () => releaseLock(lockRoot as string),
+    approveAndApply: (target, authority) => approveAndApplyOperationBundleLocked(deps.root, {
+      ...target, principal: authority.principal, runtime: authority.runtime,
+    }),
+  };
+}
+
+/** The same steps with the inventory over the capacity scan's own body and the host's lock and executor as given. Building them does no I/O. */
+export function productApplyStepsOver(sources: {
+  inventory: OperationInventoryReads;
+  lock: Pick<ProductApplySteps, "acquireLock" | "releaseLock">;
+  approveAndApply: (request: ApproveOperationBundleRequest) => Promise<OperationActionResult>;
+}): ProductApplySteps {
+  return {
+    loadInventory: () => scanOperationInventoryFrom(sources.inventory),
+    acquireLock: () => sources.lock.acquireLock(),
+    releaseLock: () => sources.lock.releaseLock(),
+    approveAndApply: (target, authority) => sources.approveAndApply({ ...target, principal: authority.principal, runtime: authority.runtime }),
+  };
+}
+
+/** {@link applyProductBundle} over {@link ProductApplySteps}: THE ONE BODY. The authority is the host's principal and runtime, as given. */
+export async function applyProductBundleWith(
+  steps: ProductApplySteps, authority: ApplyAuthorityV1, request: ProductApplyRequestV1,
+): Promise<ProductApplyResultV1> {
   // Captured by own DATA descriptors before anything reads it, the discipline
   // every preparation and product operation takes: a planted `bundle` accessor
   // would otherwise choose which proposal is applied on behalf of a caller who
   // named a different one.
   const captured = capturedRequest<ProductApplyRequestV1>(request);
   if (captured === null) return { status: "refused", reason: REQUEST_CAPTURE_REFUSAL };
-  const resolved = await resolveApplyTarget(deps.root, captured.bundle);
+  const resolved = await resolveApplyTarget(steps, captured.bundle);
   if ("reason" in resolved) return { status: "refused", reason: resolved.reason };
-  return underApplyLock(deps.root, () => approveAndApplyOperationBundleLocked(deps.root, {
+  return underApplyLock(steps, () => steps.approveAndApply({
     workspaceId: resolved.workspaceId,
     bundleId: resolved.bundleId,
     manifestDigest: resolved.manifestDigest,
-    principal: deps.principal,
-    runtime: deps.runtime,
-  }));
+  }, authority));
 }

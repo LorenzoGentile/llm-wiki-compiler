@@ -10,13 +10,21 @@
  * treated as moved, never re-moved or lost), and a completed receipt short-circuits
  * to a no-op. A quarantined-then-restored run must never become trusted, so the
  * engine only moves bytes and signs receipts; it never re-signs run history.
+ *
+ * ONE ENGINE BODY over {@link QuarantineUnitLeaves}. `runTwoPhaseQuarantineWith`
+ * owns the permit check, the completed-receipt short-circuit, planned-receipt
+ * reuse on resume, signing, receipt authentication and kind/unit binding, and the
+ * phase order planned → moves → bytes fsync → verify → completed, with the same
+ * crash seams. The per-object move protocol (inode identity, half-finished-commit
+ * completion, unlink and fsync), the receipt leaf I/O and the directory sync stay
+ * in the local-disk leaves; the root entries delegate per call.
  */
 
 import {
   assertLifecycleMutationPermit, type LifecycleMutationPermitV1,
 } from "./lifecycle-mutation-permit.js";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, rename, stat, unlink } from "node:fs/promises";
+import { mkdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { atomicWriteNoReplaceDurable } from "../utils/atomic-write.js";
 import { fsyncDirectoryChain } from "../utils/atomic-write-durability.js";
@@ -37,6 +45,7 @@ import {
   type RetiredQuarantineUnitV1,
 } from "./receipts.js";
 import type { PreparationPrincipalV1 } from "./run-types.js";
+import type { CappedLeafReadBuffer } from "../utils/confined-read.js";
 
 /** Lifecycle hashing streams, so the ceiling is the real evidence-object bound. */
 const VERIFY_HASH_CAP_BYTES = MAX_PREPARATION_EVIDENCE_OBJECT_BYTES;
@@ -77,6 +86,50 @@ export interface QuarantineMoveInput {
 }
 
 /**
+ * Refuse an unplaceable unit id exactly as the incumbent's path derivation did, and
+ * at the same point: OUTSIDE the readers' catch, so it rejects rather than reading as
+ * "not settled". Lexical only (the empty root is never touched), as `paths.ts` itself does.
+ */
+function assertUnitId(unitId: string): void {
+  preparationQuarantineUnitPaths("", unitId);
+}
+
+/** Which of a unit's two signed receipts a leaf holds. */
+type ReceiptLeaf = "planned" | "completed";
+
+/** What the engine asks of one quarantine unit's storage. No member takes a project root. */
+export interface QuarantineUnitLeaves {
+  /** One receipt leaf's bytes within `maxBytes`, no-follow; a unit id it cannot place throws. */
+  readReceiptLeaf(unitId: string, which: ReceiptLeaf, maxBytes: number): Promise<CappedLeafReadBuffer>;
+  /** Ensure the unit's bytes directory exists before the planned receipt is published. */
+  prepareBytesRoot(unitId: string): Promise<void>;
+  /** Create-only, durable publication of one signed receipt leaf. */
+  publishReceipt(unitId: string, which: ReceiptLeaf, bytes: Buffer): Promise<void>;
+  /** Move one planned leaf into the unit, or complete/prove a move already made; a conflict throws. */
+  moveObject(unitId: string, object: QuarantineObjectV1): Promise<void>;
+  /** Durably sync the unit's bytes directory chain. */
+  syncBytesRoot(unitId: string): Promise<void>;
+  /** Prove one moved leaf is a regular file of the planned size holding the planned bytes; throws otherwise. */
+  verifyMovedObject(unitId: string, object: QuarantineObjectV1): Promise<void>;
+}
+
+/** The local-disk unit leaves for one root, built per call. In no package index. */
+function diskQuarantineUnitLeaves(root: string): QuarantineUnitLeaves {
+  const receiptFile = (unitId: string, which: ReceiptLeaf) => {
+    const paths = preparationQuarantineUnitPaths(root, unitId);
+    return which === "planned" ? paths.plannedReceiptFile : paths.completedReceiptFile;
+  };
+  return {
+    readReceiptLeaf: (unitId, which, maxBytes) => readCappedNoFollowBuffer(receiptFile(unitId, which), maxBytes),
+    prepareBytesRoot: async (unitId) => { await mkdir(preparationQuarantineUnitPaths(root, unitId).bytesRoot, { recursive: true }); },
+    publishReceipt: (unitId, which, bytes) => writeReceipt(root, receiptFile(unitId, which), bytes),
+    moveObject: (unitId, object) => moveObject(root, unitId, object),
+    syncBytesRoot: (unitId) => fsyncDirectoryChain(preparationQuarantineUnitPaths(root, unitId).bytesRoot),
+    verifyMovedObject: (unitId, object) => verifyMovedObject(root, unitId, object),
+  };
+}
+
+/**
  * Read a bounded receipt leaf and verify it under the governing key, or null. A valid
  * HMAC alone is NOT enough: the receipt must also bind the exact kind and unit it is
  * being read as. Both receipt kinds are signed by the same key, so without that
@@ -84,9 +137,10 @@ export interface QuarantineMoveInput {
  * be honoured as proof of completion before any byte moved.
  */
 async function readVerifiedReceipt(
-  file: string, key: Buffer, kind: QuarantineReceiptContentV1["kind"], unitId: string,
+  leaves: QuarantineUnitLeaves, key: Buffer, kind: QuarantineReceiptContentV1["kind"], unitId: string,
 ): Promise<QuarantineReceiptV1 | null> {
-  const read = await readCappedNoFollowBuffer(file, MAX_LIFECYCLE_RECEIPT_BYTES);
+  const which: ReceiptLeaf = kind === "quarantine-planned" ? "planned" : "completed";
+  const read = await leaves.readReceiptLeaf(unitId, which, MAX_LIFECYCLE_RECEIPT_BYTES);
   if (read.kind === "absent") return null;
   if (read.kind !== "ok") throw new Error("quarantine receipt is unreadable");
   const receipt = parseLifecycleReceipt(read.body.toString("utf8")) as QuarantineReceiptV1;
@@ -108,9 +162,17 @@ export async function readSettledQuarantineReceipt(
   root: string, unitId: string, key: Buffer,
   expect: { keyEpochId: string; scope?: QuarantineScope; reason?: QuarantineReason },
 ): Promise<QuarantineReceiptV1 | null> {
-  const paths = preparationQuarantineUnitPaths(root, unitId);
+  return readSettledQuarantineReceiptFrom(diskQuarantineUnitLeaves(root), unitId, key, expect);
+}
+
+/** {@link readSettledQuarantineReceipt} over the unit leaves: the one settlement predicate. */
+async function readSettledQuarantineReceiptFrom(
+  leaves: QuarantineUnitLeaves, unitId: string, key: Buffer,
+  expect: { keyEpochId: string; scope?: QuarantineScope; reason?: QuarantineReason },
+): Promise<QuarantineReceiptV1 | null> {
+  assertUnitId(unitId);
   try {
-    const receipt = await readVerifiedReceipt(paths.completedReceiptFile, key, "quarantine-completed", unitId);
+    const receipt = await readVerifiedReceipt(leaves, key, "quarantine-completed", unitId);
     if (receipt === null || receipt.keyEpochId !== expect.keyEpochId) return null;
     if (expect.scope !== undefined && receipt.scope !== expect.scope) return null;
     if (expect.reason !== undefined && receipt.reason !== expect.reason) return null;
@@ -163,8 +225,8 @@ function quarantineAuthority(
 }
 
 /** Durably publish one signed receipt leaf create-only, fsynced with its parent. */
-async function writeReceipt(root: string, file: string, receipt: QuarantineReceiptV1): Promise<void> {
-  await atomicWriteNoReplaceDurable(file, canonicalBytes(receipt), { confineRoot: root, exactParent: true, mode: 0o600 });
+async function writeReceipt(root: string, file: string, bytes: Buffer): Promise<void> {
+  await atomicWriteNoReplaceDurable(file, bytes, { confineRoot: root, exactParent: true, mode: 0o600 });
 }
 
 /**
@@ -173,19 +235,18 @@ async function writeReceipt(root: string, file: string, receipt: QuarantineRecei
  * attestation alike — never a fresh enumeration, so state that changed since the plan
  * was signed cannot drift into the completion.
  */
-async function planPhase(input: QuarantineMoveInput): Promise<QuarantinePlan> {
-  const paths = preparationQuarantineUnitPaths(input.root, input.unitId);
-  const existing = await readVerifiedReceipt(paths.plannedReceiptFile, input.key, "quarantine-planned", input.unitId);
+async function planPhase(leaves: QuarantineUnitLeaves, input: QuarantineMoveInput): Promise<QuarantinePlan> {
+  const existing = await readVerifiedReceipt(leaves, input.key, "quarantine-planned", input.unitId);
   if (existing !== null) {
     const { kind: _kind, integrity: _integrity, ...authority } = existing;
     return { authority };
   }
-  await mkdir(paths.bytesRoot, { recursive: true });
+  await leaves.prepareBytesRoot(input.unitId);
   const plan: QuarantinePlan = {
     authority: quarantineAuthority(input, planObjects(input.objects)),
   };
-  await writeReceipt(input.root, paths.plannedReceiptFile,
-    signQuarantineReceipt(input.key, receiptContent("quarantine-planned", plan.authority)));
+  await leaves.publishReceipt(input.unitId, "planned",
+    canonicalBytes(signQuarantineReceipt(input.key, receiptContent("quarantine-planned", plan.authority))));
   return plan;
 }
 
@@ -221,7 +282,6 @@ async function moveObject(root: string, unitId: string, object: QuarantineObject
     await assertMovedBytes(root, paths.bytesRoot, dest, object);
     return;
   }
-  const destPresent = destLeaf.kind;
   const sourcePresent = sourceLeaf.kind;
   if (sourcePresent === "absent") throw new Error(`quarantine source and destination both absent: ${object.logicalPath}`);
   await moveVerifiedSource(root, sourcePath, dest, object);
@@ -253,22 +313,24 @@ async function moveVerifiedSource(root: string, source: string, dest: string, ob
  * resumed unit re-proves each source against the signed plan first; a fresh plan
  * enumerated its digests moments earlier under the same lock.
  */
-async function movePhase(input: QuarantineMoveInput, objects: readonly QuarantineObjectV1[]): Promise<void> {
-  const paths = preparationQuarantineUnitPaths(input.root, input.unitId);
-  for (const object of objects) await moveObject(input.root, input.unitId, object);
-  await fsyncDirectoryChain(paths.bytesRoot);
+async function movePhase(leaves: QuarantineUnitLeaves, unitId: string, objects: readonly QuarantineObjectV1[]): Promise<void> {
+  for (const object of objects) await leaves.moveObject(unitId, object);
+  await leaves.syncBytesRoot(unitId);
 }
 
-/** Phase three: verify each moved leaf by byte count and cheap-readable digest. */
-async function verifyPhase(root: string, unitId: string, objects: readonly QuarantineObjectV1[]): Promise<void> {
-  for (const object of objects) {
-    const dest = preparationQuarantineUnitPaths(root, unitId).byteObjectFile(object.objectName);
-    const destStat = await stat(dest).catch(() => null);
-    if (destStat === null || !destStat.isFile() || destStat.size !== object.byteCount) {
-      throw new Error(`quarantine verification failed for ${object.logicalPath}`);
-    }
-    await assertMovedBytes(root, preparationQuarantineUnitPaths(root, unitId).bytesRoot, dest, object);
+/** Prove one moved leaf on disk: a regular file of the planned size holding the planned bytes. */
+async function verifyMovedObject(root: string, unitId: string, object: QuarantineObjectV1): Promise<void> {
+  const dest = preparationQuarantineUnitPaths(root, unitId).byteObjectFile(object.objectName);
+  const destStat = await stat(dest).catch(() => null);
+  if (destStat === null || !destStat.isFile() || destStat.size !== object.byteCount) {
+    throw new Error(`quarantine verification failed for ${object.logicalPath}`);
   }
+  await assertMovedBytes(root, preparationQuarantineUnitPaths(root, unitId).bytesRoot, dest, object);
+}
+
+/** Phase three: verify each moved leaf by byte count and cheap-readable digest, in plan order. */
+async function verifyPhase(leaves: QuarantineUnitLeaves, unitId: string, objects: readonly QuarantineObjectV1[]): Promise<void> {
+  for (const object of objects) await leaves.verifyMovedObject(unitId, object);
 }
 
 /**
@@ -278,28 +340,33 @@ async function verifyPhase(root: string, unitId: string, objects: readonly Quara
  * authenticates every receipt.
  */
 export async function runTwoPhaseQuarantine(input: QuarantineMoveInput): Promise<QuarantineReceiptV1> {
+  return runTwoPhaseQuarantineWith(diskQuarantineUnitLeaves(input.root), input);
+}
+
+/** {@link runTwoPhaseQuarantine} over the unit leaves: the one engine body. `input.root` is not read here. */
+export async function runTwoPhaseQuarantineWith(leaves: QuarantineUnitLeaves, input: QuarantineMoveInput): Promise<QuarantineReceiptV1> {
   assertLifecycleMutationPermit(input.permit, input.unitId);
-  const paths = preparationQuarantineUnitPaths(input.root, input.unitId);
-  const completed = await readVerifiedReceipt(paths.completedReceiptFile, input.key, "quarantine-completed", input.unitId);
+  const completed = await readVerifiedReceipt(leaves, input.key, "quarantine-completed", input.unitId);
   if (completed !== null) return completed;
-  const plan = await planPhase(input);
+  const plan = await planPhase(leaves, input);
   await input.faults?.afterPlanned?.();
-  await movePhase(input, plan.authority.objects);
+  await movePhase(leaves, input.unitId, plan.authority.objects);
   await input.faults?.afterMoves?.();
-  await verifyPhase(input.root, input.unitId, plan.authority.objects);
+  await verifyPhase(leaves, input.unitId, plan.authority.objects);
   await input.faults?.beforeCompleted?.();
   const receipt = signQuarantineReceipt(input.key,
     receiptContent("quarantine-completed", plan.authority));
-  await writeReceipt(input.root, paths.completedReceiptFile, receipt);
+  await leaves.publishReceipt(input.unitId, "completed", canonicalBytes(receipt));
   return receipt;
 }
 
 /** Digest one unit's completed receipt exactly as it sits on disk, or null if unreadable. */
 async function completedReceiptDigest(
-  root: string, unitId: string,
+  leaves: QuarantineUnitLeaves, unitId: string,
 ): Promise<{ kind: "digest"; digest: string } | { kind: "absent" } | { kind: "unavailable" }> {
-  const file = preparationQuarantineUnitPaths(root, unitId).completedReceiptFile;
-  const read = await readCappedNoFollowBuffer(file, MAX_LIFECYCLE_RECEIPT_BYTES);
+  // The RAW capped leaf, deliberately not an authenticated read: the attestation is
+  // a digest of the bytes as they sit, whoever signed them.
+  const read = await leaves.readReceiptLeaf(unitId, "completed", MAX_LIFECYCLE_RECEIPT_BYTES);
   // THREE-way, deliberately. Collapsing `unavailable` into `absent` here made an
   // unreadable receipt - oversize, non-regular, symlinked, EACCES - look exactly
   // like a unit that was never completed, so it was silently dropped from the
@@ -356,11 +423,18 @@ export interface RetirementSet {
 export async function retirableUnitsFrom(
   root: string, unitIds: readonly string[], excludeUnitId: string,
 ): Promise<RetirementSet> {
+  return retirableUnitsFromLeaves(diskQuarantineUnitLeaves(root), unitIds, excludeUnitId);
+}
+
+/** {@link retirableUnitsFrom} over the unit leaves: sequential, the excluded unit skipped, no re-parse. */
+export async function retirableUnitsFromLeaves(
+  leaves: QuarantineUnitLeaves, unitIds: readonly string[], excludeUnitId: string,
+): Promise<RetirementSet> {
   const retired: RetiredQuarantineUnitV1[] = [];
   const unreadable: string[] = [];
   for (const unitId of unitIds) {
     if (unitId === excludeUnitId) continue;
-    const receipt = await completedReceiptDigest(root, unitId);
+    const receipt = await completedReceiptDigest(leaves, unitId);
     if (receipt.kind === "unavailable") unreadable.push(unitId);
     if (receipt.kind === "digest") retired.push({ unitId, receiptDigest: receipt.digest });
   }
@@ -380,9 +454,14 @@ export async function retirableUnitsFrom(
  * unit directory waive the precondition and quarantine a healthy run.
  */
 export async function quarantineUnitStarted(root: string, unitId: string, key: Buffer): Promise<boolean> {
-  const paths = preparationQuarantineUnitPaths(root, unitId);
+  return quarantineUnitStartedFrom(diskQuarantineUnitLeaves(root), unitId, key);
+}
+
+/** {@link quarantineUnitStarted} over the unit leaves: positive evidence only. */
+async function quarantineUnitStartedFrom(leaves: QuarantineUnitLeaves, unitId: string, key: Buffer): Promise<boolean> {
+  assertUnitId(unitId);
   try {
-    return (await readVerifiedReceipt(paths.plannedReceiptFile, key, "quarantine-planned", unitId)) !== null;
+    return (await readVerifiedReceipt(leaves, key, "quarantine-planned", unitId)) !== null;
   } catch {
     return false;
   }

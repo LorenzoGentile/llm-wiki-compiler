@@ -12,6 +12,14 @@
  * (`upsertPhaseSummary`) and existing transition types — no new durable
  * vocabulary. The gate instance is keyed by the gate phase's `logicalPhaseId`,
  * which is what the gate authority looks the summary up by.
+ *
+ * ONE BODY EACH over {@link GateDriverSteps}, none of which takes a project
+ * root: {@link blockAtGateWith} and {@link resumeFromGateWith} decide under the
+ * lock (the read, the state and proceed checks, the projected append). The
+ * blocking lock is the one MECHANISM the steps carry. The root forms keep their
+ * signatures and pass {@link diskGateDriverSteps}, which calls the incumbent lock,
+ * reader and writer when asked; {@link gateDriverStepsOver} composes the read and
+ * the append from each one's own body, with the caller's lock.
  */
 
 import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
@@ -21,13 +29,50 @@ import { upsertPhaseSummary } from "./attempts/start.js";
 import { findApprovedGateProof } from "./gates.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
 import {
-  appendProjectedTransitionLocked, readPreparationRun, type PreparationRunContentProjector,
+  appendPreparationTransitionWith, appendProjectedTransitionLocked, readPreparationRun, readPreparationRunFrom,
+  type PreparationRunContentProjector, type PreparationRunLeafReads, type PreparationRunRead, type PreparationRunWriteSteps,
 } from "./run-store.js";
 import type { PhaseInstanceId } from "./ids.js";
 import type {
-  PhaseInstanceState, PhaseSummaryV1,
-  PreparationPrincipalV1, PreparationRunBinding, PreparationRunV1,
+  AppendPreparationTransitionInput, PhaseInstanceState, PhaseSummaryV1,
+  PreparationPrincipalV1, PreparationRunBinding, PreparationRunPredecessor, PreparationRunV1,
 } from "./run-types.js";
+
+/** One projected append fenced to `expected`, under a held lock. Shared by the gate driver and the gate operation. */
+export type ProjectedRunAppend = (
+  binding: PreparationRunBinding, expected: PreparationRunPredecessor,
+  input: AppendPreparationTransitionInput, project: PreparationRunContentProjector,
+) => Promise<PreparationRunV1>;
+
+/** What one gate move asks for, in order. No member takes a project root. */
+export interface GateDriverSteps {
+  /** The blocking project lock: a MECHANISM, no decision. */
+  readonly lock: { acquire(): Promise<void>; release(): Promise<void> };
+  /** The run at `binding`, authenticated. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The projected append. */
+  readonly appendProjected: ProjectedRunAppend;
+}
+
+/** LOCAL DISK. The incumbent lock, reader and writer for `root`, each called when asked. */
+function diskGateDriverSteps(root: string): GateDriverSteps {
+  return {
+    lock: { acquire: () => acquireMutationLockBlocking(root, "ordinary"), release: () => releaseLock(root) },
+    readRun: (binding) => readPreparationRun(root, binding),
+    appendProjected: (binding, expected, input, project) => appendProjectedTransitionLocked(root, binding, expected, input, project),
+  };
+}
+
+/** The same read and append over the run store's own bodies, under the caller's `lock`. Building it does no I/O. */
+export function gateDriverStepsOver(
+  sources: { runs: PreparationRunLeafReads; writes: PreparationRunWriteSteps }, lock: GateDriverSteps["lock"],
+): GateDriverSteps {
+  return {
+    lock,
+    readRun: (binding) => readPreparationRunFrom(sources.runs, binding),
+    appendProjected: (binding, expected, input, project) => appendPreparationTransitionWith(sources.writes, binding, expected, input, project),
+  };
+}
 
 /** The gate phase the runner is driving — enough to bind and materialize its instance. */
 export interface GatePhaseV1 {
@@ -71,9 +116,17 @@ export async function blockAtGate(
   root: string, binding: PreparationRunBinding, gate: GatePhaseV1,
   actor: PreparationPrincipalV1, at: string,
 ): Promise<GateMoveV1> {
-  return underGateLock(root, binding, async (run) => {
+  return blockAtGateWith(diskGateDriverSteps(root), binding, gate, actor, at);
+}
+
+/** {@link blockAtGate} over {@link GateDriverSteps}: THE ONE BODY. */
+export async function blockAtGateWith(
+  steps: GateDriverSteps, binding: PreparationRunBinding, gate: GatePhaseV1,
+  actor: PreparationPrincipalV1, at: string,
+): Promise<GateMoveV1> {
+  return underGateLock(steps, binding, async (run) => {
     if (!BLOCKABLE_STATES.has(run.state)) return { status: "refused", reason: `run is ${run.state}, not running` };
-    const next = await appendProjectedTransitionLocked(root, binding, preparationRunPredecessor(run), {
+    const next = await steps.appendProjected(binding, preparationRunPredecessor(run), {
       type: "phase-progressed", stateAfter: "awaiting-gate",
       payload: { kind: "phase", phaseInstanceId: gate.phaseInstanceId, phaseState: "awaiting-gate" },
       actor: { id: actor.id, surface: actor.surface }, at,
@@ -92,12 +145,20 @@ export async function resumeFromGate(
   root: string, binding: PreparationRunBinding, gate: GatePhaseV1,
   actor: PreparationPrincipalV1, at: string,
 ): Promise<GateMoveV1> {
-  return underGateLock(root, binding, async (run) => {
+  return resumeFromGateWith(diskGateDriverSteps(root), binding, gate, actor, at);
+}
+
+/** {@link resumeFromGate} over {@link GateDriverSteps}: THE ONE BODY. */
+export async function resumeFromGateWith(
+  steps: GateDriverSteps, binding: PreparationRunBinding, gate: GatePhaseV1,
+  actor: PreparationPrincipalV1, at: string,
+): Promise<GateMoveV1> {
+  return underGateLock(steps, binding, async (run) => {
     if (run.state !== "awaiting-gate") return { status: "refused", reason: `run is ${run.state}, not awaiting-gate` };
     if (!hasProceedDecision(run, gate)) {
       return { status: "refused", reason: `gate ${gate.gateId} has no operative approval` };
     }
-    const next = await appendProjectedTransitionLocked(root, binding, preparationRunPredecessor(run), {
+    const next = await steps.appendProjected(binding, preparationRunPredecessor(run), {
       type: "phase-progressed", stateAfter: "running",
       payload: { kind: "phase", phaseInstanceId: gate.phaseInstanceId, phaseState: "succeeded" },
       actor: { id: actor.id, surface: actor.surface }, at,
@@ -123,15 +184,15 @@ function gateSummaryProjector(gate: GatePhaseV1, state: PhaseInstanceState): Pre
 
 /** Acquire the ordinary lock, read the run, and hand it to one gate move. */
 async function underGateLock(
-  root: string, binding: PreparationRunBinding,
+  steps: GateDriverSteps, binding: PreparationRunBinding,
   move: (run: PreparationRunV1) => Promise<GateMoveV1>,
 ): Promise<GateMoveV1> {
-  await acquireMutationLockBlocking(root, "ordinary");
+  await steps.lock.acquire();
   try {
-    const read = await readPreparationRun(root, binding);
+    const read = await steps.readRun(binding);
     if (read.status !== "ok") return { status: "refused", reason: `run unreadable: ${read.status}` };
     return await move(read.run);
   } finally {
-    await releaseLock(root);
+    await steps.lock.release();
   }
 }

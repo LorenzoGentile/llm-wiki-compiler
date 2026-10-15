@@ -12,14 +12,21 @@
  * rather than opening a duplicate, and every entry point demands the explicit
  * destructive confirmation. Purge destroys only a complete, receipt-verified unit's
  * quarantined bytes and retains the signed receipts as the historical tombstone.
+ *
+ * THE TWO ASSESSMENTS ARE BODIES. `assessPerRunQuarantine` and
+ * `assessQuarantinePurge` own every refusal, its code and message, and the read
+ * order, over {@link QuarantineAssessmentReads}; the driver adapters call them
+ * with the local reads INSIDE the same driver lease as before. This does NOT make
+ * the capture and the key/receipt reads one observation: key and receipt BYTES are
+ * still read separately from the capture, which remains the recorded 9E debt.
  */
 
 import { ungated, type UngatedInput } from "./lifecycle-driver.js";
 import { createHash } from "node:crypto";
-import { readPreparationKey } from "./key-epoch.js";
+import { readPreparationKey, type PreparationKeyRead } from "./key-epoch.js";
 import {
   runLifecycleCustodyOperation,
-  type LifecycleCustodyAdapter, type LifecycleGoverningKey,
+  type LifecycleCustodyAdapter, type LifecycleCustodyAssessment, type LifecycleGoverningKey,
 } from "./lifecycle-driver.js";
 import {
   captureLifecycleScopedObject,
@@ -28,8 +35,8 @@ import {
   quarantineUnitConfinement,
 } from "./lifecycle-fs/quarantine-operations.js";
 import { PreparationLifecycleNamespaceError } from "./lifecycle-fs/namespace.js";
-import { readPreparationRun } from "./run-store.js";
-import { scanActivePreparationStore, type PreparationLeafObservation } from "./orphan-scan.js";
+import { readPreparationRun, type PreparationRunRead } from "./run-store.js";
+import { scanActivePreparationStore, type PreparationLeafObservation, type PreparationOrphanScan } from "./orphan-scan.js";
 import type { PreparationLifecycleReadV1 } from "./lifecycle-snapshot/types.js";
 import { type QuarantineReceiptV1 } from "./receipts.js";
 import {
@@ -50,6 +57,37 @@ export class PreparationQuarantineError extends Error {
   }
 }
 
+/**
+ * What the quarantine and purge assessments read. Each member is a whole domain
+ * read; none takes a project root. All run inside the driver's read lease.
+ */
+export interface QuarantineAssessmentReads {
+  /** The preparation key WITH ITS BYTES (custody and HMAC need them). Local: `readPreparationKey(root)`. */
+  readKey(): Promise<PreparationKeyRead>;
+  /** Whether an authenticated plan already started this unit. Local: `quarantineUnitStarted(root, ...)`. */
+  unitStarted(unitId: string, key: Buffer): Promise<boolean>;
+  /** A semantically settled completed receipt, or null. Local: `readSettledQuarantineReceipt(root, ...)`. */
+  readSettledReceipt(unitId: string, key: Buffer, expect: Parameters<typeof readSettledQuarantineReceipt>[3]): Promise<QuarantineReceiptV1 | null>;
+  /** The authenticated run. Local: `readPreparationRun(root, binding)`. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The run's owned leaves, from the driver's capture. Local: `enumerateRunScope(root, ...)`. */
+  enumerateRunScope(binding: PreparationRunBinding, read: PreparationLifecycleReadV1): Promise<ScopedQuarantineObject[]>;
+  /** The unit directory's confinement and completed-receipt presence. Local: this module's physical observation. */
+  observePurgeUnit(unitId: string): ReturnType<typeof observePurgeUnit>;
+}
+
+/** The local assessment reads for one root, built per call. In no package index. */
+function localQuarantineAssessmentReads(root: string): QuarantineAssessmentReads {
+  return {
+    readKey: () => readPreparationKey(root),
+    unitStarted: (unitId, key) => quarantineUnitStarted(root, unitId, key),
+    readSettledReceipt: (unitId, key, expect) => readSettledQuarantineReceipt(root, unitId, key, expect),
+    readRun: (binding) => readPreparationRun(root, binding),
+    enumerateRunScope: (binding, read) => enumerateRunScope(root, binding, read),
+    observePurgeUnit: (unitId) => observePurgeUnit(root, unitId),
+  };
+}
+
 /** Explicit residual-state confirmation for one per-run quarantine. */
 export interface QuarantineRunInput {
   binding: PreparationRunBinding;
@@ -64,15 +102,46 @@ export function perRunQuarantineUnitId(runId: string): string {
   return `qtn-${createHash("sha256").update(runId, "utf8").digest("hex").slice(0, 32)}`;
 }
 
+/**
+ * What the destructive SCOPE policy reads. Physical: the active-store walk, the
+ * confined hashing capture of one leaf, and the prune custody listing. The scope
+ * bodies own the completeness gates, the owned-leaf filters, the concurrency shape
+ * and the error mapping. No member takes a project root.
+ */
+interface DestructiveScopeReads {
+  /** The active preparation store walk. Local: `scanActivePreparationStore(root)`. */
+  scanActiveStore(): Promise<PreparationOrphanScan>;
+  /** The confined capture (path, bytes, digest) of one leaf. Local: `captureLifecycleScopedObject(root, ...)`. */
+  captureObject(relativePath: string, byteCount: number): Promise<ScopedQuarantineObject>;
+  /** Every durable leaf under the prune registry. Local: `enumeratePruneCustodyLeaves(root)`. */
+  listPruneCustodyLeaves(): ReturnType<typeof enumeratePruneCustodyLeaves>;
+}
+
+/** The local scope reads for one root, built per call. In no package index. */
+function localDestructiveScopeReads(root: string): DestructiveScopeReads {
+  return {
+    scanActiveStore: () => scanActivePreparationStore(root),
+    captureObject: (relativePath, byteCount) => captureLifecycleScopedObject(root, relativePath, byteCount),
+    listPruneCustodyLeaves: () => enumeratePruneCustodyLeaves(root),
+  };
+}
+
 /** Build one scoped move object from an observed preparation leaf. */
-async function scopedObject(root: string, leaf: PreparationLeafObservation): Promise<ScopedQuarantineObject> {
-  return scopedLeafObject(root, leaf.relativePath, leaf.bytes);
+async function scopedObject(reads: DestructiveScopeReads, leaf: PreparationLeafObservation): Promise<ScopedQuarantineObject> {
+  return scopedLeafObjectFrom(reads, leaf.relativePath, leaf.bytes);
 }
 
 /** Build one scoped move object from a source path and observed byte count. */
 export async function scopedLeafObject(root: string, relativePath: string, byteCount: number): Promise<ScopedQuarantineObject> {
+  return scopedLeafObjectFrom(localDestructiveScopeReads(root), relativePath, byteCount);
+}
+
+/** {@link scopedLeafObject} over the scope reads: any capture failure is `unit-unavailable`. */
+async function scopedLeafObjectFrom(
+  reads: DestructiveScopeReads, relativePath: string, byteCount: number,
+): Promise<ScopedQuarantineObject> {
   try {
-    return await captureLifecycleScopedObject(root, relativePath, byteCount);
+    return await reads.captureObject(relativePath, byteCount);
   } catch (error) {
     throw new PreparationQuarantineError("unit-unavailable", (error as Error).message);
   }
@@ -86,7 +155,14 @@ export async function scopedLeafObject(root: string, relativePath: string, byteC
  * the scope claims while signing a receipt that attests the whole scope, so the plan
  * is refused until the inventory can be taken completely.
  */
-export async function scanForDestructivePlan(root: string, read: PreparationLifecycleReadV1) {
+export async function scanForDestructivePlan(root: string, read: PreparationLifecycleReadV1): Promise<PreparationOrphanScan> {
+  return scanForDestructivePlanFrom(localDestructiveScopeReads(root), read);
+}
+
+/** {@link scanForDestructivePlan} over the scope reads: the capture's registry gate, then the active scan's own gate. */
+async function scanForDestructivePlanFrom(
+  reads: Pick<DestructiveScopeReads, "scanActiveStore">, read: PreparationLifecycleReadV1,
+): Promise<PreparationOrphanScan> {
   // REGISTRY completeness comes from the driver's capture, not from walking the
   // registry again. The previous version called `scanPreparationOrphans`, which
   // walks active storage AND the lifecycle registry — a second enumeration of
@@ -124,7 +200,7 @@ export async function scanForDestructivePlan(root: string, read: PreparationLife
   // ACTIVE storage still needs its own walk: a lifecycle snapshot carries unit
   // and storage state, never the per-leaf detail a plan must name. This is the
   // narrowly bound read, not a second look at the registry.
-  return completeActiveScan(root);
+  return completeActiveScan(reads);
 }
 
 /**
@@ -141,8 +217,8 @@ const REGISTRY_COMPLETENESS_PROBLEMS: ReadonlySet<string> = new Set([
  * A destructive plan may only be built from a COMPLETE inventory: planning from
  * a partial scan quarantines a subset and reports success.
  */
-async function completeActiveScan(root: string) {
-  const scan = await scanActivePreparationStore(root);
+async function completeActiveScan(reads: Pick<DestructiveScopeReads, "scanActiveStore">): Promise<PreparationOrphanScan> {
+  const scan = await reads.scanActiveStore();
   if (scan.problems.length > 0) {
     const dimensions = [...new Set(scan.problems.map((problem) => problem.dimension))].sort().join(", ");
     throw new PreparationQuarantineError("unit-unavailable",
@@ -155,16 +231,23 @@ async function completeActiveScan(root: string) {
 export async function enumerateRunScope(
   root: string, binding: PreparationRunBinding, read: PreparationLifecycleReadV1,
 ): Promise<ScopedQuarantineObject[]> {
-  return ownedRunLeaves(root, binding, await scanForDestructivePlan(root, read));
+  return enumerateRunScopeFrom(localDestructiveScopeReads(root), binding, read);
+}
+
+/** {@link enumerateRunScope} over the scope reads. */
+async function enumerateRunScopeFrom(
+  reads: DestructiveScopeReads, binding: PreparationRunBinding, read: PreparationLifecycleReadV1,
+): Promise<ScopedQuarantineObject[]> {
+  return ownedRunLeaves(reads, binding, await scanForDestructivePlanFrom(reads, read));
 }
 
 /** The leaves one run exclusively owns, from an already-gated scan. */
 function ownedRunLeaves(
-  root: string, binding: PreparationRunBinding, scan: { leaves: readonly PreparationLeafObservation[] },
+  reads: DestructiveScopeReads, binding: PreparationRunBinding, scan: { leaves: readonly PreparationLeafObservation[] },
 ): Promise<ScopedQuarantineObject[]> {
   const owned = scan.leaves.filter((leaf) => leaf.kind !== "quarantine" && leaf.workspaceId === binding.workspaceId
     && (leaf.preparationId === binding.preparationId || leaf.runId === binding.runId));
-  return Promise.all(owned.map((leaf) => scopedObject(root, leaf)));
+  return Promise.all(owned.map((leaf) => scopedObject(reads, leaf)));
 }
 
 /**
@@ -178,10 +261,17 @@ function ownedRunLeaves(
 export async function enumerateProjectScope(
   root: string, read: PreparationLifecycleReadV1,
 ): Promise<ScopedQuarantineObject[]> {
-  const scan = await scanForDestructivePlan(root, read);
+  return enumerateProjectScopeFrom(localDestructiveScopeReads(root), read);
+}
+
+/** {@link enumerateProjectScope} over the scope reads: gated scan, staged prune leaves, then active captures, active first. */
+async function enumerateProjectScopeFrom(
+  reads: DestructiveScopeReads, read: PreparationLifecycleReadV1,
+): Promise<ScopedQuarantineObject[]> {
+  const scan = await scanForDestructivePlanFrom(reads, read);
   const active = scan.leaves.filter((leaf) => leaf.kind !== "quarantine");
-  const staged = await enumeratePruneUnitContents(root);
-  return [...await Promise.all(active.map((leaf) => scopedObject(root, leaf))), ...staged];
+  const staged = await enumeratePruneUnitContents(reads);
+  return [...await Promise.all(active.map((leaf) => scopedObject(reads, leaf))), ...staged];
 }
 
 /**
@@ -190,11 +280,13 @@ export async function enumerateProjectScope(
  * destroying: the next sweep reads one, cannot verify it under the fresh key, and
  * fails permanently. The reset therefore empties each unit completely.
  */
-async function enumeratePruneUnitContents(root: string): Promise<ScopedQuarantineObject[]> {
+async function enumeratePruneUnitContents(reads: DestructiveScopeReads): Promise<ScopedQuarantineObject[]> {
   try {
-    const leaves = await enumeratePruneCustodyLeaves(root);
+    const leaves = await reads.listPruneCustodyLeaves();
+    // NOT awaited, exactly as before: only the LISTING rejection is mapped by this
+    // catch; a capture rejection already arrives as `unit-unavailable`.
     return Promise.all(leaves.map((leaf) =>
-      scopedLeafObject(root, leaf.relativePath, leaf.byteCount)));
+      scopedLeafObjectFrom(reads, leaf.relativePath, leaf.byteCount)));
   } catch (error) {
     if (error instanceof PreparationQuarantineError) throw error;
     throw new PreparationQuarantineError("unit-unavailable", (error as Error).message);
@@ -241,6 +333,54 @@ function captureQuarantineInput(input: QuarantineRunInput): UngatedInput<Quarant
 }
 
 /**
+ * The per-run quarantine assessment: confirmation, eligibility from the driver's
+ * capture, key material cross-checked against the captured epoch, the fresh-start
+ * precondition, and the object set. Read-only; runs inside the driver lease.
+ */
+export async function assessPerRunQuarantine(
+  reads: QuarantineAssessmentReads, input: UngatedInput<QuarantineRunInput>, read: PreparationLifecycleReadV1,
+): Promise<LifecycleCustodyAssessment<"custody-move">> {
+  if (input.confirmResidualState !== true) {
+    throw new PreparationQuarantineError("confirmation-required", "quarantine requires explicit residual-state confirmation");
+  }
+  // ELIGIBILITY comes from the driver's capture, which already carries the key
+  // STATE. Deciding it from an independent read was the observation this
+  // migration exists to remove, and it also let the decision and the material
+  // disagree — the snapshot could say absent while a key appeared a moment
+  // later, and only the second read would be believed.
+  if (read.status !== "ok") {
+    throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
+  }
+  const keyState = read.snapshot.keyState;
+  if (keyState.status === "absent") throw new PreparationQuarantineError("key-missing", "per-run quarantine requires a healthy key; use reset");
+  if (keyState.status !== "ok") throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
+  // The BYTES still need their own read, and this is the honest limit of the
+  // single capture: a lifecycle snapshot carries key state and epoch id, never
+  // key material, because HMAC verification and the custody phase both need
+  // the secret itself. The capture decides eligibility; this supplies material,
+  // and the epoch ids are cross-checked so the two cannot silently diverge.
+  const key = await reads.readKey();
+  if (key.status !== "ok" || key.keyEpochId !== keyState.keyEpochId) {
+    throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
+  }
+  const unitId = perRunQuarantineUnitId(input.binding.runId);
+  // The fresh-start precondition is part of assessment, not authorization: a
+  // unit already started waives it only on proof of semantic settlement.
+  if (!(await reads.unitStarted(unitId, key.key))) {
+    await assertIntegrityInvalid(reads, input.binding, unitId, { key: key.key, keyEpochId: key.keyEpochId });
+  }
+  return {
+    key: { key: key.key, keyEpochId: key.keyEpochId },
+    draft: {
+      kind: "custody-move" as const,
+      unitId, scope: "per-run", reason: "run-integrity-invalid", runId: input.binding.runId,
+      objects: await reads.enumerateRunScope(input.binding, read),
+      residualObligations: ["run-integrity-invalid", "operator-accepted-residual-state"],
+    },
+  };
+}
+
+/**
  * Per-run quarantine as a driver adapter (PLA-INV-07). It supplies only
  * eligibility and the object set; the custody protocol itself belongs to the
  * driver. Every refusal code and its message are unchanged, because they are part
@@ -252,46 +392,7 @@ const perRunQuarantineAdapter: LifecycleCustodyAdapter<UngatedInput<QuarantineRu
 
   // Read-only throughout. Per-run quarantine has no epoch to materialize, so the
   // key it reads here is the key the custody phase uses.
-  async assess(root, input, read) {
-    if (input.confirmResidualState !== true) {
-      throw new PreparationQuarantineError("confirmation-required", "quarantine requires explicit residual-state confirmation");
-    }
-    // ELIGIBILITY comes from the driver's capture, which already carries the key
-    // STATE. Deciding it from an independent read was the observation this
-    // migration exists to remove, and it also let the decision and the material
-    // disagree — the snapshot could say absent while a key appeared a moment
-    // later, and only the second read would be believed.
-    if (read.status !== "ok") {
-      throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
-    }
-    const keyState = read.snapshot.keyState;
-    if (keyState.status === "absent") throw new PreparationQuarantineError("key-missing", "per-run quarantine requires a healthy key; use reset");
-    if (keyState.status !== "ok") throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
-    // The BYTES still need their own read, and this is the honest limit of the
-    // single capture: a lifecycle snapshot carries key state and epoch id, never
-    // key material, because HMAC verification and the custody phase both need
-    // the secret itself. The capture decides eligibility; this supplies material,
-    // and the epoch ids are cross-checked so the two cannot silently diverge.
-    const key = await readPreparationKey(root);
-    if (key.status !== "ok" || key.keyEpochId !== keyState.keyEpochId) {
-      throw new PreparationQuarantineError("key-unreadable", "per-run quarantine requires a healthy key; use reset");
-    }
-    const unitId = perRunQuarantineUnitId(input.binding.runId);
-    // The fresh-start precondition is part of assessment, not authorization: a
-    // unit already started waives it only on proof of semantic settlement.
-    if (!(await quarantineUnitStarted(root, unitId, key.key))) {
-      await assertIntegrityInvalid(root, input.binding, unitId, { key: key.key, keyEpochId: key.keyEpochId });
-    }
-    return {
-      key: { key: key.key, keyEpochId: key.keyEpochId },
-      draft: {
-          kind: "custody-move" as const,
-        unitId, scope: "per-run", reason: "run-integrity-invalid", runId: input.binding.runId,
-        objects: await enumerateRunScope(root, input.binding, read),
-        residualObligations: ["run-integrity-invalid", "operator-accepted-residual-state"],
-      },
-    };
-  },
+  assess: (root, input, read) => assessPerRunQuarantine(localQuarantineAssessmentReads(root), input, read),
 
   // Nothing to materialize. The permit is still minted and carried, because the
   // custody engine requires one however the key was obtained.
@@ -308,13 +409,13 @@ const perRunQuarantineAdapter: LifecycleCustodyAdapter<UngatedInput<QuarantineRu
  * the precondition and let a healthy run be quarantined.
  */
 async function assertIntegrityInvalid(
-  root: string, binding: PreparationRunBinding, unitId: string, key: { key: Buffer; keyEpochId: string },
+  reads: QuarantineAssessmentReads, binding: PreparationRunBinding, unitId: string, key: { key: Buffer; keyEpochId: string },
 ): Promise<void> {
-  const settled = await readSettledQuarantineReceipt(root, unitId, key.key, {
+  const settled = await reads.readSettledReceipt(unitId, key.key, {
     keyEpochId: key.keyEpochId, scope: "per-run", reason: "run-integrity-invalid",
   });
   if (settled !== null) return; // already quarantined; the engine settles idempotently
-  const read = await readPreparationRun(root, binding);
+  const read = await reads.readRun(binding);
   if (!(read.status === "unavailable" && read.code === "run-integrity-invalid")) {
     throw new PreparationQuarantineError("not-integrity-invalid",
       `per-run quarantine requires an integrity-invalid run, saw ${read.status === "ok" ? read.run.state : read.status}`);
@@ -330,6 +431,37 @@ export interface PurgeQuarantineInput {
 }
 
 /**
+ * The purge assessment: destroy confirmation, the current key, the unit's
+ * confinement and completed-receipt presence, then semantic settlement under that
+ * key. Read-only; runs inside the driver lease.
+ */
+export async function assessQuarantinePurge(
+  reads: QuarantineAssessmentReads, input: UngatedInput<PurgeQuarantineInput>,
+): Promise<LifecycleCustodyAssessment<"verified-destroy">> {
+  if (input.confirmDestroy !== true) {
+    throw new PreparationQuarantineError("confirmation-required", "purge requires explicit destroy confirmation");
+  }
+  const key = await reads.readKey();
+  if (key.status !== "ok") throw new PreparationQuarantineError("unit-unavailable", "purge requires the current key to verify the unit");
+  const { confinement, receiptStatus } = await reads.observePurgeUnit(input.unitId);
+  if (confinement === "redirected") {
+    throw new PreparationQuarantineError("unit-unavailable", "quarantine unit is not a real confined directory");
+  }
+  if (receiptStatus === "absent") {
+    throw new PreparationQuarantineError("unit-incomplete", "purge requires a completed quarantine unit");
+  }
+  const settled = await reads.readSettledReceipt(input.unitId, key.key, { keyEpochId: key.keyEpochId });
+  if (settled === null) {
+    throw new PreparationQuarantineError("unit-unavailable",
+      "purge requires a completed receipt that authenticates for this exact unit, kind, and epoch");
+  }
+  return {
+    draft: { kind: "verified-destroy" as const, unitId: input.unitId, objects: settled.objects, settled },
+    key: { key: key.key, keyEpochId: key.keyEpochId },
+  };
+}
+
+/**
  * Purge one complete quarantine unit's bytes after verifying its completed receipt
  * under the current key. It deletes only the moved bytes and keeps the signed
  * receipts as the minimal historical tombstone; a pending or unverifiable unit is
@@ -340,34 +472,7 @@ const purgeAdapter: LifecycleCustodyAdapter<UngatedInput<PurgeQuarantineInput>, 
   operation: "purge",
   planKind: "verified-destroy",
 
-  async assess(root, input) {
-    if (input.confirmDestroy !== true) {
-      throw new PreparationQuarantineError("confirmation-required", "purge requires explicit destroy confirmation");
-    }
-    const key = await readPreparationKey(root);
-    if (key.status !== "ok") throw new PreparationQuarantineError("unit-unavailable", "purge requires the current key to verify the unit");
-    const { confinement, receiptStatus } = await observePurgeUnit(root, input.unitId);
-    if (confinement === "redirected") {
-      throw new PreparationQuarantineError("unit-unavailable", "quarantine unit is not a real confined directory");
-    }
-    if (receiptStatus === "absent") {
-      throw new PreparationQuarantineError("unit-incomplete", "purge requires a completed quarantine unit");
-    }
-    const settled = await readSettledQuarantineReceipt(root, input.unitId, key.key, { keyEpochId: key.keyEpochId });
-    if (settled === null) {
-      throw new PreparationQuarantineError("unit-unavailable",
-        "purge requires a completed receipt that authenticates for this exact unit, kind, and epoch");
-    }
-    return {
-      draft: {
-        kind: "verified-destroy" as const,
-        unitId: input.unitId,
-        objects: settled.objects,
-        settled,
-      },
-      key: { key: key.key, keyEpochId: key.keyEpochId },
-    };
-  },
+  assess: (root, input) => assessQuarantinePurge(localQuarantineAssessmentReads(root), input),
 
   materialize: async (_root, _input, assessment) => assessment.key as LifecycleGoverningKey,
 };

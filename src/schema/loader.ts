@@ -7,10 +7,10 @@
  * projects continue to work without any migration.
  */
 
-import { existsSync } from "fs";
-import { readFile } from "fs/promises";
 import path from "path";
 import yaml from "js-yaml";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import type {
   PageKind,
   PageKindRule,
@@ -30,11 +30,10 @@ const SCHEMA_CANDIDATE_PATHS = [
   "wiki/.schema.yml",
 ];
 
-/** Find the first existing schema candidate path under `root`, or null. */
-function findSchemaPath(root: string): string | null {
+/** Find the first existing schema candidate path, in priority order, or null. */
+async function findSchemaPath(reads: LegacyLocalReads): Promise<string | null> {
   for (const candidate of SCHEMA_CANDIDATE_PATHS) {
-    const absolute = path.join(root, candidate);
-    if (existsSync(absolute)) return absolute;
+    if (await reads.exists(candidate)) return candidate;
   }
   return null;
 }
@@ -125,14 +124,35 @@ function applyOverrides(
  * @param root - Project root directory.
  * @returns Resolved schema config.
  */
-export async function loadSchema(root: string): Promise<SchemaConfig> {
+export function loadSchema(root: string): Promise<SchemaConfig> {
+  return loadSchemaFrom(diskLocalReads(root));
+}
+
+/**
+ * The same schema, read through `reads`. Parse errors keep naming the located
+ * path, so a local project's messages still carry the file's absolute path.
+ */
+export async function loadSchemaFrom(reads: LegacyLocalReads): Promise<SchemaConfig> {
   const defaults = buildDefaultSchema();
-  const schemaPath = findSchemaPath(root);
+  const schemaPath = await findSchemaPath(reads);
   if (!schemaPath) return defaults;
 
-  const raw = await readFile(schemaPath, "utf-8");
-  const parsed = parseSchemaFile(schemaPath, raw);
-  return applyOverrides(defaults, parsed, schemaPath);
+  const raw = await reads.readText(schemaPath);
+  return schemaFromText(reads.locate(schemaPath), raw);
+}
+
+/**
+ * Resolve a schema from text already read, or the defaults when there is none.
+ * A reader with no filesystem uses this so its schema is merged and normalized
+ * by the same code as a local project's.
+ *
+ * @param schemaName - The schema's file name; its extension selects JSON or YAML.
+ * @param raw - The schema text, or `null` when the project declares no schema.
+ */
+function schemaFromText(schemaName: string, raw: string | null): SchemaConfig {
+  const defaults = buildDefaultSchema();
+  if (raw === null) return defaults;
+  return applyOverrides(defaults, parseSchemaFile(schemaName, raw), schemaName);
 }
 
 /** Expose candidate paths so the CLI `schema init` command can pick one. */

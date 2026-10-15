@@ -5,18 +5,54 @@
  * operation-aware relation seam (never a duplicate write to attach a mutation id).
  * An authority record present without its child audit event is partially applied;
  * recovery repairs only the event.
+ *
+ * ONE BODY. {@link defineRelationAdapter} owns every verdict (profile validity,
+ * the declared-digest and promise checks, the append-shaped observation with
+ * its duplicate, partial and unbound-satisfaction arms, the operation-aware
+ * append's outcomes, verify) over {@link RelationAdapterStores}, none of which
+ * takes a project root. The shipped {@link relationAdapter} passes the local
+ * stores, which read the context's root when called and call the incumbent
+ * profile loader, relation and event readers and
+ * `appendRelationForOperationLocked`. `AdapterContext.root` stays the
+ * compatibility handle a host adapter receives.
  */
 
-import { readEvents } from "../../events/store-read.js";
-import { appendRelationForOperationLocked } from "../../relations/operation-write.js";
+import { readEvents, type ReadEventsResult } from "../../events/store-read.js";
+import { appendRelationForOperationLocked, type RelationOperationApply } from "../../relations/operation-write.js";
 import { relationContentHash } from "../../relations/digest.js";
 import { buildRelationRef, type AppendRelationInput } from "../../relations/store.js";
-import { readRelationRecords, type BoundRelationRecord } from "../../relations/store-read.js";
-import type { CitationRef } from "../../relations/types.js";
+import { readRelationRecords, type BoundRelationRecord, type ReadRelationRecordsResult } from "../../relations/store-read.js";
+import type { CitationRef, RelationRef } from "../../relations/types.js";
 import type { EntityId, ProfilePack } from "../../profile/types.js";
-import { defineOperationStoreAdapter, type AdapterContext, type OperationObservation, type OperationStoreAdapter } from "../adapter-types.js";
+import type { OperationBinding } from "../../utils/operation-binding.js";
+import {
+  defineOperationStoreAdapter, type AdapterApply, type AdapterContext, type AdapterPreflight, type AdapterVerify,
+  type OperationObservation, type OperationStoreAdapter,
+} from "../adapter-types.js";
 import type { RelationOperationMutation } from "../types.js";
 import { loadProfileOrUndefined, toOperationBinding } from "./shared.js";
+
+/** What the relation adapter asks of the project. No member takes a project root. */
+export interface RelationAdapterStores {
+  /** The active profile, or undefined when none is loadable. */
+  loadProfile(): Promise<ProfilePack | undefined>;
+  /** Every relation record with its operation binding. */
+  readRelations(): Promise<ReadRelationRecordsResult>;
+  /** The project's audit events. */
+  readEvents(): Promise<ReadEventsResult>;
+  /** The operation-aware append (never a duplicate write); the caller holds the project lock. */
+  appendForOperation(profile: ProfilePack, input: AppendRelationInput, binding: OperationBinding, promisedId: RelationRef["id"]): Promise<RelationOperationApply>;
+}
+
+/** LOCAL DISK. The incumbent loader, readers and relation seam, each reading the context's root when called. */
+function diskRelationAdapterStores(ctx: Pick<AdapterContext, "root">): RelationAdapterStores {
+  return {
+    loadProfile: () => loadProfileOrUndefined(ctx.root),
+    readRelations: () => readRelationRecords(ctx.root),
+    readEvents: () => readEvents(ctx.root),
+    appendForOperation: (profile, input, binding, promisedId) => appendRelationForOperationLocked(ctx.root, profile, input, binding, promisedId),
+  };
+}
 
 /** Build the validated relation input from the manifest mutation. */
 function relationInput(mutation: RelationOperationMutation): AppendRelationInput {
@@ -55,15 +91,15 @@ function declaredDigestConflict(mutation: RelationOperationMutation): string | n
 }
 
 /** Observe append-shaped relation state against the mutation identity + content. */
-async function observeRelation(ctx: AdapterContext<RelationOperationMutation>): Promise<OperationObservation> {
+async function observeRelation(stores: RelationAdapterStores, ctx: AdapterContext<RelationOperationMutation>): Promise<OperationObservation> {
   const mutationId = ctx.auditBinding.mutationId;
-  const state = await relationState(ctx.root, mutationId);
+  const state = await relationState(stores, mutationId);
   if (state === null) return { outcome: "unavailable", detail: "relation or event store is unreadable" };
   const boundRecords = state.records.filter((record) => record.operationBinding?.mutationId === mutationId);
   if (boundRecords.length > 1 || state.boundEvents > 1) return { outcome: "conflict", detail: "duplicate relation authority for mutation" };
   const digestConflict = declaredDigestConflict(ctx.mutation);
   if (digestConflict !== null) return { outcome: "conflict", detail: digestConflict };
-  const profile = await loadProfileOrUndefined(ctx.root);
+  const profile = await stores.loadProfile();
   if (!profile) return { outcome: "unavailable", detail: "no profile is active" };
   let contentHash: string;
   try { contentHash = buildRelationRef(profile, relationInput(ctx.mutation)).contentHash; }
@@ -75,11 +111,11 @@ async function observeRelation(ctx: AdapterContext<RelationOperationMutation>): 
 
 /** Read the relation and event stores for one mutation identity, or null when unreadable. */
 async function relationState(
-  root: string, mutationId: string,
+  stores: RelationAdapterStores, mutationId: string,
 ): Promise<{ records: readonly BoundRelationRecord[]; boundEvents: number } | null> {
   try {
-    const records = (await readRelationRecords(root)).records;
-    const boundEvents = (await readEvents(root)).events
+    const records = (await stores.readRelations()).records;
+    const boundEvents = (await stores.readEvents()).events
       .filter((event) => event.operationBinding?.mutationId === mutationId).length;
     return { records, boundEvents };
   } catch {
@@ -130,50 +166,61 @@ function promiseConflict(profile: ProfilePack, mutation: RelationOperationMutati
   return declaredDigestConflict(mutation);
 }
 
-export const relationAdapter: OperationStoreAdapter = defineOperationStoreAdapter<"relation">({
-  kind: "relation",
+/** Preflight: an active profile under which the relation content is valid. */
+async function preflightRelation(stores: RelationAdapterStores, ctx: AdapterContext<RelationOperationMutation>): Promise<AdapterPreflight> {
+  const profile = await stores.loadProfile();
+  if (!profile) return { status: "unavailable", detail: "no profile is active" };
+  try { buildRelationRef(profile, relationInput(ctx.mutation)); }
+  catch (error) { return { status: "park", code: "bundle-precondition-conflict", detail: error instanceof Error ? error.message : "invalid relation" }; }
+  return { status: "ready" };
+}
 
-  async preflight(ctx) {
-    const profile = await loadProfileOrUndefined(ctx.root);
-    if (!profile) return { status: "unavailable", detail: "no profile is active" };
-    try { buildRelationRef(profile, relationInput(ctx.mutation)); }
-    catch (error) { return { status: "park", code: "bundle-precondition-conflict", detail: error instanceof Error ? error.message : "invalid relation" }; }
-    return { status: "ready" };
-  },
+/** Apply: refuse a dishonest promise, then append through the operation-aware seam and name any dedupe. */
+async function applyRelation(stores: RelationAdapterStores, ctx: AdapterContext<RelationOperationMutation>): Promise<AdapterApply> {
+  const profile = await stores.loadProfile();
+  if (!profile) return { status: "unavailable", detail: "no profile is active" };
+  const refused = promiseConflict(profile, ctx.mutation);
+  if (refused !== null) return { status: "conflict", detail: refused };
+  let result: RelationOperationApply;
+  try {
+    result = await stores.appendForOperation(
+      profile, relationInput(ctx.mutation), toOperationBinding(ctx.auditBinding),
+      ctx.mutation.postcondition.recordId as `rel_${string}`,
+    );
+  } catch (error) {
+    return { status: "unavailable", detail: error instanceof Error ? error.message : "relation apply failed" };
+  }
+  if (result.status === "conflict") return { status: "conflict", detail: result.detail };
+  if (result.status === "skipped-idempotent") {
+    // The postcondition's recordId binds only records this mutation CREATES; a
+    // dedupe kept a pre-existing record, so the skip NAMES the id that actually
+    // satisfies the content — the claim boundary is observable, never silent.
+    return {
+      status: "skipped-idempotent", postStateDigest: ctx.mutation.postcondition.digest,
+      boundToMutation: result.bound, detail: `content satisfied by existing relation ${result.ref.id}`,
+    };
+  }
+  return { status: "applied", postStateDigest: ctx.mutation.postcondition.digest };
+}
 
-  observe: observeRelation,
+/** Verify: the observation, restated as a verdict. */
+async function verifyRelation(stores: RelationAdapterStores, ctx: AdapterContext<RelationOperationMutation>): Promise<AdapterVerify> {
+  const observation = await observeRelation(stores, ctx);
+  if (observation.outcome === "applied") return { status: "verified", postStateDigest: ctx.mutation.postcondition.digest };
+  if (observation.outcome === "unavailable") return { status: "unavailable", detail: observation.detail ?? "relation unreadable" };
+  return { status: "mismatch", detail: observation.detail ?? "relation postcondition not met" };
+}
 
-  async apply(ctx) {
-    const profile = await loadProfileOrUndefined(ctx.root);
-    if (!profile) return { status: "unavailable", detail: "no profile is active" };
-    const refused = promiseConflict(profile, ctx.mutation);
-    if (refused !== null) return { status: "conflict", detail: refused };
-    let result: Awaited<ReturnType<typeof appendRelationForOperationLocked>>;
-    try {
-      result = await appendRelationForOperationLocked(
-        ctx.root, profile, relationInput(ctx.mutation), toOperationBinding(ctx.auditBinding),
-        ctx.mutation.postcondition.recordId as `rel_${string}`,
-      );
-    } catch (error) {
-      return { status: "unavailable", detail: error instanceof Error ? error.message : "relation apply failed" };
-    }
-    if (result.status === "conflict") return { status: "conflict", detail: result.detail };
-    if (result.status === "skipped-idempotent") {
-      // The postcondition's recordId binds only records this mutation CREATES; a
-      // dedupe kept a pre-existing record, so the skip NAMES the id that actually
-      // satisfies the content — the claim boundary is observable, never silent.
-      return {
-        status: "skipped-idempotent", postStateDigest: ctx.mutation.postcondition.digest,
-        boundToMutation: result.bound, detail: `content satisfied by existing relation ${result.ref.id}`,
-      };
-    }
-    return { status: "applied", postStateDigest: ctx.mutation.postcondition.digest };
-  },
+/** The relation adapter over the stores `storesOf` gives each context: THE ONE BODY of every verdict. */
+export function defineRelationAdapter(storesOf: (ctx: AdapterContext<RelationOperationMutation>) => RelationAdapterStores): OperationStoreAdapter {
+  return defineOperationStoreAdapter<"relation">({
+    kind: "relation",
+    preflight: (ctx) => preflightRelation(storesOf(ctx), ctx),
+    observe: (ctx) => observeRelation(storesOf(ctx), ctx),
+    apply: (ctx) => applyRelation(storesOf(ctx), ctx),
+    verify: (ctx) => verifyRelation(storesOf(ctx), ctx),
+  });
+}
 
-  async verify(ctx) {
-    const observation = await observeRelation(ctx);
-    if (observation.outcome === "applied") return { status: "verified", postStateDigest: ctx.mutation.postcondition.digest };
-    if (observation.outcome === "unavailable") return { status: "unavailable", detail: observation.detail ?? "relation unreadable" };
-    return { status: "mismatch", detail: observation.detail ?? "relation postcondition not met" };
-  },
-});
+/** The shipped relation adapter: the body over the local stores for each context's root. */
+export const relationAdapter: OperationStoreAdapter = defineRelationAdapter(diskRelationAdapterStores);

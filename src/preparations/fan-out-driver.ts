@@ -12,19 +12,53 @@
  * the runner injects `driveInstance` (its single-instance attempt loop) so this
  * module never reaches into the attempt machinery. The `RunPreparation*` types
  * are imported type-only from the runner — erased at runtime, so no cycle.
+ *
+ * ONE BODY EACH over {@link FanOutReads} (the run read, then the run's verified
+ * evidence read) and a {@link FanOutInput} that carries no project root:
+ * {@link driveMapPhaseWith} and {@link driveRepeatPhaseWith}. The input-taking
+ * forms keep their signatures and pass the incumbent root readers, called when
+ * asked; {@link fanOutReadsOver} composes the same reads from each store's own body.
  */
 
-import { readPreparationEvidenceBytes } from "./evidence-store.js";
+import { readPreparationEvidenceBytes, type PreparationEvidenceLeafReads } from "./evidence-store.js";
 import { derivePhaseInstanceId, repeatExpansionIdentity, singleExpansionIdentity } from "./ids.js";
 import {
   enumerateMapExpansion, repeatIterationDecision, type RepeatContinuationInputV1,
 } from "./expansion.js";
 import type { NormalizedPhaseV1 } from "./plan-types.js";
-import { readPreparationRun } from "./run-store.js";
+import { readPreparationRun, readPreparationRunFrom, type PreparationRunLeafReads, type PreparationRunRead } from "./run-store.js";
+import type { PreparationRunBinding } from "./run-types.js";
+import { evidenceLocationOf, runEvidenceBytesOver, type RunEvidenceBytes } from "./runner-reconstruct.js";
 import type { RunPreparationInputV1, RunPreparationResultV1 } from "./runner.js";
 
 /** Cap on decodable source-evidence bytes for one fan-out. */
 const MAX_SOURCE_EVIDENCE_BYTES = 4 * 1024 * 1024;
+
+/** The two reads a fan-out makes, in order: the authenticated run, then its verified evidence. No member takes a project root. */
+export interface FanOutReads {
+  /** The run at the input's binding. */
+  readRun(): Promise<PreparationRunRead>;
+  /** One verified evidence object at the run's location. */
+  readonly evidenceBytes: RunEvidenceBytes;
+}
+
+/** What a fan-out body reads off the runner input: the binding and the pack's item decoder, never the root. */
+export type FanOutInput = Pick<RunPreparationInputV1, "binding" | "decodeExpansionItems">;
+
+/** LOCAL DISK. The incumbent root readers for the input, each called when asked and reading the root and the location off the input at that read, as the incumbent did. */
+function diskFanOutReads(input: RunPreparationInputV1): FanOutReads {
+  return {
+    readRun: () => readPreparationRun(input.root, input.binding),
+    evidenceBytes: (digest, maxBytes) => readPreparationEvidenceBytes(input.root, evidenceLocationOf(input.binding), digest, maxBytes),
+  };
+}
+
+/** The same reads over the run store's and the evidence store's own leaves, at `binding`. Building it does no I/O. */
+export function fanOutReadsOver(
+  sources: { runs: PreparationRunLeafReads; evidence: PreparationEvidenceLeafReads }, binding: PreparationRunBinding,
+): FanOutReads {
+  return { readRun: () => readPreparationRunFrom(sources.runs, binding), evidenceBytes: runEvidenceBytesOver(sources.evidence, binding) };
+}
 
 /** The runner's single-instance attempt loop, injected so this module never owns it. */
 export type DriveInstanceFn =
@@ -42,10 +76,19 @@ export async function driveMapPhase(
   expansion: Extract<NormalizedPhaseV1["expansion"], { kind: "map" }>,
   driveInstance: DriveInstanceFn,
 ): Promise<RunPreparationResultV1 | null> {
+  return driveMapPhaseWith(diskFanOutReads(input), input, phase, expansion, driveInstance);
+}
+
+/** {@link driveMapPhase} over {@link FanOutReads}: THE ONE BODY. */
+export async function driveMapPhaseWith(
+  reads: FanOutReads, input: FanOutInput, phase: NormalizedPhaseV1,
+  expansion: Extract<NormalizedPhaseV1["expansion"], { kind: "map" }>,
+  driveInstance: DriveInstanceFn,
+): Promise<RunPreparationResultV1 | null> {
   if (input.decodeExpansionItems === undefined) {
     return { status: "refused", runId: input.binding.runId, reason: `map phase ${phase.logicalPhaseId} needs an item decoder` };
   }
-  const items = await readSourceItems(input, phase, expansion);
+  const items = await readSourceItems(reads, input, phase, expansion);
   if (typeof items === "string") return { status: "refused", runId: input.binding.runId, reason: items };
   const enumerated = enumerateMapExpansion(items, expansion);
   if (enumerated.status !== "ok") {
@@ -70,6 +113,15 @@ export async function driveRepeatPhase(
   expansion: Extract<NormalizedPhaseV1["expansion"], { kind: "bounded-repeat" }>,
   driveInstance: DriveInstanceFn,
 ): Promise<RunPreparationResultV1 | null> {
+  return driveRepeatPhaseWith(diskFanOutReads(input), input, phase, expansion, driveInstance);
+}
+
+/** {@link driveRepeatPhase} over {@link FanOutReads}: THE ONE BODY. */
+export async function driveRepeatPhaseWith(
+  reads: FanOutReads, input: FanOutInput, phase: NormalizedPhaseV1,
+  expansion: Extract<NormalizedPhaseV1["expansion"], { kind: "bounded-repeat" }>,
+  driveInstance: DriveInstanceFn,
+): Promise<RunPreparationResultV1 | null> {
   const continuation = repeatContinuationInput(expansion.continuation);
   if (continuation === null) {
     return { status: "refused", runId: input.binding.runId, reason: `bounded-repeat ${phase.logicalPhaseId}: while-boolean continuation is unsupported` };
@@ -77,7 +129,7 @@ export async function driveRepeatPhase(
   for (let index = 0; index < expansion.maximumIterations; index += 1) {
     const outcome = await driveInstance(phase.logicalPhaseId, repeatExpansionIdentity(index));
     if (outcome !== null) return outcome;
-    const remaining = await repeatRemainingIsEmpty(input, phase, index, continuation);
+    const remaining = await repeatRemainingIsEmpty(reads, input, phase, index, continuation);
     if (typeof remaining === "string") return { status: "refused", runId: input.binding.runId, reason: remaining };
     const decision = repeatIterationDecision({
       completedIndex: index, maximumIterations: expansion.maximumIterations,
@@ -100,7 +152,7 @@ function repeatContinuationInput(
 
 /** Whether one committed iteration's remaining-queue is empty (fixed-count never reads). */
 async function repeatRemainingIsEmpty(
-  input: RunPreparationInputV1, phase: NormalizedPhaseV1, index: number,
+  reads: FanOutReads, input: FanOutInput, phase: NormalizedPhaseV1, index: number,
   continuation: RepeatContinuationInputV1,
 ): Promise<boolean | string> {
   if (continuation.kind === "fixed-count") return true; // unread by the fixed-count decision
@@ -109,13 +161,13 @@ async function repeatRemainingIsEmpty(
     manifestDigest: input.binding.manifestDigest, logicalPhaseId: phase.logicalPhaseId,
     expansionIdentity: repeatExpansionIdentity(index),
   });
-  const items = await readInstanceItems(input, phase.logicalPhaseId, instance);
+  const items = await readInstanceItems(reads, input, phase.logicalPhaseId, instance);
   return typeof items === "string" ? items : items.length === 0;
 }
 
 /** Read and decode the source phase's output evidence for a map expansion. */
 async function readSourceItems(
-  input: RunPreparationInputV1, phase: NormalizedPhaseV1,
+  reads: FanOutReads, input: FanOutInput, phase: NormalizedPhaseV1,
   expansion: Extract<NormalizedPhaseV1["expansion"], { kind: "map" }>,
 ): Promise<readonly unknown[] | string> {
   const binding = phase.inputBindings.find((entry) => entry.bindingId === expansion.sourceEvidenceBinding);
@@ -124,7 +176,7 @@ async function readSourceItems(
     manifestDigest: input.binding.manifestDigest, logicalPhaseId: binding.sourcePhaseId,
     expansionIdentity: singleExpansionIdentity(),
   });
-  return readInstanceItems(input, phase.logicalPhaseId, sourceInstance);
+  return readInstanceItems(reads, input, phase.logicalPhaseId, sourceInstance);
 }
 
 /**
@@ -134,17 +186,16 @@ async function readSourceItems(
  * committed iteration instance) — both decode a list from durable evidence.
  */
 async function readInstanceItems(
-  input: RunPreparationInputV1, decoderPhaseId: string,
+  reads: FanOutReads, input: FanOutInput, decoderPhaseId: string,
   instancePhaseId: ReturnType<typeof derivePhaseInstanceId>,
 ): Promise<readonly unknown[] | string> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await reads.readRun();
   if (read.status !== "ok") return "run unreadable";
   const summary = read.run.phaseSummaries.find((entry) => entry.phaseInstanceId === instancePhaseId);
   if (summary?.outputEvidenceDigest === undefined) return `phase ${decoderPhaseId} produced no output evidence`;
   const bare = summary.outputEvidenceDigest.startsWith("sha256:")
     ? summary.outputEvidenceDigest.slice("sha256:".length) : summary.outputEvidenceDigest;
-  const bytes = await readPreparationEvidenceBytes(input.root,
-    { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId }, bare, MAX_SOURCE_EVIDENCE_BYTES);
+  const bytes = await reads.evidenceBytes(bare, MAX_SOURCE_EVIDENCE_BYTES);
   if (bytes.status !== "ok") return `source evidence ${bytes.status}`;
   return input.decodeExpansionItems!(decoderPhaseId, bytes.bytes);
 }

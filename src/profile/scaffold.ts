@@ -1,6 +1,15 @@
 /**
  * @file src/profile/scaffold.ts
  * @description Builds and installs the minimal profile used by beginner onboarding.
+ *
+ * ONE LOCKED BODY: {@link installStarterProfileLockedWith} owns the existing-profile
+ * refusal, the corpus refusal and its wording, directory then serialization then
+ * write, and the commit classification after a failed write (installed, unknown
+ * with no cleanup, absent with removal of only a directory this call created) over
+ * {@link StarterProfileInstallSteps}. The root form keeps building the profile
+ * BEFORE the ordinary blocking lock and releases it in `finally`; its local steps
+ * keep the confined mkdir and real-directory check, the atomic write, the commit
+ * read and the removal, and read each test dependency only when it is used.
  */
 
 import { lstat, mkdir, realpath, rmdir } from "node:fs/promises";
@@ -14,8 +23,8 @@ import { confineUnderRoot, isInsideDir } from "../utils/path-confine.js";
 import { resolveExistingConfinedPrivateDir } from "../utils/private-dir.js";
 import { isSlugSafe } from "./identity.js";
 import { loadProfile } from "./load.js";
-import { isTypedCorpusEmpty } from "./templates/corpus.js";
-import type { ProfilePack } from "./types.js";
+import { diskTypedCorpusReads, isTypedCorpusEmptyFrom, type TypedCorpusReads } from "./templates/corpus.js";
+import type { LoadedProfile, ProfilePack } from "./types.js";
 import { validateProfile } from "./validate.js";
 
 /** Whether a failed scaffold operation wrote its active profile. */
@@ -127,9 +136,10 @@ async function assertRealDirectory(root: string, target: string, directory: stri
 }
 
 /** Remove only an empty entity directory created by this failed operation. */
-async function compensateDirectory(target: string, originalError: unknown): Promise<never> {
+async function compensateDirectory(steps: StarterProfileInstallSteps, directory: string, originalError: unknown): Promise<never> {
+  const target = steps.entityDirectoryHandle(directory);
   try {
-    await rmdir(target);
+    await steps.removeEmptyDirectory(target);
   } catch (cleanupError) {
     throw new ProfileScaffoldError(
       `${errorMessage(originalError)}; cleanup failed for ${target}: ${errorMessage(cleanupError)}`,
@@ -161,6 +171,37 @@ function corpusRefusal(reasons: string[]): ProfileScaffoldError {
   return new ProfileScaffoldError(`${summary}.\n- ${reasons.join("\n- ")}`);
 }
 
+/** What the locked install asks of the project. No member takes a project root. */
+export interface StarterProfileInstallSteps {
+  /** The active profile. Local: `loadProfile(root)`. */
+  loadProfile(): Promise<LoadedProfile>;
+  /** The typed-corpus probe's reads. Local: `diskTypedCorpusReads(root)`. */
+  corpus: TypedCorpusReads;
+  /** Create or verify the confined, real entity directory; whether this call created it. */
+  prepareEntityDirectory(directory: string): Promise<boolean>;
+  /** Write the active profile (the commit point). Local: the `writeProfile` dependency, read now. */
+  writeProfile(body: string): Promise<void>;
+  /** Classify the commit after a failed write. Local: the `confirmProfileCommit` dependency, read now. */
+  confirmProfileCommit(body: string): Promise<ProfileCommitStatus>;
+  /** The handle naming a created entity directory in a cleanup message. Local: its absolute path. */
+  entityDirectoryHandle(directory: string): string;
+  /** Remove one EMPTY directory by its handle. Local: `rmdir`. */
+  removeEmptyDirectory(handle: string): Promise<void>;
+}
+
+/** LOCAL. The incumbent collaborators for one root; each dependency is read when it is called. */
+function localStarterProfileSteps(root: string, dependencies: ProfileScaffoldDependencies): StarterProfileInstallSteps {
+  return {
+    loadProfile: () => loadProfile(root),
+    corpus: diskTypedCorpusReads(root),
+    prepareEntityDirectory: (directory) => prepareEntityDirectory(root, directory),
+    writeProfile: (body) => (dependencies.writeProfile ?? writeProfile)(root, body),
+    confirmProfileCommit: (body) => (dependencies.confirmProfileCommit ?? confirmProfileCommit)(root, body),
+    entityDirectoryHandle: (directory) => path.join(root, directory),
+    removeEmptyDirectory: (handle) => rmdir(handle),
+  };
+}
+
 /** Install a minimal profile only when no existing typed corpus can be reinterpreted. */
 export async function installStarterProfile(
   root: string,
@@ -172,33 +213,51 @@ export async function installStarterProfile(
   const directory = profile.entities[entityType].directory;
   await acquireMutationLockBlocking(root, "ordinary");
   try {
-    const loaded = await loadProfile(root);
-    if (loaded.loadedFrom !== null) throw new ProfileScaffoldError("A profile already exists.");
-    const probe = await isTypedCorpusEmpty(root, loaded, profile);
-    if (!probe.empty) throw corpusRefusal(probe.reasons);
-    const createdDirectory = await prepareEntityDirectory(root, directory);
-    const profileBody = canonicalProfileJson(profile);
-    try {
-      await (dependencies.writeProfile ?? writeProfile)(root, profileBody);
-    } catch (error) {
-      const commit = await (dependencies.confirmProfileCommit ?? confirmProfileCommit)(root, profileBody);
-      if (commit === "committed") {
-        throw new ProfileScaffoldError(
-          `Profile was installed, but durability confirmation failed: ${errorMessage(error)}`,
-          "installed",
-        );
-      }
-      if (commit === "unknown") {
-        throw new ProfileScaffoldError(
-          `Installation state could not be confirmed after a write failure; no cleanup was attempted: ${errorMessage(error)}`,
-          "unknown",
-        );
-      }
-      if (createdDirectory) await compensateDirectory(path.join(root, directory), error);
-      throw new ProfileScaffoldError(errorMessage(error));
-    }
-    return { profileId, entityType, directory };
+    return await installStarterProfileLockedWith(localStarterProfileSteps(root, dependencies), { profile, profileId, entityType, directory });
   } finally {
     await releaseLock(root);
   }
+}
+
+/** {@link installStarterProfile}'s locked region over {@link StarterProfileInstallSteps}: THE ONE BODY. */
+export async function installStarterProfileLockedWith(
+  steps: StarterProfileInstallSteps,
+  request: { profile: ProfilePack; profileId: string; entityType: string; directory: string },
+): Promise<ProfileScaffoldResult> {
+  const { profile, profileId, entityType, directory } = request;
+  const loaded = await steps.loadProfile();
+  if (loaded.loadedFrom !== null) throw new ProfileScaffoldError("A profile already exists.");
+  const probe = await isTypedCorpusEmptyFrom(steps.corpus, loaded, profile);
+  if (!probe.empty) throw corpusRefusal(probe.reasons);
+  const createdDirectory = await steps.prepareEntityDirectory(directory);
+  const profileBody = canonicalProfileJson(profile);
+  try {
+    await steps.writeProfile(profileBody);
+  } catch (error) {
+    return await failedWrite(steps, { error, profileBody, directory, createdDirectory });
+  }
+  return { profileId, entityType, directory };
+}
+
+/** Classify a failed profile write: installed, unknown (no cleanup), or absent (remove only a created directory). */
+async function failedWrite(
+  steps: StarterProfileInstallSteps,
+  failure: { error: unknown; profileBody: string; directory: string; createdDirectory: boolean },
+): Promise<never> {
+  const { error, profileBody, directory, createdDirectory } = failure;
+  const commit = await steps.confirmProfileCommit(profileBody);
+  if (commit === "committed") {
+    throw new ProfileScaffoldError(
+      `Profile was installed, but durability confirmation failed: ${errorMessage(error)}`,
+      "installed",
+    );
+  }
+  if (commit === "unknown") {
+    throw new ProfileScaffoldError(
+      `Installation state could not be confirmed after a write failure; no cleanup was attempted: ${errorMessage(error)}`,
+      "unknown",
+    );
+  }
+  if (createdDirectory) await compensateDirectory(steps, directory, error);
+  throw new ProfileScaffoldError(errorMessage(error));
 }

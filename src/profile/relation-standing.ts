@@ -16,7 +16,7 @@
  * store is read EXACTLY ONCE per call (via the lock-free {@link readLiveValidRelations}),
  * and page state comes from the bounded frontmatter-only scan (no bodies). It
  * reuses the write path's PURE checker ({@link checkRelationPreconditions}) and the
- * write path's confined endpoint FACTS resolver ({@link makeEndpointFactsResolver}),
+ * write path's confined endpoint FACTS resolver ({@link makeEndpointFactsResolverFrom}),
  * so a standing check and a write agree, byte-for-byte, on both the count semantics
  * AND what "a qualifying endpoint" means (existing, field-contract-valid, and in
  * an allowed lifecycle state when the requirement filters on one).
@@ -33,10 +33,20 @@
  * returns `[]`; a profile that declares gating but has no page currently in a gated
  * state also reads no relations. So the built-in default (no lifecycles) and any
  * non-gated profile add zero problems and stay byte-identical.
+ *
+ * ONE BODY: {@link collectStandingRelationProblems} runs
+ * {@link collectStandingRelationProblemsFrom} over local-disk
+ * {@link StandingRelationSources}. Which types and pages are gated, both short
+ * circuits, the single relation read and both "cannot verify" catches are
+ * decided in that body; the sources only look.
  */
 
 import { entityId, isSlugSafe } from "./identity.js";
-import { scanEntityDir } from "../wiki/collect.js";
+import { diskEntityPageReads, type EntityPageReads } from "./lifecycle-read.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../utils/jsonl-store.js";
+import { scanEntityDirFrom } from "../wiki/collect.js";
 import type { EntityId, EntityProblemView, EntityTypeDef, LifecycleDef, ProfilePack } from "./types.js";
 import type { RelationRef } from "../relations/types.js";
 import {
@@ -47,8 +57,8 @@ import {
   type RelationEndpointIndex,
   type UnmetRelationRequirement,
 } from "../relations/precondition.js";
-import { readLiveValidRelations } from "../relations/live-valid.js";
-import { isStoreUnavailable, makeEndpointFactsResolver, describeUnmet } from "../relations/enforce-precondition.js";
+import { readLiveValidRelationsFrom } from "../relations/live-valid.js";
+import { isStoreUnavailable, makeEndpointFactsResolverFrom, describeUnmet } from "../relations/enforce-precondition.js";
 
 /** Problem `kind` for a page whose gated-state relation precondition no longer holds. */
 export const LIFECYCLE_RELATION_UNMET_KIND = "lifecycle-relation-requirement-unmet" as const;
@@ -89,8 +99,8 @@ function gatedTypes(profile: ProfilePack): GatedType[] {
  * (it is not an enrolled entity id), and a page whose current state declares no
  * requirement is not a standing concern.
  */
-async function gatedPagesOfType(root: string, type: GatedType): Promise<GatedPage[]> {
-  const { scans } = await scanEntityDir(root, type.def.directory, { includeBody: false });
+async function gatedPagesOfType(source: LegacyLocalEntityScans, type: GatedType): Promise<GatedPage[]> {
+  const { scans } = await scanEntityDirFrom(source, type.def.directory, { includeBody: false });
   const out: GatedPage[] = [];
   for (const scan of scans) {
     const state = scan.frontmatter[type.lifecycle.field];
@@ -102,9 +112,9 @@ async function gatedPagesOfType(root: string, type: GatedType): Promise<GatedPag
 }
 
 /** Every page in the project currently sitting in a gated state, across all gated types. */
-async function collectGatedPages(root: string, types: GatedType[]): Promise<GatedPage[]> {
+async function collectGatedPages(source: LegacyLocalEntityScans, types: GatedType[]): Promise<GatedPage[]> {
   const out: GatedPage[] = [];
-  for (const type of types) out.push(...(await gatedPagesOfType(root, type)));
+  for (const type of types) out.push(...(await gatedPagesOfType(source, type)));
   return out;
 }
 
@@ -166,18 +176,46 @@ export async function collectStandingRelationProblems(
   root: string,
   profile: ProfilePack,
 ): Promise<EntityProblemView[]> {
+  return collectStandingRelationProblemsFrom(
+    { scans: diskLocalEntityScans(root), graph: diskGraphStoreReads(root), pages: diskEntityPageReads(root) }, profile);
+}
+
+/**
+ * Everything {@link collectStandingRelationProblemsFrom} reads. OWNED BY THE
+ * STANDING CHECK: a narrow seam; not `ProjectStore`, not a hosted or
+ * access-control contract, and it selects no backend. Nothing ties the three to
+ * one project; production builds all from one root.
+ */
+export interface StandingRelationSources {
+  /** The gated entity directories, frontmatter only, through the existing entity-scan binding. */
+  scans: LegacyLocalEntityScans;
+  /** The relation store, through the graph-store read; asked at most ONCE per call. */
+  graph: GraphStoreReads;
+  /** One confined page per DISTINCT relation endpoint. */
+  pages: EntityPageReads;
+}
+
+/**
+ * {@link collectStandingRelationProblems} over {@link StandingRelationSources}:
+ * THE ONE BODY. No gated type reads nothing; no page in a gated state reads no
+ * relations; then one relation read and the endpoint pages.
+ */
+export async function collectStandingRelationProblemsFrom(
+  sources: StandingRelationSources,
+  profile: ProfilePack,
+): Promise<EntityProblemView[]> {
   const types = gatedTypes(profile);
   if (types.length === 0) return []; // no gating declared → read NOTHING
-  const gated = await collectGatedPages(root, types);
+  const gated = await collectGatedPages(sources.scans, types);
   if (gated.length === 0) return []; // nothing currently gated → no relation read
   let relations: RelationRef[];
   try {
-    relations = await readLiveValidRelations(root, profile); // ONE lock-free read
+    relations = await readLiveValidRelationsFrom(sources.graph, profile); // ONE lock-free read
   } catch (err) {
     if (isStoreUnavailable(err)) return [unverifiableProblem(err as Error)];
     throw err; // a genuinely-unexpected error propagates (never masked as "cannot verify")
   }
-  const resolveEndpoint = makeEndpointFactsResolver(root, profile);
+  const resolveEndpoint = makeEndpointFactsResolverFrom(sources.pages, profile);
   const relationIndex = buildRelationEndpointIndex(relations); // built ONCE, shared across all gated pages
   const problems: EntityProblemView[] = [];
   try {

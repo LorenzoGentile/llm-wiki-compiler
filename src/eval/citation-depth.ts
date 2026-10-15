@@ -8,9 +8,13 @@
  * Metrics:
  *  - claimLevelRate: fraction of citations that include a line range.
  *  - avgCitationsPerParagraph: citation density across prose paragraphs.
+ *
+ * The measure has ONE body, {@link evaluateCitationDepthFrom}, over the page
+ * collection's own sources. It names no project root. `evaluateCitationDepth`
+ * builds the local-disk sources from its root and delegates.
  */
 
-import { collectAllPages } from "../linter/rules.js";
+import { collectAllPagesFrom, diskLintPageSources, type LintPageSources } from "../linter/rules-shared.js";
 import { parseFrontmatter, extractClaimCitations, splitProseParagraphs } from "../utils/markdown.js";
 import type { CitationDepthResult } from "./types.js";
 
@@ -35,7 +39,18 @@ function countPageCitations(body: string): PageCounts {
 export async function evaluateCitationDepth(
   root: string,
 ): Promise<CitationDepthResult> {
-  const pages = await collectAllPages(root);
+  return evaluateCitationDepthFrom(diskLintPageSources(root));
+}
+
+/**
+ * {@link evaluateCitationDepth} over {@link LintPageSources}: THE ONE BODY. One
+ * walk of the generic pages; a page read that fails rejects the measure.
+ *
+ * @param sources - The page collection's sources.
+ * @returns The citation counts, the claim-level rate and the citation density.
+ */
+export async function evaluateCitationDepthFrom(sources: LintPageSources): Promise<CitationDepthResult> {
+  const pages = await collectAllPagesFrom(sources);
   let totalCitations = 0;
   let citationsWithLineRange = 0;
   let totalProseParagraphs = 0;

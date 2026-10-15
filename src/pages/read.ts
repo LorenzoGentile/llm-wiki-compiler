@@ -10,17 +10,33 @@
  * both consumers work from identical read semantics.
  *
  * Slugs reach these readers from MCP callers, so they are untrusted. Every read
- * goes through {@link readPageContent}, which accepts a slug only as a single
- * filename component and confines the resolved file to its page directory, so
+ * goes through {@link readPageContentFrom}, which accepts a slug only as a single
+ * filename component and asks for the file confined to its page directory, so
  * neither `../` segments nor a symlink can read a file outside that directory.
+ *
+ * ONE BODY EACH, OVER ONE READ. {@link readPageContentFrom} and
+ * {@link readPageRecordFrom} decide over {@link PageContentReads}, the confined
+ * page read alone. The root forms keep their signatures and pass the local read,
+ * built per call, which calls the incumbent `readConfinedWikiPage(root, …)` when
+ * asked, so module spies and mocks still intercept. Confinement itself stays
+ * with that local read.
  */
 
 import { parseFrontmatter } from "../utils/markdown.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
 import { readConfinedWikiPage } from "../compiler/confined-wiki-read.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 
 /** Directories searched (in priority order) when resolving a page slug. */
 const PAGE_DIRS = [CONCEPTS_DIR, QUERIES_DIR];
+
+/** The one read a page read takes: a page's text confined to its directory. No member takes a project root. */
+export type PageContentReads = Pick<LegacyLocalReads, "readConfinedPage">;
+
+/** LOCAL DISK. The incumbent confined page read for `root`, called when asked; building it does no I/O. */
+function localPageContentReads(root: string): PageContentReads {
+  return { readConfinedPage: (relDir, slug) => readConfinedWikiPage(root, relDir, slug) };
+}
 
 /** Shape returned by readPageRecord and search_pages for each matching page. */
 export interface PageRecord {
@@ -53,8 +69,13 @@ function isPageSlugComponent(slug: string): boolean {
  * @returns The page's content, or `null` when it is absent or not readable here.
  */
 export async function readPageContent(root: string, dir: string, slug: string): Promise<string | null> {
+  return readPageContentFrom(localPageContentReads(root), dir, slug);
+}
+
+/** {@link readPageContent} over {@link PageContentReads}: THE ONE BODY. A refused slug reads nothing. */
+export async function readPageContentFrom(reads: PageContentReads, dir: string, slug: string): Promise<string | null> {
   if (!isPageSlugComponent(slug)) return null;
-  const result = await readConfinedWikiPage(root, dir, slug);
+  const result = await reads.readConfinedPage(dir, slug);
   return "content" in result ? result.content : null;
 }
 
@@ -67,8 +88,13 @@ export async function readPageContent(root: string, dir: string, slug: string): 
  * @returns The parsed page record, or `null` if not found or orphaned.
  */
 export async function readPageRecord(root: string, slug: string): Promise<PageRecord | null> {
+  return readPageRecordFrom(localPageContentReads(root), slug);
+}
+
+/** {@link readPageRecord} over {@link PageContentReads}: THE ONE BODY. Directories in priority order; the first readable, unorphaned page wins. */
+export async function readPageRecordFrom(reads: PageContentReads, slug: string): Promise<PageRecord | null> {
   for (const dir of PAGE_DIRS) {
-    const content = await readPageContent(root, dir, slug);
+    const content = await readPageContentFrom(reads, dir, slug);
     if (!content) continue;
 
     const { meta, body } = parseFrontmatter(content);

@@ -4,14 +4,20 @@
  * Resources expose read-only views of the wiki under the llmwiki:// URI
  * scheme. Hosts can attach these as context without invoking a tool —
  * useful for letting agents browse the wiki passively.
+ *
+ * Every resource reads through ONE module-local {@link WikiResourceReads}
+ * object. {@link registerWikiResources} gives them the local root readers the
+ * resources always called (with their exact empty, `null` and rejection
+ * semantics); {@link registerWikiResourcesWith} takes any reads. The state
+ * resource's one decision (fail closed on a too-new state) and the eval
+ * resources' empty report stay in the resource bodies.
  */
 
 import path from "path";
-import { readdir } from "fs/promises";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CONCEPTS_DIR, INDEX_FILE, QUERIES_DIR, SOURCES_DIR, STATE_FILE } from "@atomicstrata/llmwiki-core/compiler-cli";
 import { safeReadFile, parseFrontmatter } from "@atomicstrata/llmwiki-core/compiler-cli";
-import { readStateClassified, readPageContent } from "@atomicstrata/llmwiki-core/compiler-cli";
+import { readStateClassified, readPageContent, listPageFileNames } from "@atomicstrata/llmwiki-core/compiler-cli";
 import { loadPreviousReport, loadHistory } from "@atomicstrata/llmwiki-core/compiler-cli";
 import { listSelectedSourceFiles } from "@atomicstrata/llmwiki-core/compiler-cli";
 
@@ -41,18 +47,60 @@ function markdownContent(uri: URL, text: string): {
   };
 }
 
-/** Register all 7 read-only wiki resources on the given MCP server. */
-export function registerWikiResources(server: McpServer, root: string): void {
-  registerIndexResource(server, root);
-  registerSourcesResource(server, root);
-  registerStateResource(server, root);
-  registerConceptResource(server, root);
-  registerQueryResource(server, root);
-  registerEvalReportResource(server, root);
-  registerEvalHistoryResource(server, root);
+/** The two page directories the page resources serve. */
+type PageDirectory = typeof CONCEPTS_DIR | typeof QUERIES_DIR;
+
+/** The reads every resource makes. No member takes a project root. */
+export interface WikiResourceReads {
+  /** The text of `wiki/index.md`; `""` when it cannot be read. */
+  indexText(): Promise<string>;
+  /** The selected Markdown source files, in listing order. Rejects raw. */
+  sourceFiles(): Promise<string[]>;
+  /** One listed source's text; `""` when it cannot be read. */
+  sourceText(file: string): Promise<string>;
+  /** One page directory's entry names, unsorted and unfiltered. Rejects when it cannot be listed. */
+  pageFileNames(dir: PageDirectory): Promise<string[]>;
+  /** One page's text confined to `dir`; `null` for a refused slug, a missing page or an escape. */
+  pageText(dir: PageDirectory, slug: string): Promise<string | null>;
+  /** The classified compile state; never a recovering read. */
+  state(): ReturnType<typeof readStateClassified>;
+  /** The latest eval report, or `null` when there is none. */
+  previousEvalReport(): ReturnType<typeof loadPreviousReport>;
+  /** The eval run history, oldest first, as the eval history reads it. */
+  evalHistory(): ReturnType<typeof loadHistory>;
 }
 
-function registerIndexResource(server: McpServer, root: string): void {
+/** LOCAL DISK. The root readers the resources always called, each called when asked. */
+function diskWikiResourceReads(root: string): WikiResourceReads {
+  return {
+    indexText: () => safeReadFile(path.join(root, INDEX_FILE)),
+    sourceFiles: () => listSelectedSourceFiles(root),
+    sourceText: (file) => safeReadFile(path.join(root, SOURCES_DIR, file)),
+    pageFileNames: (dir) => listPageFileNames(root, dir),
+    pageText: (dir, slug) => readPageContent(root, dir, slug),
+    state: () => readStateClassified(root),
+    previousEvalReport: () => loadPreviousReport(root),
+    evalHistory: () => loadHistory(root),
+  };
+}
+
+/** Register all 7 read-only wiki resources on the given MCP server. */
+export function registerWikiResources(server: McpServer, root: string): void {
+  registerWikiResourcesWith(server, diskWikiResourceReads(root));
+}
+
+/** {@link registerWikiResources} with every resource reading through `reads`. Registration order is unchanged. */
+export function registerWikiResourcesWith(server: McpServer, reads: WikiResourceReads): void {
+  registerIndexResource(server, reads);
+  registerSourcesResource(server, reads);
+  registerStateResource(server, reads);
+  registerConceptResource(server, reads);
+  registerQueryResource(server, reads);
+  registerEvalReportResource(server, reads);
+  registerEvalHistoryResource(server, reads);
+}
+
+function registerIndexResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "wiki-index",
     "llmwiki://index",
@@ -62,13 +110,13 @@ function registerIndexResource(server: McpServer, root: string): void {
       mimeType: "text/markdown",
     },
     async (uri) => {
-      const content = await safeReadFile(path.join(root, INDEX_FILE));
+      const content = await reads.indexText();
       return { contents: [markdownContent(uri, content)] };
     },
   );
 }
 
-function registerSourcesResource(server: McpServer, root: string): void {
+function registerSourcesResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "wiki-sources",
     "llmwiki://sources",
@@ -78,12 +126,12 @@ function registerSourcesResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri) => ({
-      contents: [jsonContent(uri, await listSources(root))],
+      contents: [jsonContent(uri, await listSources(reads))],
     }),
   );
 }
 
-function registerStateResource(server: McpServer, root: string): void {
+function registerStateResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "wiki-state",
     "llmwiki://state",
@@ -93,7 +141,7 @@ function registerStateResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri) => {
-      const { status, state } = await readStateClassified(root);
+      const { status, state } = await reads.state();
       // Fail closed on a too-new state: every sibling surface branches on
       // `status`, so the resource must too rather than streaming a body written
       // by a newer llmwiki as if it were healthy. "ok"/"missing"/"corrupt" keep
@@ -113,11 +161,11 @@ function registerStateResource(server: McpServer, root: string): void {
   );
 }
 
-function registerConceptResource(server: McpServer, root: string): void {
+function registerConceptResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "wiki-concept",
     new ResourceTemplate("llmwiki://concept/{slug}", {
-      list: async () => listPagesUnder(root, CONCEPTS_DIR, "concept"),
+      list: async () => listPagesUnder(reads, CONCEPTS_DIR, "concept"),
     }),
     {
       title: "Wiki Concept",
@@ -125,16 +173,16 @@ function registerConceptResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri, { slug }) => ({
-      contents: [jsonContent(uri, await loadPageWithMeta(root, CONCEPTS_DIR, decodeSlug(String(slug))))],
+      contents: [jsonContent(uri, await loadPageWithMeta(reads, CONCEPTS_DIR, decodeSlug(String(slug))))],
     }),
   );
 }
 
-function registerQueryResource(server: McpServer, root: string): void {
+function registerQueryResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "wiki-query",
     new ResourceTemplate("llmwiki://query/{slug}", {
-      list: async () => listPagesUnder(root, QUERIES_DIR, "query"),
+      list: async () => listPagesUnder(reads, QUERIES_DIR, "query"),
     }),
     {
       title: "Wiki Query",
@@ -142,19 +190,18 @@ function registerQueryResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri, { slug }) => ({
-      contents: [jsonContent(uri, await loadPageWithMeta(root, QUERIES_DIR, decodeSlug(String(slug))))],
+      contents: [jsonContent(uri, await loadPageWithMeta(reads, QUERIES_DIR, decodeSlug(String(slug))))],
     }),
   );
 }
 
 /** Source listing: filename, frontmatter (truncation, source URL, etc.). */
-async function listSources(root: string): Promise<Array<Record<string, unknown>>> {
-  const sourcesPath = path.join(root, SOURCES_DIR);
-  const files = await listSelectedSourceFiles(root);
+async function listSources(reads: WikiResourceReads): Promise<Array<Record<string, unknown>>> {
+  const files = await reads.sourceFiles();
 
   const records: Array<Record<string, unknown>> = [];
   for (const file of files) {
-    const content = await safeReadFile(path.join(sourcesPath, file));
+    const content = await reads.sourceText(file);
     const { meta } = parseFrontmatter(content);
     records.push({ filename: file, ...meta });
   }
@@ -188,15 +235,16 @@ function decodeSlug(value: string): string {
 /**
  * Read a single page and return a structured payload (slug, meta, body). The
  * slug is decoded from a caller's URI, so a `%2F` has become a real separator:
- * {@link readPageContent} refuses anything but one filename component and
- * confines the read to `dir`, and every refusal reads as a missing page.
+ * the page read ({@link readPageContent} locally) refuses anything but one
+ * filename component and confines the read to `dir`, and every refusal reads as
+ * a missing page.
  */
 async function loadPageWithMeta(
-  root: string,
-  dir: string,
+  reads: WikiResourceReads,
+  dir: PageDirectory,
   slug: string,
 ): Promise<{ slug: string; meta: Record<string, unknown>; body: string }> {
-  const content = await readPageContent(root, dir, slug);
+  const content = await reads.pageText(dir, slug);
   if (!content) {
     throw new Error(`Page not found: ${dir}/${slug}.md`);
   }
@@ -205,7 +253,7 @@ async function loadPageWithMeta(
   return { slug, meta, body: body.trim() };
 }
 
-function registerEvalReportResource(server: McpServer, root: string): void {
+function registerEvalReportResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "eval-report",
     "llmwiki://eval/report",
@@ -215,13 +263,13 @@ function registerEvalReportResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri) => {
-      const report = await loadPreviousReport(root);
+      const report = await reads.previousEvalReport();
       return { contents: [jsonContent(uri, report ?? {})] };
     },
   );
 }
 
-function registerEvalHistoryResource(server: McpServer, root: string): void {
+function registerEvalHistoryResource(server: McpServer, reads: WikiResourceReads): void {
   server.registerResource(
     "eval-history",
     "llmwiki://eval/history",
@@ -231,7 +279,7 @@ function registerEvalHistoryResource(server: McpServer, root: string): void {
       mimeType: "application/json",
     },
     async (uri) => {
-      const reports = await loadHistory(root);
+      const reports = await reads.evalHistory();
       return { contents: [jsonContent(uri, reports)] };
     },
   );
@@ -239,14 +287,13 @@ function registerEvalHistoryResource(server: McpServer, root: string): void {
 
 /** Build a resource list payload by enumerating .md files in a wiki directory. */
 async function listPagesUnder(
-  root: string,
-  dir: string,
+  reads: WikiResourceReads,
+  dir: PageDirectory,
   scheme: "concept" | "query",
 ): Promise<{ resources: Array<{ uri: string; name: string }> }> {
-  const pagesPath = path.join(root, dir);
   let files: string[];
   try {
-    files = await readdir(pagesPath);
+    files = await reads.pageFileNames(dir);
   } catch {
     return { resources: [] };
   }

@@ -9,12 +9,31 @@
  * separated from writing it, so a caller that must preflight against the real
  * epoch id can still refuse without having touched the project. The preparation
  * and Milestone A key epochs are separate.
+ *
+ * ONE KEY READ, OVER THE READER'S OWN LEAF. What makes bytes a key is decided in
+ * one body, `readPreparationKeyFrom`: the cap it asks for, the canonical base64
+ * of exactly 32 bytes, the epoch derived from those bytes, and the three
+ * statuses. It takes `PreparationKeyLeafReads` and no project root or path. The
+ * root-named readers, and the creation and recovery reads below, keep their
+ * signatures and reach that body over the private local-disk leaf, built on
+ * each call. What the local disk adds stays on the disk side and is unchanged:
+ * the confined no-follow open, owner and mode, the link count against the one
+ * reserved alias, and the capped handle-bound read. The lifecycle observation's
+ * `readOpenedPreparationKey` still takes an open file handle and is NOT bound
+ * here; it shares only the codec. Nothing here selects a backend.
+ *
+ * ONE CREATE-OR-REFUSE BODY. {@link prepareKeyForEmptyEpochLockedWith} decides
+ * the empty-epoch creation over {@link PreparationKeyCreateSteps}, none of which
+ * takes a project root: the exact empty inventory, the unavailable / ok / absent
+ * policy for the current key, reuse of a synced crash-ready key, and (in the
+ * publication it hands back) the collision re-read. Minting fresh bytes and the
+ * durable no-replace write stay MECHANISM. The root form keeps its signature and
+ * builds the local steps per call.
  */
 
-import { AtomicWriteCollisionError, atomicWriteNoReplaceDurable } from "../utils/atomic-write.js";
 import { durableTempPath, durableWritingPath } from "../utils/atomic-write-no-replace-durable.js";
-import { openConfinedLeaf, readWithinCapOrElse } from "../utils/confined-read.js";
-import { healthyKeyLinks, healthyKeyMetadata, recoveredEpochKey } from "../utils/key-leaf-health.js";
+import { openConfinedLeaf, readWithinCapOrElse, type CappedLeafRead } from "../utils/confined-read.js";
+import { healthyKeyLinks, healthyKeyMetadata, publishKeyLeafNoReplace, recoveredEpochKey } from "../utils/key-leaf-health.js";
 import path from "node:path";
 import { MAX_PREPARATION_KEY_FILE_BYTES } from "./constants.js";
 import { preparationKeyEpochId } from "./run-integrity.js";
@@ -52,33 +71,116 @@ export function decodePreparationKey(body: string): Buffer | null {
   return key;
 }
 
+/**
+ * What the key read asks of the store. Owned by the key reader; the read takes
+ * no project root and no path.
+ */
+export interface PreparationKeyLeafReads {
+  /**
+   * The key leaf's text within `maxBytes`, from a leaf the store vouches for.
+   * `absent` is a store with no key leaf. `unavailable` is a leaf that exists
+   * and may not be trusted or read: on the local disk that is confinement, the
+   * no-follow open, owner and mode, the link count and the byte cap. May
+   * reject; the body catches nothing.
+   */
+  readKeyLeaf(maxBytes: number): Promise<CappedLeafRead>;
+}
+
+/**
+ * The local-disk key leaf for one exact file. Private, and built per call: the
+ * closure opens and checks the leaf when it is asked, never earlier.
+ */
+function diskPreparationKeyLeafReads(root: string, file: string, reservedAlias?: string): PreparationKeyLeafReads {
+  return { readKeyLeaf: (maxBytes) => readHealthyKeyLeafText(root, file, reservedAlias, maxBytes) };
+}
+
+/**
+ * The local-disk leaf of the project's CURRENT key: the key file, with its
+ * durable temp path as the one reserved alias. WHICH FILE THAT IS IS STATED
+ * ONCE, HERE. Building it does no path work and no I/O: the path is derived
+ * when the leaf is asked for, never earlier. Exported for the store's leaf
+ * composition (`store-leaf-reads.ts`) only; in no package index.
+ */
+export function diskCurrentPreparationKeyLeafReads(root: string): PreparationKeyLeafReads {
+  return { readKeyLeaf: (maxBytes) => {
+    const file = preparationKeyFile(root);
+    return diskPreparationKeyLeafReads(root, file, durableTempPath(file)).readKeyLeaf(maxBytes);
+  } };
+}
+
 /** Read the preparation key without creating directories or collapsing faults. */
 export async function readPreparationKey(root: string): Promise<PreparationKeyRead> {
-  const file = preparationKeyFile(root);
-  return readPreparationKeyLeaf(root, file, durableTempPath(file));
+  return readPreparationKeyFrom(diskCurrentPreparationKeyLeafReads(root));
+}
+
+/**
+ * {@link readPreparationKey} over the reader's own leaf: the one body. It asks
+ * for the leaf under the key cap, then decodes the canonical 32-byte key and
+ * derives its epoch HERE. A leaf that does not decode is `unavailable`, the
+ * same answer as a leaf the store refused. It confines nothing and checks no
+ * owner, mode or link: an in-memory leaf is trusted exactly as far as whoever
+ * supplied it.
+ */
+export async function readPreparationKeyFrom(leaves: PreparationKeyLeafReads): Promise<PreparationKeyRead> {
+  const leaf = await leaves.readKeyLeaf(MAX_PREPARATION_KEY_FILE_BYTES);
+  if (leaf.kind === "absent") return { status: "absent" };
+  if (leaf.kind === "unavailable") return { status: "unavailable" };
+  const key = decodePreparationKey(leaf.body);
+  return key === null ? { status: "unavailable" } : { status: "ok", key, keyEpochId: preparationKeyEpochId(key) };
+}
+
+/** What a reader that needs only the key's epoch learns: its status and epoch, NEVER the key bytes. */
+export type PreparationKeyEpochRead =
+  | { status: "absent" }
+  | { status: "unavailable" }
+  | { status: "ok"; keyEpochId: Sha256Digest };
+
+/**
+ * Read the preparation key and hand on its epoch WITHOUT the key bytes, for a
+ * consumer that only binds or classifies by epoch. One {@link readPreparationKey}
+ * call per call, nothing cached and nothing caught: the same statuses and the
+ * same rejection come back.
+ */
+export async function readPreparationKeyEpoch(root: string): Promise<PreparationKeyEpochRead> {
+  return epochWithoutKeyBytes(await readPreparationKey(root));
+}
+
+/** {@link readPreparationKeyEpoch} over the reader's own leaf: one {@link readPreparationKeyFrom} call, the same projection. */
+export async function readPreparationKeyEpochFrom(leaves: PreparationKeyLeafReads): Promise<PreparationKeyEpochRead> {
+  return epochWithoutKeyBytes(await readPreparationKeyFrom(leaves));
+}
+
+/** A key read's status and epoch, with the key bytes left behind. */
+function epochWithoutKeyBytes(key: PreparationKeyRead): PreparationKeyEpochRead {
+  // A NEW OBJECT, BY NAME. The ok answer carries the key bytes; a spread or the
+  // whole result would hand them to a caller that asked only for the epoch. The
+  // two non-ok answers hold no bytes and are returned as they are.
+  return key.status === "ok" ? { status: "ok", keyEpochId: key.keyEpochId } : key;
 }
 
 /** Read one exact key-shaped leaf through the same confined key contract. */
 async function readPreparationKeyLeaf(root: string, file: string, reservedAlias?: string): Promise<PreparationKeyRead> {
-  const opened = await openConfinedLeaf(root, file, path.dirname(file));
-  switch (opened.kind) {
-    case "absent": return { status: "absent" };
-    case "unavailable": return { status: "unavailable" };
-    case "confirmed": break;
-  }
-  const metadataHealthy = healthyKeyMetadata(opened.mode, opened.uid);
-  const linksHealthy = await healthyKeyLinks(opened, reservedAlias);
-  if (metadataHealthy && linksHealthy) return readHealthyPreparationKey(opened);
-  await opened.handle.close().catch(() => {});
-  return { status: "unavailable" };
+  return readPreparationKeyFrom(diskPreparationKeyLeafReads(root, file, reservedAlias));
 }
 
-/** Decode and identify one opened key whose metadata is already trusted. */
-async function readHealthyPreparationKey(
-  opened: Extract<Awaited<ReturnType<typeof openConfinedLeaf>>, { kind: "confirmed" }>,
-): Promise<PreparationKeyRead> {
-  const key = await readOpenedPreparationKey(opened);
-  return key === null ? { status: "unavailable" } : { status: "ok", key, keyEpochId: preparationKeyEpochId(key) };
+/**
+ * One confined key leaf's text, or why not: the local disk's half of the key
+ * read. The no-follow confined open, then owner and mode, then the link count
+ * against the one reserved alias, then the capped handle-bound read. BOTH
+ * health checks run before either is acted on, so the link check still runs on
+ * a leaf whose owner or mode is already wrong. The handle is closed on every
+ * path. It decodes nothing and knows no key size.
+ */
+async function readHealthyKeyLeafText(
+  root: string, file: string, reservedAlias: string | undefined, maxBytes: number,
+): Promise<CappedLeafRead> {
+  const opened = await openConfinedLeaf(root, file, path.dirname(file));
+  if (opened.kind !== "confirmed") return opened;
+  const metadataHealthy = healthyKeyMetadata(opened.mode, opened.uid);
+  const linksHealthy = await healthyKeyLinks(opened, reservedAlias);
+  if (metadataHealthy && linksHealthy) return readWithinCapOrElse(opened, maxBytes, () => ({ kind: "unavailable" as const }));
+  await opened.handle.close().catch(() => {});
+  return { kind: "unavailable" };
 }
 
 /**
@@ -92,12 +194,6 @@ export async function readOpenedPreparationKey(
   return read.kind === "ok" ? decodePreparationKey(read.body) : null;
 }
 
-/** Reuse a synced ready-only crash key; incomplete scratch bytes are disposable. */
-async function keyForEmptyEpochPublication(root: string): Promise<Buffer> {
-  const file = preparationKeyFile(root);
-  const ready = await readPreparationKeyLeaf(root, durableTempPath(file), durableWritingPath(file));
-  return recoveredEpochKey(ready, PREPARATION_KEY_BYTES, "preparation");
-}
 
 /** Require the exact five-part active inventory and prove every byte count is zero. */
 function assertEmptyEpochInventory(inventory: PreparationEpochInventory): void {
@@ -130,16 +226,38 @@ function emptyHealthyEntry(value: unknown): boolean {
   return inventoryEntryShape(value) && zeroHealthyEntry(value);
 }
 
+/** What empty-epoch key creation asks of the store. No member takes a project root. */
+export interface PreparationKeyCreateSteps {
+  /** The current key, read as any reader reads it (also the collision re-read). */
+  readCurrentKey(): Promise<PreparationKeyRead>;
+  /** A synced ready-only crash key an interrupted publication left, read through the same key contract. */
+  readCrashReadyKey(): Promise<PreparationKeyRead>;
+  /** MECHANISM: durably publish `key` without replacing one; `collision` when one is there. Any other fault THROWS. */
+  publishKey(key: Buffer): Promise<"created" | "collision">;
+}
+
+/** LOCAL DISK. The current and crash-ready key leaves and the no-replace write for `root`, each reached when asked. */
+function diskPreparationKeyCreateSteps(root: string): PreparationKeyCreateSteps {
+  return {
+    readCurrentKey: () => readPreparationKey(root),
+    readCrashReadyKey: () => {
+      const file = preparationKeyFile(root);
+      return readPreparationKeyLeaf(root, durableTempPath(file), durableWritingPath(file));
+    },
+    publishKey: (key) => publishKeyLeafNoReplace(root, preparationKeyFile(root), key),
+  };
+}
+
+/** The reads over the key reader's own body, with the caller's publication mechanism. Building it does no I/O. */
+export function preparationKeyCreateStepsOver(
+  leaves: { current: PreparationKeyLeafReads; crashReady: PreparationKeyLeafReads }, publishKey: PreparationKeyCreateSteps["publishKey"],
+): PreparationKeyCreateSteps {
+  return { readCurrentKey: () => readPreparationKeyFrom(leaves.current), readCrashReadyKey: () => readPreparationKeyFrom(leaves.crashReady), publishKey };
+}
+
 /** Reconcile any crash-left aliases before reporting an existing healthy key. */
-async function refuseExistingKeyEpoch(root: string, key: Buffer): Promise<never> {
-  try {
-    await atomicWriteNoReplaceDurable(preparationKeyFile(root), key.toString("base64"), {
-      confineRoot: root, exactParent: true, mode: 0o600,
-    });
-  } catch (error) {
-    if (error instanceof AtomicWriteCollisionError) throw new Error("preparation key epoch already exists");
-    throw error;
-  }
+async function refuseExistingKeyEpoch(steps: PreparationKeyCreateSteps, key: Buffer): Promise<never> {
+  await steps.publishKey(key);
   throw new Error("preparation key epoch already exists");
 }
 
@@ -157,19 +275,12 @@ export interface PreparedPreparationKey {
 
 /** Durably create the minted key, failing closed on any concurrent creation. */
 async function publishPreparedKey(
-  root: string, key: Buffer, options: PreparationKeyCreateOptions,
+  steps: PreparationKeyCreateSteps, key: Buffer, options: PreparationKeyCreateOptions,
 ): Promise<void> {
   await options.beforePublishForTest?.();
-  try {
-    await atomicWriteNoReplaceDurable(preparationKeyFile(root), key.toString("base64"), {
-      confineRoot: root, exactParent: true, mode: 0o600,
-    });
-  } catch (error) {
-    if (error instanceof AtomicWriteCollisionError) {
-      const collision = await readPreparationKey(root);
-      throw new Error(`preparation key creation collision: ${collision.status}`);
-    }
-    throw error;
+  if (await steps.publishKey(key) === "collision") {
+    const collision = await steps.readCurrentKey();
+    throw new Error(`preparation key creation collision: ${collision.status}`);
   }
 }
 
@@ -196,13 +307,21 @@ export async function prepareKeyForEmptyEpochLocked(
   inventory: PreparationEpochInventory,
   options: PreparationKeyCreateOptions = {},
 ): Promise<PreparedPreparationKey> {
+  return prepareKeyForEmptyEpochLockedWith(diskPreparationKeyCreateSteps(root), inventory, options);
+}
+
+/** {@link prepareKeyForEmptyEpochLocked} over {@link PreparationKeyCreateSteps}: THE ONE BODY, publication included. */
+export async function prepareKeyForEmptyEpochLockedWith(
+  steps: PreparationKeyCreateSteps,
+  inventory: PreparationEpochInventory,
+  options: PreparationKeyCreateOptions = {},
+): Promise<PreparedPreparationKey> {
   assertEmptyEpochInventory(inventory);
-  const file = preparationKeyFile(root);
-  const current = await readPreparationKeyLeaf(root, file, durableTempPath(file));
+  const current = await steps.readCurrentKey();
   if (current.status === "unavailable") throw new Error("preparation key is unavailable");
-  if (current.status === "ok") return refuseExistingKeyEpoch(root, current.key);
-  const key = await keyForEmptyEpochPublication(root);
+  if (current.status === "ok") return refuseExistingKeyEpoch(steps, current.key);
+  const key = recoveredEpochKey(await steps.readCrashReadyKey(), PREPARATION_KEY_BYTES, "preparation");
   return {
-    keyEpochId: preparationKeyEpochId(key), publish: () => publishPreparedKey(root, key, options),
+    keyEpochId: preparationKeyEpochId(key), publish: () => publishPreparedKey(steps, key, options),
   };
 }

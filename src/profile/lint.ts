@@ -33,22 +33,66 @@
  * Every entity-page finding carries the offending page/dir's `entityType` so
  * callers can group diagnostics by entity type; store-level relation findings
  * are not page-scoped and carry none.
+ *
+ * NO PROJECT ROOT BELOW THE TWO ROOT-TAKING ENTRIES. `collectProfileLintInputFrom`
+ * and `collectProfileLintFindings` reach the project only through
+ * {@link ProfileLintSources}, five existing seams composed once.
+ * `collectProfileLintInput(root, profile)` and `lintProfileEntities(root, profile)`
+ * build the local disk sources for one call. The artifact resolver runs over
+ * the artifact store's leaf reads, which the artifact sources carry. ONE
+ * STANDING EXCEPTION IS NOT CLOSED HERE: on local disk the artifact sources
+ * still call the root-taking provenance verifier, exactly as before this file
+ * knew about sources.
  */
 
-import { collectEntityPages, type EntityProblem } from "./collect.js";
+import { collectEntityPagesFrom, type EntityProblem } from "./collect.js";
 import { checkPageEmpty, checkPageMalformedCitations } from "../linter/rules.js";
-import { checkRelationStore, checkStandingRelationPreconditions } from "./relation-lint.js";
-import { checkArtifactRefs } from "./artifact-lint.js";
-import { checkEventChain } from "./event-lint.js";
+import { checkRelationStoreFrom, checkStandingRelationPreconditionsFrom } from "./relation-lint.js";
+import { checkArtifactRefsFrom, diskArtifactHealthSources, type ArtifactHealthSources } from "./artifact-lint.js";
+import { checkEventChainFrom } from "./event-lint.js";
+import { diskEventReadSources, type EventReadSources } from "../events/store-read.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../utils/jsonl-store.js";
+import { diskEntityPageReads, type EntityPageReads } from "./lifecycle-read.js";
 import { lifecycleStateSet } from "./lifecycle.js";
 import type { ProfilePack, EntityPage, LifecycleDef } from "./types.js";
 import type { LintResult } from "../linter/types.js";
 import { checkDeclaredConfidence } from "./lint-confidence.js";
 import { INVALID_LIFECYCLE_STATE_RULE, PROBLEM_SEVERITY, profileRuleTiers, type ProfileRuleTier } from "./lint-registry.js";
 
-/** One real entity collection shared by all profile checks. */
+/**
+ * Everything profile lint asks of the project, as the existing seams of the
+ * checks it runs. Nothing ties the five to one project; production builds all
+ * of them from one root.
+ */
+export interface ProfileLintSources {
+  /** The entity directories: the one collection, and the standing check's gated pages. */
+  scans: LegacyLocalEntityScans;
+  /** The relation store, for the relation check and the standing check. */
+  graph: GraphStoreReads;
+  /** Endpoint entity pages, for the standing check. */
+  pages: EntityPageReads;
+  /** The event store and its head anchor. */
+  events: EventReadSources;
+  /** Artifact-ref health: the artifact store's leaf reads, the relation store and the provenance question. */
+  artifacts: ArtifactHealthSources;
+}
+
+/** LOCAL DISK. The profile lint sources for the project at `root`, built per call. Each member is the builder its check used before; building them does no I/O. */
+export function diskProfileLintSources(root: string): ProfileLintSources {
+  return {
+    scans: diskLocalEntityScans(root),
+    graph: diskGraphStoreReads(root),
+    pages: diskEntityPageReads(root),
+    events: diskEventReadSources(root),
+    artifacts: diskArtifactHealthSources(root),
+  };
+}
+
+/** One real entity collection shared by all profile checks, with the sources the later checks read through. */
 export interface ProfileLintContext {
-  root: string;
+  sources: ProfileLintSources;
   profile: ProfilePack;
   pages: EntityPage[];
   problems: EntityProblem[];
@@ -166,13 +210,18 @@ export async function lintProfileEntities(
 
 /** Collect entities once so tier requests never perform a second entity walk. */
 export async function collectProfileLintInput(root: string, profile: ProfilePack): Promise<ProfileLintContext> {
-  const { pages, problems } = await collectEntityPages(root, profile);
-  return { root, profile, pages, problems };
+  return collectProfileLintInputFrom(diskProfileLintSources(root), profile);
+}
+
+/** {@link collectProfileLintInput} through `sources`: THE ONE BODY. It holds no project root. */
+export async function collectProfileLintInputFrom(sources: ProfileLintSources, profile: ProfilePack): Promise<ProfileLintContext> {
+  const { pages, problems } = await collectEntityPagesFrom(sources.scans, profile);
+  return { sources, profile, pages, problems };
 }
 
 /** Run checks in legacy order, adding declared confidence within the page pass. */
 export async function collectProfileLintFindings(input: ProfileLintContext): Promise<ProfileLintCollection> {
-  const { root, profile, pages, problems } = input;
+  const { sources, profile, pages, problems } = input;
   const results: LintResult[] = problems.map(problemToResult);
   for (const page of pages) {
     results.push(...lintEntityPageContent(page));
@@ -180,9 +229,9 @@ export async function collectProfileLintFindings(input: ProfileLintContext): Pro
     const definition = profile.entities[page.entityType];
     if (definition) results.push(...checkDeclaredConfidence(page, definition));
   }
-  results.push(...(await checkRelationStore(root, pages, profile)));
-  results.push(...(await checkStandingRelationPreconditions(root, profile)));
-  results.push(...(await checkEventChain(root)));
-  results.push(...(await checkArtifactRefs(root, pages, profile)));
+  results.push(...(await checkRelationStoreFrom(sources.graph, pages, profile)));
+  results.push(...(await checkStandingRelationPreconditionsFrom(sources, profile)));
+  results.push(...(await checkEventChainFrom(sources.events)));
+  results.push(...(await checkArtifactRefsFrom(sources.artifacts, pages, profile)));
   return { results, ruleTiers: profileRuleTiers(profile) };
 }

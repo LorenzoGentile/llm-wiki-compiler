@@ -23,7 +23,7 @@
  */
 
 import path from "node:path";
-import { existsSync, statSync } from "node:fs";
+import { locationIsNonDirectorySync } from "../storage/disk-locations.js";
 import { withQuiet } from "../utils/output.js";
 import { ingestSource, ingestTextSource } from "../commands/ingest.js";
 import { compileAndReport } from "../compiler/index.js";
@@ -40,6 +40,7 @@ import { collectStatus } from "../status/collect.js";
 import { pickSearchRefs, loadSelectedRefs } from "../search/retrieval.js";
 import { getPage, listPages } from "../pages/list.js";
 import { listSources, getSource, deleteSource } from "../sources/store.js";
+import { withRegisteredProjectLock } from "../operation-bundles/registered-project-lock.js";
 import { runOkfExport } from "../export/okf/run.js";
 import { runOkfImport } from "../import/run.js";
 import { buildStagingFacade } from "./staging-facade.js";
@@ -87,7 +88,7 @@ export function createWikiCore(options: CreateWikiOptions): WikiCore {
 export function createWikiCoreAtRoot(root: string, options: CreateWikiOptions): WikiCore {
   // A missing root is valid — ingest/ingestText create sources/ via recursive mkdir.
   // But if the path already exists and is NOT a directory, it is always a caller mistake.
-  if (existsSync(root) && !statSync(root).isDirectory()) {
+  if (locationIsNonDirectorySync(root)) {
     throw new Error(`createWiki: root exists but is not a directory: ${root}`);
   }
 
@@ -126,7 +127,8 @@ export function createWikiCoreAtRoot(root: string, options: CreateWikiOptions): 
 
     getSource: (id) => runQuiet(() => getSource(root, id)),
 
-    deleteSource: (id) => runQuiet(() => deleteSource(root, id)),
+    // Lock-free on an ordinary project; under the gated project lock once registered.
+    deleteSource: (id) => runQuiet(() => withRegisteredProjectLock(root, () => deleteSource(root, id))),
 
     status: () => runQuiet(() => collectStatus(root)),
 

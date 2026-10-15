@@ -25,12 +25,23 @@
  * the operator needs to know is whether waiting will ever help. So `show` reports
  * the classification itself, including WHICH kind of unobservable, because one of
  * them resolves on a retry and the other never will.
+ *
+ * ONE BODY, OVER TWO DIFFERENT KINDS OF DEPENDENCY. Every decision above is
+ * made in `showPreparationOperationFrom`, which takes no project root.
+ * `PreparationShowReads` is PROJECT STORAGE: readiness, then the run lookup.
+ * `PreparationShowHostObservation` is NOT storage: it observes a process on
+ * THIS HOST, and no store of any kind could answer it. They are separate
+ * parameters so the second is never mistaken for portable I/O. The root-named
+ * operation keeps its signature and reaches the body over the private
+ * local-disk reads and the incumbent process classifier, unchanged. Naming
+ * them here selects no backend and sets no new liveness policy.
  */
 
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
 import { classifyExecutionOwnerLiveness } from "./attempts/lease.js";
 import type { PreparationExecutionOwnerV1, PreparationRunState, PreparationRunV1 } from "./run-types.js";
 import { resolvePreparationReadReadiness } from "./service-readiness.js";
+import type { ReadReadinessV1 } from "./service-readiness.js";
 import { resolvePreparationRun } from "./service-run-lookup.js";
 import type { PreparationRunLookupV1 } from "./service-run-lookup.js";
 import type { OwnerLiveness } from "../utils/lock-owner.js";
@@ -134,9 +145,47 @@ function livenessIsRetryable(liveness: OwnerLiveness): boolean {
   return liveness === "unobservable-unreadable";
 }
 
+/**
+ * What `show` asks of the preparation store. Owned by `show`; no read takes a
+ * project root. Each member must resolve or reject, never throw synchronously:
+ * the body catches nothing and adds no normalization.
+ */
+export interface PreparationShowReads {
+  /** Whether the project is something to read a run from. */
+  readReadiness(): Promise<ReadReadinessV1>;
+  /** Locate one run and its authenticated binding by the id the caller named. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
+}
+
+/**
+ * What `show` asks of THE HOST IT RUNS ON. A process observation, not project
+ * storage: the answer depends on this machine's process table and on nothing a
+ * store holds. Synchronous, as the incumbent classifier is.
+ */
+export interface PreparationShowHostObservation {
+  /** Classify whether the recorded owner's process is still running here. */
+  classifyOwnerLiveness(owner: Pick<PreparationExecutionOwnerV1, "pid" | "processStartTime">): OwnerLiveness;
+}
+
+/**
+ * The local-disk reads for one project root. Private, and built per call: each
+ * closure calls the imported root-taking reader when it is asked, never earlier.
+ */
+function diskPreparationShowReads(root: string): PreparationShowReads {
+  return {
+    readReadiness: () => resolvePreparationReadReadiness(root),
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+  };
+}
+
+/** This host's process observation: the incumbent classifier, called as before. */
+const HOST_PROCESS_OBSERVATION: PreparationShowHostObservation = {
+  classifyOwnerLiveness: classifyExecutionOwnerLiveness,
+};
+
 /** Report one execution owner, classification and remedy included. */
-function ownerReport(owner: PreparationExecutionOwnerV1): ExecutionOwnerReportV1 {
-  const liveness = classifyExecutionOwnerLiveness(owner);
+function ownerReport(owner: PreparationExecutionOwnerV1, host: PreparationShowHostObservation): ExecutionOwnerReportV1 {
+  const liveness = host.classifyOwnerLiveness(owner);
   return {
     pid: owner.pid, attemptId: owner.attemptId, acquiredAt: owner.acquiredAt,
     liveness, retryable: livenessIsRetryable(liveness), guidance: LIVENESS_GUIDANCE[liveness],
@@ -144,7 +193,7 @@ function ownerReport(owner: PreparationExecutionOwnerV1): ExecutionOwnerReportV1
 }
 
 /** Project one run's durable record into the reference-only report. */
-function runReport(run: PreparationRunV1, manifestDigest: string): RunReportV1 {
+function runReport(run: PreparationRunV1, manifestDigest: string, host: PreparationShowHostObservation): RunReportV1 {
   return {
     workspaceId: run.workspaceId, preparationId: run.preparationId, runId: run.runId,
     state: run.state, manifestDigest, transitionCount: run.transitions.length,
@@ -157,7 +206,7 @@ function runReport(run: PreparationRunV1, manifestDigest: string): RunReportV1 {
     // THE REF, NOT THE OBJECT. `evidenceRefs` are content addresses; resolving
     // them is a different operation with a different bound.
     evidenceRefs: run.evidenceRefs.map((ref) => ref.digest),
-    executionOwner: run.executionOwner === undefined ? null : ownerReport(run.executionOwner),
+    executionOwner: run.executionOwner === undefined ? null : ownerReport(run.executionOwner, host),
   };
 }
 
@@ -193,6 +242,17 @@ function lookupOutcome(miss: Extract<PreparationRunLookupV1, { ok: false }>): Sh
 export async function showPreparationOperation(
   root: string, request: ShowRequestV1,
 ): Promise<ShowResultV1> {
+  return showPreparationOperationFrom(diskPreparationShowReads(root), HOST_PROCESS_OBSERVATION, request);
+}
+
+/**
+ * {@link showPreparationOperation} over `show`'s own reads and its host
+ * observation: the one body. The host is asked only for a run that records an
+ * owner, and only after both reads.
+ */
+export async function showPreparationOperationFrom(
+  reads: PreparationShowReads, host: PreparationShowHostObservation, request: ShowRequestV1,
+): Promise<ShowResultV1> {
   // CAPTURED BEFORE THE FIRST AWAIT (D-10-9), for the same reason the mutating
   // verbs do it: a field re-read afterwards would describe a run the caller
   // never named, and a read reporting the wrong run is a wrong answer even
@@ -204,15 +264,15 @@ export async function showPreparationOperation(
   const captured = capturedRequest<ShowRequestV1>(request);
   if (captured === null) return { status: "refused", reason: REQUEST_CAPTURE_REFUSAL };
   const runId = captured.runId;
-  const readiness = await resolvePreparationReadReadiness(root);
+  const readiness = await reads.readReadiness();
   if (readiness.status === "unreadable") return { status: "unavailable", detail: readiness.detail };
   if (readiness.status === "absent") return { status: "refused", reason: readiness.detail };
-  const resolved = await resolvePreparationRun(root, runId);
+  const resolved = await reads.resolveRun(runId);
   // THE LOOKUP'S OWN CLASSIFICATION, not a re-derivation of it. Every failing
   // arm used to land on `refused`, so a degraded manifest scan and a corrupt run
   // leaf — both of which mean this observer could not see — were reported as
   // settled facts about the store, and the CLI exited 1 where its documented
   // retryable code is 2.
   if (!resolved.ok) return lookupOutcome(resolved);
-  return { status: "shown", run: runReport(resolved.run, resolved.binding.manifestDigest) };
+  return { status: "shown", run: runReport(resolved.run, resolved.binding.manifestDigest, host) };
 }

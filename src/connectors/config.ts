@@ -7,12 +7,16 @@
  * Project-local `.llmwiki/config.json` may only tighten connector etiquette
  * floors such as allowed hosts and request interval; it cannot activate a
  * connector or widen the first-party registry allowlist.
+ *
+ * ONE BODY, ONE PHYSICAL READ. {@link loadConnectorConfigFrom} owns every
+ * decision (absence means registry defaults, each untrusted shape's reason, and
+ * the tighten-only parse) over {@link ConnectorConfigLeaf}: the shared project
+ * config leaf (`utils/project-config-leaf.ts`), read without creating `.llmwiki`,
+ * reporting each physical outcome distinctly. {@link loadConnectorConfig} keeps
+ * its signature and passes the local leaf, built per call. In no package index.
  */
 
-import path from "node:path";
-import { MAX_LOCAL_CONFIG_BYTES } from "../utils/constants.js";
-import { readCappedNoFollow } from "../utils/confined-read.js";
-import { resolveExistingConfinedPrivateDir } from "../utils/private-dir.js";
+import { diskProjectConfigLeaf, type ProjectConfigLeaf, type ProjectConfigLeafRead } from "../utils/project-config-leaf.js";
 
 const CONNECTORS_ENV = "LLMWIKI_CONNECTORS";
 const CONTACT_RE = /^[A-Za-z0-9._%+\-@]+$/;
@@ -37,6 +41,11 @@ interface ProjectConnectorConfig {
   connectors?: Record<string, unknown>;
 }
 
+/** One physical read of the project config leaf (the shared read). */
+export type ConnectorConfigLeafRead = ProjectConfigLeafRead;
+/** The project config leaf as the connector config body asks it (the shared leaf). */
+export type ConnectorConfigLeaf = ProjectConfigLeaf;
+
 /** Return true only when the operator's out-of-workspace env var names `id`. */
 export function isConnectorActivated(id: string): boolean {
   const raw = process.env[CONNECTORS_ENV];
@@ -57,8 +66,18 @@ export async function loadConnectorConfig(
   registryHosts: readonly string[],
   defaultMinIntervalMs: number,
 ): Promise<ConnectorConfigRead> {
+  return loadConnectorConfigFrom(diskProjectConfigLeaf(root), id, registryHosts, defaultMinIntervalMs);
+}
+
+/** {@link loadConnectorConfig} over {@link ConnectorConfigLeaf}: THE ONE BODY. */
+export async function loadConnectorConfigFrom(
+  leaf: ConnectorConfigLeaf,
+  id: string,
+  registryHosts: readonly string[],
+  defaultMinIntervalMs: number,
+): Promise<ConnectorConfigRead> {
   const base = defaultConnectorConfig(registryHosts, defaultMinIntervalMs);
-  const read = await readProjectConfig(root);
+  const read = await readProjectConfig(leaf);
   if (read.kind === "absent") return { kind: "absent", config: base };
   if (read.kind === "unavailable") return read;
   const entry = read.config.connectors?.[id];
@@ -72,26 +91,15 @@ function defaultConnectorConfig(hosts: readonly string[], minRequestIntervalMs: 
   return { minRequestIntervalMs, allowedHosts: [...hosts] };
 }
 
-/** Read and parse the project-local connector config leaf without creating `.llmwiki`. */
+/** Read and parse the project-local connector config leaf: each physical outcome's meaning. */
 async function readProjectConfig(
-  root: string,
+  leaf: ConnectorConfigLeaf,
 ): Promise<{ kind: "ok"; config: ProjectConnectorConfig } | { kind: "absent" } | { kind: "unavailable"; reason: string }> {
-  const privateDir = await resolvePrivateDir(root);
-  if (privateDir.kind !== "ok") return privateDir;
-  const read = await readCappedNoFollow(path.join(privateDir.dir, "config.json"), MAX_LOCAL_CONFIG_BYTES);
-  if (read.kind === "absent") return { kind: "absent" };
+  const read = await leaf.readConfig();
+  if (read.kind === "dir-unavailable") return { kind: "unavailable", reason: "config-dir-unavailable" };
+  if (read.kind === "dir-absent" || read.kind === "absent") return { kind: "absent" };
   if (read.kind === "unavailable") return { kind: "unavailable", reason: "config-unavailable" };
   return parseProjectConfig(read.body);
-}
-
-/** Resolve the existing private dir, mapping confinement failures into `unavailable`. */
-async function resolvePrivateDir(root: string): Promise<{ kind: "ok"; dir: string } | { kind: "absent" } | { kind: "unavailable"; reason: string }> {
-  try {
-    const dir = await resolveExistingConfinedPrivateDir(root);
-    return dir === null ? { kind: "absent" } : { kind: "ok", dir };
-  } catch {
-    return { kind: "unavailable", reason: "config-dir-unavailable" };
-  }
 }
 
 /** Parse the project config JSON, accepting configs with no connector section. */

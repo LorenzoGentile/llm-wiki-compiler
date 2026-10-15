@@ -12,10 +12,19 @@
  * create-only evidence CAS, and runs only after every cap and authority check
  * has passed. There is no caller-supplied evidence buffer: a byte that no
  * declared input materializes cannot enter preparation evidence.
+ *
+ * Materialization has ONE BODY, {@link materializePlannedInitialInputsWith},
+ * over {@link InitialInputMaterializeSteps}: the structured write and the
+ * caller-file materialization, neither of which takes a project root. Its root
+ * form passes the incumbent writers, called when asked. The caller-file
+ * materialization keeps its own decisions (copy, recheck, presence) in its own
+ * body, `materializeCallerFileInputWith` in `inputs.ts`, over
+ * `CallerFileEvidenceSteps`.
  */
 
 import {
-  writePreparationEvidenceCreateOnly, type PreparationEvidenceLocation,
+  writePreparationEvidenceCreateOnly, writePreparationEvidenceCreateOnlyWith,
+  type PreparationEvidenceLocation, type PreparationEvidenceWriteSteps,
 } from "./evidence-store.js";
 import {
   materializeCallerFileInput, planCallerFileInput, prepareStructuredValueInput,
@@ -53,7 +62,7 @@ export interface PlannedInitialInputSetV1 {
 }
 
 /** Closed materialize outcome: written, or a distinct fail-closed refusal. */
-type MaterializeInitialInputsOutcome =
+export type MaterializeInitialInputsOutcome =
   | { status: "materialized" }
   | { status: "unavailable"; code: PreparedInputUnavailableCode };
 
@@ -109,15 +118,42 @@ export async function planInitialInputs(
   };
 }
 
+/** The two writes materialization makes, one per input kind. No member takes a project root. */
+export interface InitialInputMaterializeSteps {
+  /** Create one structured value's immutable evidence object, or prove its exact replay. */
+  writeStructured(location: PreparationEvidenceLocation, bytes: Buffer): Promise<unknown>;
+  /** Copy one planned caller file into evidence and recheck it, or the distinct refusal. */
+  materializeCallerFile(location: PreparationEvidenceLocation, file: PreparedCallerFileV1): Promise<MaterializeInitialInputsOutcome>;
+}
+
+/** LOCAL DISK. The incumbent writers for `root`, each called when asked. */
+function diskInitialInputMaterializeSteps(root: string): InitialInputMaterializeSteps {
+  return {
+    writeStructured: (location, bytes) => writePreparationEvidenceCreateOnly(root, location, bytes),
+    materializeCallerFile: (location, file) => materializeCallerFileInput(root, location, file),
+  };
+}
+
+/**
+ * The structured write over the evidence writer's own body, with the caller's
+ * caller-file materialization (whose own body, `materializeCallerFileInputWith`,
+ * is composed by that caller). Building it does no I/O.
+ */
+export function initialInputMaterializeStepsOver(
+  evidence: PreparationEvidenceWriteSteps, materializeCallerFile: InitialInputMaterializeSteps["materializeCallerFile"],
+): InitialInputMaterializeSteps {
+  return { writeStructured: (location, bytes) => writePreparationEvidenceCreateOnlyWith(evidence, location, bytes), materializeCallerFile };
+}
+
 /** Materialize one planned initial input into the immutable evidence CAS. */
 async function materializeItem(
-  root: string, location: PreparationEvidenceLocation, item: PlannedInitialInput,
+  steps: InitialInputMaterializeSteps, location: PreparationEvidenceLocation, item: PlannedInitialInput,
 ): Promise<MaterializeInitialInputsOutcome> {
   if (item.kind === "structured") {
-    await writePreparationEvidenceCreateOnly(root, location, item.bytes);
+    await steps.writeStructured(location, item.bytes);
     return { status: "materialized" };
   }
-  return materializeCallerFileInput(root, location, item.file);
+  return steps.materializeCallerFile(location, item.file);
 }
 
 /**
@@ -129,9 +165,16 @@ async function materializeItem(
 export async function materializePlannedInitialInputs(
   root: string, location: PreparationEvidenceLocation, set: PlannedInitialInputSetV1, missing: ReadonlySet<string>,
 ): Promise<MaterializeInitialInputsOutcome> {
+  return materializePlannedInitialInputsWith(diskInitialInputMaterializeSteps(root), location, set, missing);
+}
+
+/** {@link materializePlannedInitialInputs} over {@link InitialInputMaterializeSteps}: THE ONE BODY. Digest order; only the missing; the first refusal stops. */
+export async function materializePlannedInitialInputsWith(
+  steps: InitialInputMaterializeSteps, location: PreparationEvidenceLocation, set: PlannedInitialInputSetV1, missing: ReadonlySet<string>,
+): Promise<MaterializeInitialInputsOutcome> {
   for (const item of [...set.planned].sort((a, b) => a.bareDigest.localeCompare(b.bareDigest))) {
     if (!missing.has(item.bareDigest)) continue;
-    const outcome = await materializeItem(root, location, item);
+    const outcome = await materializeItem(steps, location, item);
     if (outcome.status === "unavailable") return outcome;
   }
   return { status: "materialized" };

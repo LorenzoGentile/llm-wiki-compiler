@@ -16,11 +16,10 @@ import {
   type QuarantineReceiptV1,
 } from "../receipts.js";
 import { canonicalTime } from "../run-parse-helpers.js";
-import type { PreparationLifecycleNamespaceV1 } from "../lifecycle-fs/types.js";
 import {
   LifecycleObservationError,
-  readLifecycleLeaf,
 } from "../lifecycle-fs/leaf-observation.js";
+import type { LifecycleLeafReads } from "./classifier-types.js";
 import type { CapturedLifecycleKey } from "../lifecycle-fs/key-observation.js";
 import type { LifecycleScanBounds } from "../lifecycle-fs/bounds.js";
 
@@ -233,7 +232,7 @@ function parseClosedReceipt(body: Buffer): QuarantineReceiptV1 | PruneReceiptV1 
 
 /** Read one exact receipt leaf and authenticate it against the captured key. */
 async function observeLifecycleReceipt(
-  namespace: PreparationLifecycleNamespaceV1,
+  reads: LifecycleLeafReads,
   file: string,
   unitRoot: string,
   key: CapturedLifecycleKey,
@@ -241,12 +240,7 @@ async function observeLifecycleReceipt(
 ): Promise<LifecycleReceiptObservation | "absent"> {
   let read;
   try {
-    read = await readLifecycleLeaf({
-      root: namespace.root.realPath,
-      file,
-      expectedDir: unitRoot,
-      maxBytes: bounds.maxReceiptBytes,
-    });
+    read = await reads.readLeaf(file, unitRoot, bounds.maxReceiptBytes);
   } catch (error) {
     const code = error instanceof LifecycleObservationError
       ? error.code
@@ -277,7 +271,7 @@ async function observeLifecycleReceipt(
 
 /** Read one receipt and require its expected family kind and containing unit. */
 export async function observeBoundLifecycleReceipt(
-  namespace: PreparationLifecycleNamespaceV1,
+  reads: LifecycleLeafReads,
   file: string,
   unitRoot: string,
   unitId: string,
@@ -286,7 +280,7 @@ export async function observeBoundLifecycleReceipt(
   bounds: LifecycleScanBounds,
 ): Promise<LifecycleReceiptObservation | "absent"> {
   const candidate = await observeLifecycleReceipt(
-    namespace, file, unitRoot, key, bounds,
+    reads, file, unitRoot, key, bounds,
   );
   if (candidate === "absent") return candidate;
   if (candidate.receipt.kind !== kind || candidate.receipt.unitId !== unitId) {

@@ -20,15 +20,21 @@
  * so the migration can content-verify a preserved vector without re-reading.
  */
 
-import { stat } from "node:fs/promises";
 import path from "node:path";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "./constants.js";
-import { collectNamespacedPageRecords, buildEmbeddingText } from "./embeddings-pages.js";
+import {
+  buildEmbeddingText,
+  collectNamespacedPageRecordsFrom,
+  diskEmbeddingPageReads,
+  type EmbeddingPageReads,
+} from "./embeddings-pages.js";
 import { hashChunkText, splitIntoChunks } from "./retrieval.js";
 import { sha256Text } from "../connectors/hash.js";
 import { parseQualifiedPageId, qualifiedPageId, type PageId } from "./page-id.js";
 import { pageEmbedSurfaces } from "./embed-eligibility.js";
-import { collectEntityPages, invalidEntityPagePaths } from "../profile/collect.js";
+import { collectEntityPagesFrom, invalidEntityPagePaths } from "../profile/collect.js";
 import { isDefaultProfile } from "../profile/default.js";
 import type { LoadedProfile } from "../profile/types.js";
 import type { EligibleLivePage } from "./embeddings-migrate.js";
@@ -76,9 +82,28 @@ export async function collectEligibleLivePages(
   root: string,
   profile: LoadedProfile,
 ): Promise<CollectedPage[]> {
-  const reserved = await collectReservedPages(root);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return collectEligibleLivePagesFrom({ pages: diskEmbeddingPageReads(root), entities: diskLocalEntityScans(root) }, profile);
+}
+
+/** What the eligible-page collector reads: the reserved-page reads, and the entity-directory scans for typed pages. */
+export interface EmbeddingCollectSources {
+  readonly pages: EmbeddingPageReads;
+  readonly entities: LegacyLocalEntityScans;
+}
+
+/**
+ * {@link collectEligibleLivePages} over `sources`: THE ONE BODY. Reserved pages
+ * first; the default profile stops there, before any entity scan; then typed
+ * pages in entity declaration order, gated by eligibility and profile validity.
+ */
+export async function collectEligibleLivePagesFrom(
+  sources: EmbeddingCollectSources,
+  profile: LoadedProfile,
+): Promise<CollectedPage[]> {
+  const reserved = await collectReservedPages(sources.pages);
   if (isDefaultProfile(profile.profile)) return reserved;
-  const typed = await collectTypedPages(root, profile);
+  const typed = await collectTypedPages(sources.entities, profile);
   return [...reserved, ...typed];
 }
 
@@ -99,19 +124,31 @@ const ABSENT_CODES: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]);
  * exist, so it is absent.
  */
 export async function requestedPagesExistence(root: string, profile: LoadedProfile, requested: PageId[]): Promise<Map<PageId, PageExistence>> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return requestedPagesExistenceFrom(diskEmbeddingPageReads(root), profile, requested);
+}
+
+/** {@link requestedPagesExistence} over `reads`: THE ONE BODY. Which directory owns an id, and what each error means, are decided here. */
+export async function requestedPagesExistenceFrom(
+  reads: EmbeddingPageReads,
+  profile: LoadedProfile,
+  requested: PageId[],
+): Promise<Map<PageId, PageExistence>> {
   const out = new Map<PageId, PageExistence>();
   for (const pageId of requested) {
     const parsed = parseQualifiedPageId(pageId);
     const directory = parsed === null ? null : pageDirectoryFor(parsed.namespace, profile);
     if (parsed === null || directory === null) { out.set(pageId, "absent"); continue; }
-    out.set(pageId, await fileExistence(path.join(root, directory, `${parsed.pagePart}.md`)));
+    // The locator is POSIX project-relative, matching the declared-directory convention (see `isRegularFile`).
+    out.set(pageId, await fileExistence(reads, path.posix.join(directory, `${parsed.pagePart}.md`)));
   }
   return out;
 }
 
-async function fileExistence(filePath: string): Promise<PageExistence> {
+/** One page file's existence: a regular file is present; only a missing path or parent proves absence. */
+async function fileExistence(reads: EmbeddingPageReads, relPath: string): Promise<PageExistence> {
   try {
-    return (await stat(filePath)).isFile() ? "present" : "absent";
+    return (await reads.isRegularFile(relPath)) ? "present" : "absent";
   } catch (error) {
     return ABSENT_CODES.has(String((error as NodeJS.ErrnoException).code)) ? "absent" : "unknown";
   }
@@ -125,16 +162,16 @@ function pageDirectoryFor(namespace: string, profile: LoadedProfile): string | n
 }
 
 /** Collect concept + query pages (both surfaces eligible, legacy gate applies). */
-async function collectReservedPages(root: string): Promise<CollectedPage[]> {
-  const tagged = await collectNamespacedPageRecords(root);
+async function collectReservedPages(reads: EmbeddingPageReads): Promise<CollectedPage[]> {
+  const tagged = await collectNamespacedPageRecordsFrom(reads);
   return tagged.map(({ namespace, record }) =>
     toCollectedPage(qualifiedPageId(namespace, record.slug), record),
   );
 }
 
 /** Collect typed entity pages, gated by eligibility + profile validity. */
-async function collectTypedPages(root: string, profile: LoadedProfile): Promise<CollectedPage[]> {
-  const { pages, problems } = await collectEntityPages(root, profile.profile);
+async function collectTypedPages(entities: LegacyLocalEntityScans, profile: LoadedProfile): Promise<CollectedPage[]> {
+  const { pages, problems } = await collectEntityPagesFrom(entities, profile.profile);
   const invalidPaths = invalidEntityPagePaths(problems);
   const out: CollectedPage[] = [];
   for (const page of pages) {

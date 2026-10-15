@@ -34,6 +34,13 @@
  * this run (an interrupted removal being resumed) is never reported as
  * "Deleted", and every page line comes from what `applyRemovalLocked` actually
  * unlinked rather than from what the pre-lock plan proposed.
+ *
+ * ONE BODY, NO ROOT. {@link rmCommandWith} owns every decision above (the
+ * no-match refusal, the dry run that takes no lock, the non-blocking lock
+ * refusal, report-then-regenerate inside the one lock, and the skipped-page exit
+ * code) over {@link RmSteps}. {@link rmCommand} keeps its signature, reads the
+ * working directory as before, and passes the local steps, which call the
+ * incumbent root forms when asked (so module spies and mocks still intercept).
  */
 
 import {
@@ -47,6 +54,31 @@ import type { SkippedDelete } from "../wiki/delete-page.js";
 import { releaseLock } from "../utils/lock.js";
 import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
 import * as output from "../utils/output.js";
+
+/** The project steps one removal takes. No member takes a project root. */
+export interface RmSteps {
+  /** The removal plan for `ref`, or null when no source matches. */
+  plan(ref: string): Promise<RemovalPlan | null>;
+  /** Take the project mutation lock without blocking; false when another process holds it. */
+  acquireLock(): Promise<boolean>;
+  /** Apply the plan under the held lock. */
+  apply(plan: RemovalPlan): Promise<RemovalApplyResult>;
+  /** Regenerate the derived artifacts under the held lock. */
+  regenerate(): Promise<void>;
+  /** Release the project lock. */
+  releaseLock(): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent root forms for `root`, each called when asked. */
+function localRmSteps(root: string): RmSteps {
+  return {
+    plan: (ref) => planRemoval(root, ref),
+    acquireLock: () => acquireMutationLock(root, "ordinary"),
+    apply: (plan) => applyRemovalLocked(root, plan),
+    regenerate: () => regenerateDerivedLocked(root),
+    releaseLock: () => releaseLock(root),
+  };
+}
 
 /** Options for {@link rmCommand}. */
 export interface RmOptions {
@@ -62,8 +94,12 @@ export interface RmOptions {
  * @returns The process exit code (0 success, 1 refusal).
  */
 export async function rmCommand(ref: string, options: RmOptions = {}): Promise<number> {
-  const root = process.cwd();
-  const plan = await planRemoval(root, ref);
+  return rmCommandWith(localRmSteps(process.cwd()), ref, options);
+}
+
+/** {@link rmCommand} over {@link RmSteps}: THE ONE BODY. */
+export async function rmCommandWith(steps: RmSteps, ref: string, options: RmOptions = {}): Promise<number> {
+  const plan = await steps.plan(ref);
   if (plan === null) {
     output.status("x", output.error(`No source matches "${ref}". Look in sources/ for the filename.`));
     return 1;
@@ -75,7 +111,7 @@ export async function rmCommand(ref: string, options: RmOptions = {}): Promise<n
   }
 
   // Non-blocking: a compile holding the lock means refuse cleanly, never force.
-  if (!(await acquireMutationLock(root, "ordinary"))) {
+  if (!(await steps.acquireLock())) {
     output.status("x", output.error("Another llmwiki process holds the project lock. Try again when it finishes."));
     return 1;
   }
@@ -85,12 +121,12 @@ export async function rmCommand(ref: string, options: RmOptions = {}): Promise<n
     // actually did before regenerateDerivedLocked's own progress output (or a
     // LLMWIKI_EMBED_STRICT throw) can appear in the transcript. Both calls stay
     // inside this one held lock.
-    applied = await applyRemovalLocked(root, plan);
+    applied = await steps.apply(plan);
     printPlan(plan, false, applied);
-    await regenerateDerivedLocked(root);
+    await steps.regenerate();
     printRegenerated(applied.deleted.length);
   } finally {
-    await releaseLock(root);
+    await steps.releaseLock();
   }
   return reportSkipped(applied.skipped);
 }

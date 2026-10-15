@@ -19,10 +19,21 @@
  * fault (park); we read its `storeFault` discriminant to split them. LOCK-FREE: reads
  * only through the confined `resolveArtifactRef`, acquires nothing (runs inside the
  * caller's held project lock).
+ *
+ * ONE BODY: {@link enforceArtifactPreconditionsFrom} decides over
+ * {@link ArtifactPreconditionReads} — the artifact store's own reads and the
+ * execution-provenance verifier's preparation-store reads. The root form keeps its
+ * signature and builds both local reads per call; building them does no I/O, and
+ * the preparation lifecycle authority is the store's own disk leaves, unchanged.
  */
 import { parseArtifactRef } from "./ref.js";
-import { resolveArtifactRef, type ArtifactHealth, type StoreFaultReason } from "./resolve.js";
-import { verifyExecutionProvenance } from "./execution-provenance.js";
+import {
+  diskArtifactStoreReads, resolveArtifactRefFrom, type ArtifactHealth, type ArtifactStoreReads, type StoreFaultReason,
+} from "./resolve.js";
+import {
+  executionProvenanceReadsOver, verifyExecutionProvenanceFrom, type ExecutionProvenanceReads,
+} from "./execution-provenance.js";
+import { diskPreparationStoreLeafReads } from "../preparations/store-leaf-reads.js";
 import type { ArtifactPreconditionReq, LifecycleDef, ProfilePack } from "../profile/types.js";
 
 /** Thrown when a required artifact is absent or resolves to a CONFIRMED violation — a HARD denial. */
@@ -60,6 +71,21 @@ export function classifyArtifactHealth(health: ArtifactHealth, storeFault: Store
   return "deny"; // dangling / hash-mismatch / schema-invalid / bytes-tampered
 }
 
+/**
+ * The two reads the artifact enforcer asks for. No member takes a project root.
+ * Local: `diskArtifactStoreReads(root)` and
+ * `executionProvenanceReadsOver(diskPreparationStoreLeafReads(root))`.
+ */
+export interface ArtifactPreconditionReads {
+  /** The artifact store's reads the metadata-only resolution runs over. */
+  store: ArtifactStoreReads;
+  /** The preparation-store reads the OPTIONAL execution-provenance arm runs over. */
+  provenance: ExecutionProvenanceReads;
+}
+
+/** The enforcer's request: everything but the project root. */
+type ArtifactPreconditionRequest = Omit<EnforceArtifactPreconditionsArgs, "root">;
+
 /** Inputs to {@link enforceArtifactPreconditions}; grouped to keep the arg list small. */
 export interface EnforceArtifactPreconditionsArgs {
   /** Absolute project root (the CALLER already holds its lock). */
@@ -91,12 +117,24 @@ export interface EnforceArtifactPreconditionsArgs {
  * @throws {ArtifactPreconditionUnverifiableError} When only unverifiable outcomes occurred.
  */
 export async function enforceArtifactPreconditions(args: EnforceArtifactPreconditionsArgs): Promise<void> {
+  return enforceArtifactPreconditionsFrom({
+    store: diskArtifactStoreReads(args.root),
+    provenance: executionProvenanceReadsOver(diskPreparationStoreLeafReads(args.root)),
+  }, args);
+}
+
+/**
+ * {@link enforceArtifactPreconditions} over {@link ArtifactPreconditionReads}: THE ONE
+ * BODY. The early-out reads nothing; every requirement is judged in order; any
+ * denial outranks every park.
+ */
+export async function enforceArtifactPreconditionsFrom(reads: ArtifactPreconditionReads, args: ArtifactPreconditionRequest): Promise<void> {
   const reqs = args.lifecycle.transitionArtifactRequirements?.[args.enteredState];
   if (reqs === undefined || reqs.length === 0) return; // early-out: read NOTHING
   const denials: string[] = [];
   const parks: string[] = [];
   for (const req of reqs) {
-    const outcome = await requirementVerdict(args, req);
+    const outcome = await requirementVerdict(reads, args, req);
     if (outcome.verdict === "deny") denials.push(outcome.message);
     else if (outcome.verdict === "park") parks.push(outcome.message);
   }
@@ -106,7 +144,7 @@ export async function enforceArtifactPreconditions(args: EnforceArtifactPrecondi
 
 /** One requirement's three-way outcome: resolve health, then the optional provenance arm. */
 async function requirementVerdict(
-  args: EnforceArtifactPreconditionsArgs, req: ArtifactPreconditionReq,
+  reads: ArtifactPreconditionReads, args: ArtifactPreconditionRequest, req: ArtifactPreconditionReq,
 ): Promise<{ verdict: ArtifactVerdict; message: string }> {
   const ref = parseArtifactRef(args.meta[req.field]);
   if (!ref) return { verdict: "deny", message: `field ${JSON.stringify(req.field)} carries no resolvable ${req.artifactType} artifact ref` };
@@ -117,15 +155,15 @@ async function requirementVerdict(
   if (ref.artifactType !== req.artifactType) {
     return { verdict: "deny", message: `field ${JSON.stringify(req.field)} pins a ${ref.artifactType} artifact but a ${req.artifactType} is required` };
   }
-  const { health, storeFault } = await resolveArtifactRef(args.root, args.profile, ref);
+  const { health, storeFault } = await resolveArtifactRefFrom(reads.store, args.profile, ref);
   const verdict = classifyArtifactHealth(health, storeFault);
   if (verdict !== "pass") return { verdict, message: `field ${JSON.stringify(req.field)} artifact ${ref.slug} is ${health}` };
   // The OPTIONAL execution-provenance arm runs only over a HEALTHY pin: a run's
   // admitted digest vouching for bytes the store cannot even resolve would be
   // provenance over nothing.
   if (req.executionProvenance !== undefined) {
-    const provenance = await verifyExecutionProvenance(
-      args.root, req.executionProvenance, args.slug, `sha256:${ref.sha256}`);
+    const provenance = await verifyExecutionProvenanceFrom(
+      reads.provenance, req.executionProvenance, args.slug, `sha256:${ref.sha256}`);
     if (provenance.verdict !== "pass") {
       return { verdict: provenance.verdict, message: `field ${JSON.stringify(req.field)} artifact ${ref.slug}: ${provenance.detail}` };
     }

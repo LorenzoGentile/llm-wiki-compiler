@@ -5,6 +5,13 @@
  * LLM-free (it reads + hashes sources, but never writes); never calls
  * detectChanges (avoids the double-hash regression) and never uses readState
  * (which writes .bak on corrupt state).
+ *
+ * ONE BODY, FOUR READS. {@link resolveStaleRefreshFrom} decides the plan over
+ * {@link StaleRefreshReads}: the classified state, its freshness snapshot, the
+ * concept pages and the selected sources, the same four the status snapshot
+ * takes. {@link resolveStaleRefresh} keeps its signature and passes the local
+ * reads, built inert per call, which call the incumbent root readers when asked,
+ * so module spies and mocks still intercept. Nothing selects a backend.
  */
 
 import { listSelectedSourceFiles } from "../sources/scan.js";
@@ -17,6 +24,20 @@ import { CONCEPTS_DIR } from "../utils/constants.js";
 import type { SourceChange, WikiState } from "../utils/types.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
 import type { StateStatus } from "../utils/state.js";
+import type { StatusReads } from "../status/collect.js";
+
+/** The four reads one stale-refresh plan takes, as the status snapshot names them. No member takes a project root. */
+export type StaleRefreshReads = Pick<StatusReads, "readState" | "buildFreshness" | "scanConcepts" | "listSourceFiles">;
+
+/** LOCAL DISK. The incumbent root readers for `root`, each called when asked; building them does no I/O. */
+function localStaleRefreshReads(root: string): StaleRefreshReads {
+  return {
+    readState: () => readStateClassified(root),
+    buildFreshness: (classified) => buildFreshnessSnapshot(root, classified),
+    scanConcepts: () => scanWikiPages(path.join(root, CONCEPTS_DIR)),
+    listSourceFiles: () => listSelectedSourceFiles(root),
+  };
+}
 
 export interface RefreshPlan {
   /** Stale pages and partial-deletion pages rebuilt from live owners. */
@@ -141,14 +162,23 @@ const sorted = (xs: Iterable<string>): string[] => [...xs].sort();
  * @param root - Absolute path to the llmwiki project root.
  */
 export async function resolveStaleRefresh(root: string): Promise<RefreshResolution> {
-  const classified = await readStateClassified(root);
+  return resolveStaleRefreshFrom(localStaleRefreshReads(root));
+}
+
+/**
+ * {@link resolveStaleRefresh} over {@link StaleRefreshReads}: THE ONE BODY. The
+ * state first and alone; on anything but `ok`, nothing else is read. Then the
+ * freshness snapshot, the concept pages, and last the selected sources.
+ */
+export async function resolveStaleRefreshFrom(reads: StaleRefreshReads): Promise<RefreshResolution> {
+  const classified = await reads.readState();
   if (classified.status !== "ok") {
     return { stateStatus: classified.status, plan: null };
   }
 
-  const snapshot = await buildFreshnessSnapshot(root, classified);
+  const snapshot = await reads.buildFreshness(classified);
   const state = classified.state;
-  const pages = await scanWikiPages(path.join(root, CONCEPTS_DIR));
+  const pages = await reads.scanConcepts();
   const c = classifyPages(pages, snapshot);
 
   return {
@@ -161,7 +191,7 @@ export async function resolveStaleRefresh(root: string): Promise<RefreshResoluti
       changedOwners: sorted(c.changedOwners),
       deletedOwners: sorted(c.deletedOwners),
       knownAffected: sorted(knownAffectedFor(state, c.changedOwners, c.deletedOwners)),
-      newSkipped: sorted(await listNewSkipped(root, state)),
+      newSkipped: sorted(await listNewSkipped(reads, state)),
       changeFilter: makeChangeFilter(c.changedOwners, c.deletedOwners),
     },
   };
@@ -190,8 +220,8 @@ function knownAffectedFor(
  * These are skipped by refresh — the full compile run handles new sources.
  * No hashing performed; presence on disk is sufficient.
  */
-async function listNewSkipped(root: string, state: WikiState): Promise<string[]> {
-  const files = await listSelectedSourceFiles(root);
+async function listNewSkipped(reads: StaleRefreshReads, state: WikiState): Promise<string[]> {
+  const files = await reads.listSourceFiles();
   return files.filter((f) => !(f in state.sources));
 }
 

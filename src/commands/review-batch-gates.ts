@@ -5,9 +5,15 @@
  * multi-candidate promotion is refused before any writes. Single-item manifests
  * keep the existing typed validation semantics. Supporting dependent batches
  * requires a final-state overlay and is deliberately outside this command.
+ *
+ * ONE BODY. {@link rejectBatchRelationGatesWith} takes the profile load as a
+ * function, asked only when a multi-candidate batch holds a typed candidate;
+ * {@link rejectBatchRelationGates} keeps its signature and loads through the
+ * incumbent `loadNonDefaultProfile(root)`.
  */
 
 import { loadNonDefaultProfile } from "../profile/block.js";
+import type { LoadedProfile } from "../profile/types.js";
 import { parseFrontmatter } from "../utils/markdown.js";
 import type { PlannedReviewApproval } from "./review-batch-plan.js";
 
@@ -16,8 +22,16 @@ export async function rejectBatchRelationGates(
   root: string,
   approvals: PlannedReviewApproval[],
 ): Promise<PlannedReviewApproval[]> {
+  return rejectBatchRelationGatesWith(() => loadNonDefaultProfile(root), approvals);
+}
+
+/** {@link rejectBatchRelationGates} over the profile load: THE ONE BODY. The profile is read only when the gate can apply. */
+export async function rejectBatchRelationGatesWith(
+  nonDefaultProfile: () => Promise<LoadedProfile | undefined>,
+  approvals: PlannedReviewApproval[],
+): Promise<PlannedReviewApproval[]> {
   if (approvals.length < 2 || !approvals.some(({ candidate }) => candidate.targetEntityType)) return approvals;
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await nonDefaultProfile();
   if (!loaded) return approvals; // Typed planning already refuses a missing profile.
   return approvals.filter(({ candidate, result }) => {
     if (!candidate.targetEntityType) return true;

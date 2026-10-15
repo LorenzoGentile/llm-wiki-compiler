@@ -19,15 +19,21 @@
  * intent recovery must still see, and an expiry would silently discard it. What
  * bounds the request instead is that it is create-only, confined, bound to its
  * own run id by path, and removed the moment its intent is durably captured.
+ *
+ * ONE BODY PER VERB over {@link PreparationCancelLeaves}: the record's shape,
+ * caps, run-id binding and parsing live in the bodies (`…From`/`…With`); the
+ * local-disk leaves keep the confined, create-only, no-follow advisory
+ * primitives. The root forms delegate per call, with the same identity
+ * validators run first, in the incumbent order.
  */
 
 import { TextDecoder } from "node:util";
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { parseBoundedUniqueJson } from "../profile/templates/signing/json.js";
-import { readAdvisoryRecord, removeAdvisoryBestEffort, writeAdvisoryCreateOnly } from "../utils/advisory-file.js";
+import { readAdvisoryRecord, removeAdvisoryBestEffort, writeAdvisoryCreateOnly, type AdvisoryRecordRead } from "../utils/advisory-file.js";
 import { isWellFormedUnicode } from "../utils/well-formed-unicode.js";
 import { assertPreparationRunId, type PreparationRunId } from "./ids.js";
-import { preparationPaths } from "./paths.js";
+import { assertWorkspaceId, preparationPaths } from "./paths.js";
 
 const MAX_CANCEL_BYTES = 1024;
 const MAX_REQUESTER_BYTES = 128;
@@ -123,23 +129,60 @@ function parseCancelRequest(bytes: Buffer, runId: PreparationRunId): Preparation
   return request;
 }
 
+/** What the advisory bodies ask of the store, keyed by workspace and run. No member takes a project root. */
+export interface PreparationCancelLeaves {
+  /** Create-only, confined publication; `exists` when a request is already there. */
+  createAdvisory(workspaceId: string, runId: PreparationRunId, bytes: Buffer): Promise<"created" | "exists">;
+  /** The confined, no-follow, capped read, handed to `parse` when present. */
+  readAdvisory<T>(workspaceId: string, runId: PreparationRunId, maxBytes: number, parse: (bytes: Buffer) => T): Promise<AdvisoryRecordRead<T>>;
+  /** Best-effort removal of whatever removable shape sits at the advisory path. */
+  removeAdvisory(workspaceId: string, runId: PreparationRunId): Promise<void>;
+}
+
+/** The local-disk advisory leaves for one root, built per call. In no package index. */
+function diskPreparationCancelLeaves(root: string): PreparationCancelLeaves {
+  return {
+    createAdvisory: (workspaceId, runId, bytes) => writeAdvisoryCreateOnly(root, preparationPaths(root, workspaceId).cancelFile(runId), bytes),
+    readAdvisory: (workspaceId, runId, maxBytes, parse) => {
+      const paths = preparationPaths(root, workspaceId);
+      return readAdvisoryRecord(root, paths.cancelFile(runId), paths.runsRoot, maxBytes, parse);
+    },
+    removeAdvisory: (workspaceId, runId) => {
+      const paths = preparationPaths(root, workspaceId);
+      return removeAdvisoryBestEffort(root, paths.cancelFile(runId), paths.runsRoot);
+    },
+  };
+}
+
 /**
  * Write the advisory cancellation request without the project lock. Create-only:
  * an existing request is left untouched. This never authorizes state — a lock
  * holder must observe it and append the signed cancellation transition.
  */
 export async function writePreparationCancelLockFree(root: string, input: PreparationCancelInput): Promise<"created" | "exists"> {
-  const file = preparationPaths(root, input.workspaceId).cancelFile(input.runId);
+  return writePreparationCancelWith(diskPreparationCancelLeaves(root), input);
+}
+
+/** {@link writePreparationCancelLockFree} over the advisory leaves: the one write body. */
+export async function writePreparationCancelWith(leaves: PreparationCancelLeaves, input: PreparationCancelInput): Promise<"created" | "exists"> {
+  // The incumbent derived the advisory path first; the same validators refuse the same identities in the same order.
+  assertWorkspaceId(input.workspaceId);
+  assertPreparationRunId(input.runId);
   const bytes = canonicalBytes(buildCancelRequest(input.runId, input.requester, input.at, input.nonce));
   if (bytes.byteLength > MAX_CANCEL_BYTES) throw new Error("cancel request exceeds its 1 KiB cap");
-  return writeAdvisoryCreateOnly(root, file, bytes);
+  return leaves.createAdvisory(input.workspaceId, input.runId, bytes);
 }
 
 /** Read and validate the advisory request; a symlinked/oversize/forged file is unavailable. */
 export async function readPreparationCancel(root: string, workspaceId: string, runId: PreparationRunId): Promise<PreparationCancelRead> {
-  const paths = preparationPaths(root, workspaceId);
-  return readAdvisoryRecord(root, paths.cancelFile(runId), paths.runsRoot, MAX_CANCEL_BYTES,
-    (bytes) => parseCancelRequest(bytes, runId));
+  return readPreparationCancelFrom(diskPreparationCancelLeaves(root), workspaceId, runId);
+}
+
+/** {@link readPreparationCancel} over the advisory leaves: the one read body. */
+export async function readPreparationCancelFrom(
+  leaves: PreparationCancelLeaves, workspaceId: string, runId: PreparationRunId,
+): Promise<PreparationCancelRead> {
+  return leaves.readAdvisory(workspaceId, runId, MAX_CANCEL_BYTES, (bytes) => parseCancelRequest(bytes, runId));
 }
 
 /**
@@ -152,7 +195,17 @@ export async function readPreparationCancel(root: string, workspaceId: string, r
  * (see the file header). A request stays live until a settlement consumes it.
  */
 export async function preparationCancellationRequested(root: string, workspaceId: string, runId: PreparationRunId): Promise<boolean> {
-  const read = await readPreparationCancel(root, workspaceId, runId);
+  return preparationCancellationRequestedFrom(diskPreparationCancelLeaves(root), workspaceId, runId);
+}
+
+/** One run's cancellation poll, as the executor and finalization ask it. No member takes a project root. */
+export type PreparationCancellationProbe = (workspaceId: string, runId: PreparationRunId) => Promise<boolean>;
+
+/** {@link preparationCancellationRequested} over the advisory leaves. Exported for the bound probe compositions; in no package index. */
+export async function preparationCancellationRequestedFrom(
+  leaves: PreparationCancelLeaves, workspaceId: string, runId: PreparationRunId,
+): Promise<boolean> {
+  const read = await readPreparationCancelFrom(leaves, workspaceId, runId);
   return read.status === "present";
 }
 
@@ -166,6 +219,5 @@ export async function preparationCancellationRequested(root: string, workspaceId
  * un-removable residual is swallowed: advisory removal is non-authoritative.
  */
 export async function removePreparationCancelLocked(root: string, workspaceId: string, runId: PreparationRunId): Promise<void> {
-  const paths = preparationPaths(root, workspaceId);
-  await removeAdvisoryBestEffort(root, paths.cancelFile(runId), paths.runsRoot);
+  await diskPreparationCancelLeaves(root).removeAdvisory(workspaceId, runId);
 }

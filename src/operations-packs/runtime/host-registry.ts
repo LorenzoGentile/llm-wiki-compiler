@@ -44,6 +44,12 @@
  * written to a host-owned scratch file under `os.tmpdir()`; `admitHostHandlerLeg`
  * copies it into temporary custody and the attempt commit publishes it into the
  * preparation evidence CAS under the project lock.
+ *
+ * ONE BODY, {@link createPackHostHandlerRegistryWith}, over the run-scoped
+ * identities and {@link PackHostReads} (the snapshot and the predecessor reads),
+ * none of which takes a project root. {@link createPackHostHandlerRegistry} keeps
+ * its signature and passes the local reads, which read the root and the binding
+ * off its dependencies at each read, as before.
  */
 
 import { isDataRecord, scalarFields, isEvidenceScalar } from "./evidence-scalars.js";
@@ -54,8 +60,6 @@ import path from "node:path";
 import { canonicalBytes } from "../../profile/templates/signing/canonical.js";
 import { parseSha256Digest } from "../../capability-providers/ids.js";
 import { derivePhaseInstanceId, singleExpansionIdentity } from "../../preparations/ids.js";
-import { readPreparationEvidenceBytes } from "../../preparations/evidence-store.js";
-import { readPreparationRun } from "../../preparations/run-store.js";
 import type { NormalizedPhaseV1, PhaseExecutorV1, PhaseInputBindingV1 } from "../../preparations/plan-types.js";
 import type { PreparationRunBinding } from "../../preparations/run-types.js";
 import type { Sha256Digest } from "../../preparations/types.js";
@@ -74,7 +78,7 @@ import { decodeProviderResponse, type ProviderOutputFieldV1 } from "../handlers/
 import { enforceOutputBytes } from "../handlers/evidence.js";
 import { createHostHandlerRegistry } from "../handlers/registry.js";
 import { selectSet } from "../handlers/set-select.js";
-import { packStoreSnapshot } from "./store-snapshot.js";
+import { diskPackHostReads, type PackHostReads } from "./host-registry-reads.js";
 import type { ReconcilePhaseBodyV2 } from "../recipe-types.js";
 import { PackHostHandlerError } from "../handlers/types.js";
 import type {
@@ -247,9 +251,9 @@ async function reconcileFamily(
   evidence: readonly PackEvidenceItemV1[],
   bounds: PackHandlerBoundsV1,
   action: CompiledPackActionV1,
-  deps: { readonly root: string },
+  reads: PackHostReads,
 ): Promise<FamilyOutcomeV1> {
-  const snapshot = await packStoreSnapshot(deps.root, binding.body.comparedEvidenceClass);
+  const snapshot = await reads.storeSnapshot(binding.body.comparedEvidenceClass);
   if (snapshot.kind === "refused") return refused(PROBLEM.snapshotUnavailable, snapshot.detail);
   const ref = binding.body.projectionRef;
   const projection = ref === undefined ? undefined : action.projections[ref];
@@ -463,14 +467,14 @@ function providerOutputItems(
  * predecessor expansion is out of this slice's scope and refused by name.
  */
 async function resolvePhaseOutput(
-  deps: PackHostRuntimeDepsV1, action: CompiledPackActionV1, binding: PhaseInputBindingV1,
+  deps: PackHostRuntimeV1, reads: PackHostReads, action: CompiledPackActionV1, binding: PhaseInputBindingV1,
 ): Promise<FamilyOutcomeV1 | { kind: "evidence"; evidence: readonly PackEvidenceItemV1[] }> {
   const sourcePhaseId = binding.sourcePhaseId;
   if (sourcePhaseId === undefined) return refused(PROBLEM.phaseOutputInput, `binding ${binding.bindingId} names no source phase`);
   const source = action.plan.phases.find((phase) => phase.logicalPhaseId === sourcePhaseId);
   if (source === undefined) return refused(PROBLEM.phaseOutputInput, `binding ${binding.bindingId} names an unknown source phase`);
   if (source.expansion.kind !== "single") return refused(PROBLEM.phaseOutputInput, `source phase ${sourcePhaseId} is not a single expansion`);
-  const published = await publishedOutputBytes(deps, source, sourcePhaseId);
+  const published = await publishedOutputBytes(deps, reads, source, sourcePhaseId);
   if (!("bytes" in published)) return published;
   return source.executor?.kind === "provider-capability"
     ? providerOutputItems(published.bytes, source.executor, sourcePhaseId)
@@ -479,20 +483,18 @@ async function resolvePhaseOutput(
 
 /** Read one settled predecessor's published output bytes off durable state. */
 async function publishedOutputBytes(
-  deps: PackHostRuntimeDepsV1, source: NormalizedPhaseV1, sourcePhaseId: string,
+  deps: PackHostRuntimeV1, reads: PackHostReads, source: NormalizedPhaseV1, sourcePhaseId: string,
 ): Promise<FamilyOutcomeV1 | { readonly bytes: Buffer }> {
   const instanceId = derivePhaseInstanceId({
     manifestDigest: deps.manifestDigest, logicalPhaseId: sourcePhaseId, expansionIdentity: singleExpansionIdentity(),
   });
-  const read = await readPreparationRun(deps.root, deps.binding);
+  const read = await reads.readRun();
   if (read.status !== "ok") return refused(PROBLEM.phaseOutputInput, `predecessor run for ${sourcePhaseId} is unreadable`);
   const summary = read.run.phaseSummaries.find((entry) => entry.phaseInstanceId === instanceId);
   if (summary?.outputEvidenceDigest === undefined) return refused(PROBLEM.phaseOutputInput, `phase ${sourcePhaseId} published no output evidence`);
   const digest = summary.outputEvidenceDigest;
   const bare = digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
-  const bytes = await readPreparationEvidenceBytes(deps.root,
-    { workspaceId: deps.binding.workspaceId, preparationId: deps.binding.preparationId },
-    bare, source.bounds.maximumOutputEvidenceBytes);
+  const bytes = await reads.evidenceBytes(bare, source.bounds.maximumOutputEvidenceBytes);
   if (bytes.status !== "ok") return refused(PROBLEM.phaseOutputInput, `predecessor evidence for ${sourcePhaseId} is ${bytes.status}`);
   return { bytes: bytes.bytes };
 }
@@ -504,7 +506,7 @@ async function publishedOutputBytes(
  * predecessor's published items, in binding order.
  */
 async function evidenceFor(
-  bound: BoundPhaseV1, action: CompiledPackActionV1, deps: PackHostRuntimeDepsV1,
+  bound: BoundPhaseV1, action: CompiledPackActionV1, deps: PackHostRuntimeV1, reads: PackHostReads,
 ): Promise<FamilyOutcomeV1 | { kind: "evidence"; evidence: readonly PackEvidenceItemV1[] }> {
   const phaseOutputs = bound.inputBindings.filter((binding) => binding.sourceKind === "phase-output");
   if (phaseOutputs.length === 0) return decodeActionInput(action.initialInput.bytes);
@@ -515,7 +517,7 @@ async function evidenceFor(
     evidence.push(...decoded.evidence);
   }
   for (const binding of phaseOutputs) {
-    const resolved = await resolvePhaseOutput(deps, action, binding);
+    const resolved = await resolvePhaseOutput(deps, reads, action, binding);
     if (resolved.kind !== "evidence") return resolved;
     evidence.push(...resolved.evidence);
   }
@@ -573,13 +575,13 @@ function renderFamily(
  */
 async function computeFamily(
   binding: CompiledPhaseBindingV1, evidence: readonly PackEvidenceItemV1[],
-  bounds: PackHandlerBoundsV1, deps: PackHostRuntimeDepsV1, action: CompiledPackActionV1,
+  bounds: PackHandlerBoundsV1, deps: PackHostRuntimeV1, action: CompiledPackActionV1, reads: PackHostReads,
 ): Promise<FamilyOutcomeV1> {
   if (binding.family === "context-assemble") return { kind: "ok", result: assembleContext({ body: binding.body, evidence, bounds }) };
   if (binding.family === "set-select") return { kind: "ok", result: selectSet({ body: binding.body, primary: evidence, bounds }) };
   if (binding.family === "rule-evaluate") return { kind: "ok", result: evaluateRules({ body: binding.body, evidence, clock: deps.clock, bounds }) };
   if (binding.family === "render-template") return renderFamily(binding, evidence, bounds, action);
-  if (binding.family === "reconcile") return reconcileFamily(binding, evidence, bounds, action, deps);
+  if (binding.family === "reconcile") return reconcileFamily(binding, evidence, bounds, action, reads);
   return { kind: "ok", result: compileIntents({
     body: binding.body, evidence: uniqueByItemId(evidence), identities: hostIdentities(deps), bounds,
     projections: action.projections,
@@ -605,7 +607,7 @@ function uniqueByItemId(evidence: readonly PackEvidenceItemV1[]): readonly PackE
 }
 
 /** The closed host-derived identities an intent field mapping may bind (16.7). */
-function hostIdentities(deps: PackHostRuntimeDepsV1): PackHostIdentitiesV1 {
+function hostIdentities(deps: PackHostRuntimeV1): PackHostIdentitiesV1 {
   return { runId: deps.runId, principal: deps.principal, hostTimestamp: deps.clock.now() };
 }
 
@@ -625,12 +627,12 @@ function boundsFor(bound: BoundPhaseV1, invocation: HostHandlerInvocationV1): Pa
 /** Run one family, projecting its closed refusals onto fixed problem codes. */
 async function runFamily(
   bound: BoundPhaseV1, action: CompiledPackActionV1,
-  invocation: HostHandlerInvocationV1, deps: PackHostRuntimeDepsV1,
+  invocation: HostHandlerInvocationV1, deps: PackHostRuntimeV1, reads: PackHostReads,
 ): Promise<FamilyOutcomeV1> {
-  const evidence = await evidenceFor(bound, action, deps);
+  const evidence = await evidenceFor(bound, action, deps, reads);
   if (evidence.kind !== "evidence") return evidence;
   try {
-    return await computeFamily(bound.binding, evidence.evidence, boundsFor(bound, invocation), deps, action);
+    return await computeFamily(bound.binding, evidence.evidence, boundsFor(bound, invocation), deps, action, reads);
   } catch (cause) {
     if (cause instanceof PackDeferredError) return refused(PROBLEM.familyDeferred, cause.message);
     if (cause instanceof PackHostHandlerError) return refused(PROBLEM.familyRefused, cause.message);
@@ -688,6 +690,16 @@ async function publishOutput(
 export function createPackHostHandlerRegistry(
   action: CompiledPackActionV1, deps: PackHostRuntimeDepsV1,
 ): PreparationHostHandlerRegistryV1 {
+  return createPackHostHandlerRegistryWith(action, deps, diskPackHostReads(deps));
+}
+
+/** The run-scoped identities the registry's body reads, without the project root or the run binding. */
+export type PackHostRuntimeV1 = Omit<PackHostRuntimeDepsV1, "root" | "binding">;
+
+/** {@link createPackHostHandlerRegistry} over {@link PackHostReads}: THE ONE BODY. `deps` is read when asked, as before. */
+export function createPackHostHandlerRegistryWith(
+  action: CompiledPackActionV1, deps: PackHostRuntimeV1, reads: PackHostReads,
+): PreparationHostHandlerRegistryV1 {
   const bindings = indexByPhaseInstance(action, deps.manifestDigest);
   const scratch: ScratchV1 = { dir: null };
   // The 3A resolver is the ONE home of the unknown-id / version-drift /
@@ -699,7 +711,7 @@ export function createPackHostHandlerRegistry(
       if (bound === undefined) {
         return failure(PROBLEM.unknownPhase, "no compiled phase binding for this phase instance");
       }
-      const outcome = await runFamily(bound, action, invocation, deps);
+      const outcome = await runFamily(bound, action, invocation, deps, reads);
       return outcome.kind === "refused"
         ? failure(outcome.problem, outcome.detail)
         : publishOutput(scratch, invocation, bound, outcome.result);

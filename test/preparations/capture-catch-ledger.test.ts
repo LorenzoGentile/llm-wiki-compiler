@@ -3,7 +3,7 @@
  * @description No NEW bare catch may wrap a capture primitive, and the ones that
  * exist are listed here rather than tolerated silently.
  *
- * WHY AN ALLOWLIST RATHER THAN A FLAT PROHIBITION. Forty-two sites still wrap a
+ * WHY AN ALLOWLIST RATHER THAN A FLAT PROHIBITION. Forty-three sites still wrap a
  * capture in a bare `catch {}`, each reporting a fault as a claim about the
  * caller's input. A control asserting "none exist" would be red on arrival and
  * would be deleted; one asserting nothing would let the thirty-seventh appear
@@ -61,6 +61,10 @@ const SWALLOWS_FAULT_AS_REFUSAL: readonly string[] = [
   "src/capability-providers/brokers/types.ts::parseBrokerRequestEnvelope",
   "src/capability-providers/packages/reference-enumeration.ts::referenceObject",
   "src/connectors/candidate-batch.ts::captureConnectorResult",
+  // The one-body re-capture of the incumbent `executePhaseAttempt` park
+  // ("request-not-capturable"): the facade swallows the same fault one call deeper,
+  // in `captureRequest`, where this walk does not see it. Same debt, now visible.
+  "src/preparations/attempts/execute.ts::executePhaseAttemptWith",
   "src/preparations/completeness.ts::captureClassInput",
   "src/preparations/completeness.ts::captureIdentitySets",
   "src/preparations/completeness.ts::captureRecord",

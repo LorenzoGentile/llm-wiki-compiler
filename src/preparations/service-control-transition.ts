@@ -18,18 +18,74 @@
  * at a run the caller never named. Taking an already-captured `string` here keeps
  * that capture where the rule puts it — a helper that took the request would move
  * the read past the operation's first await and quietly undo the fix.
+ *
+ * ONE BODY EACH over {@link ControlVerbSteps}, none of which takes a project
+ * root: {@link withControlTargetFrom} (readiness, then the run) and
+ * {@link appendControlTransitionWith} (the acquisition's two refusals, the
+ * fenced append, the release). The lock's acquire and release are the one
+ * MECHANISM the steps carry; every decision about their outcome is in the body.
+ * The verbs' root forms keep their signatures and pass {@link diskControlVerbSteps},
+ * which calls the incumbent root readers, lock and writer when asked;
+ * {@link controlVerbStepsOver} composes the reads and the append from each one's
+ * own body, with the caller's lock.
  */
 
 import { RecoveryGateError, acquireMutationLock } from "../operation-bundles/lock-gate.js";
 // The same pairing `operation drive` uses: the gate acquires, utils releases.
 import { releaseLock } from "../utils/lock.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
-import { appendPreparationTransitionLocked } from "./run-store.js";
+import { appendPreparationTransitionLocked, appendPreparationTransitionWith, type PreparationRunWriteSteps } from "./run-store.js";
 import type {
-  AppendPreparationTransitionInput, PreparationRunBinding, PreparationRunV1,
+  AppendPreparationTransitionInput, PreparationRunBinding, PreparationRunPredecessor, PreparationRunV1,
 } from "./run-types.js";
-import { resolveHostReadiness } from "./service-readiness.js";
-import { resolvePreparationRun } from "./service-run-lookup.js";
+import {
+  resolveHostReadiness, resolveHostReadinessFrom, type HostReadinessV1, type PreparationReadinessReads,
+} from "./service-readiness.js";
+import {
+  resolvePreparationRun, resolvePreparationRunFrom, type PreparationRunLookupReads, type PreparationRunLookupV1,
+} from "./service-run-lookup.js";
+
+/** The project lock a control append runs under: a MECHANISM, no decision. `acquire` may throw the gate's refusal. */
+export interface ControlLock {
+  /** Acquire at `ordinary` intent: true when held, false when busy; THROWS a `RecoveryGateError` when the gate refuses. */
+  acquire(): Promise<boolean>;
+  /** Release what `acquire` took. */
+  release(): Promise<void>;
+}
+
+/** What a control verb asks for, in order. No member takes a project root. */
+export interface ControlVerbSteps {
+  /** Whether the project's own configuration can be read. */
+  hostReadiness(): Promise<HostReadinessV1>;
+  /** The named run, authenticated, with its binding. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
+  /** The project lock. */
+  readonly lock: ControlLock;
+  /** Append one transition fenced to `expected`, under the held lock. */
+  appendTransition(binding: PreparationRunBinding, expected: PreparationRunPredecessor, transition: AppendPreparationTransitionInput): Promise<unknown>;
+}
+
+/** LOCAL DISK. The incumbent root readers, lock and writer for `root`, each called when asked. */
+export function diskControlVerbSteps(root: string): ControlVerbSteps {
+  return {
+    hostReadiness: () => resolveHostReadiness(root),
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+    lock: { acquire: () => acquireMutationLock(root, "ordinary"), release: () => releaseLock(root) },
+    appendTransition: (binding, expected, transition) => appendPreparationTransitionLocked(root, binding, expected, transition),
+  };
+}
+
+/** The same reads and append over each one's own body, under the caller's `lock`. Building it does no I/O. */
+export function controlVerbStepsOver(
+  sources: { readiness: PreparationReadinessReads; lookup: PreparationRunLookupReads; runs: PreparationRunWriteSteps }, lock: ControlLock,
+): ControlVerbSteps {
+  return {
+    hostReadiness: () => resolveHostReadinessFrom(sources.readiness),
+    resolveRun: (runId) => resolvePreparationRunFrom(sources.lookup, runId),
+    lock,
+    appendTransition: (binding, expected, transition) => appendPreparationTransitionWith(sources.runs, binding, expected, transition),
+  };
+}
 
 /** The run a control verb will act on, or the reason it will not. */
 type ControlTargetV1 =
@@ -45,25 +101,25 @@ type ControlTargetV1 =
  * it; nothing here decides whether the caller MAY act, only whether acting is
  * meaningful.
  *
- * @param root - The project root this invocation acts within.
+ * @param steps - The readiness and run reads.
  * @param runId - The run id the operation captured in its synchronous prologue.
  * @returns The bound run, or the refusal reason to report unchanged.
  */
-async function resolveControlTarget(root: string, runId: string): Promise<ControlTargetV1> {
-  const ready = await resolveHostReadiness(root);
+async function resolveControlTarget(steps: ControlVerbSteps, runId: string): Promise<ControlTargetV1> {
+  const ready = await steps.hostReadiness();
   if (!ready.ready) return { ok: false, reason: ready.reason ?? "the project is not ready" };
-  const resolved = await resolvePreparationRun(root, runId);
+  const resolved = await steps.resolveRun(runId);
   return resolved.ok
     ? { ok: true, binding: resolved.binding, run: resolved.run }
     : { ok: false, reason: resolved.reason };
 }
 
-/** Resolve a captured identity, preserving the refusal before invoking a control's own policy. */
-export async function withControlTarget<T>(
-  root: string, runId: string,
+/** Resolve a captured identity, preserving the refusal before invoking a control's own policy. THE ONE BODY. */
+export async function withControlTargetFrom<T>(
+  steps: ControlVerbSteps, runId: string,
   apply: (binding: PreparationRunBinding, run: PreparationRunV1) => Promise<T>,
 ): Promise<T | { status: "refused"; reason: string }> {
-  const target = await resolveControlTarget(root, runId);
+  const target = await resolveControlTarget(steps, runId);
   if (!target.ok) return { status: "refused", reason: target.reason };
   return apply(target.binding, target.run);
 }
@@ -109,31 +165,51 @@ export type ControlAppendV1 =
  * "project lock is busy" would tell an operator to retry something that will
  * refuse identically forever.
  *
- * @param root - The project root this invocation acts within.
+ * @param steps - The project lock and the fenced append.
  * @param binding - The run's authenticated binding.
  * @param run - The run as read, supplying the predecessor the append is fenced to.
  * @param transition - The already-built transition, including its actor and instant.
  * @returns That the transition landed, or the honest reason it did not.
  */
-export async function appendControlTransitionLocked(
-  root: string, binding: PreparationRunBinding, run: PreparationRunV1,
+export async function appendControlTransitionWith(
+  steps: ControlVerbSteps, binding: PreparationRunBinding, run: PreparationRunV1,
   transition: AppendPreparationTransitionInput,
 ): Promise<ControlAppendV1> {
+  return underGatedLock<ControlAppendV1>(steps.lock, (reason) => ({ ok: false, reason }), async () => {
+    await steps.appendTransition(binding, preparationRunPredecessor(run), transition);
+    return { ok: true };
+  });
+}
+
+/**
+ * Run `work` under a GATED project acquisition, deciding both of its declines
+ * once for every operation that takes one (the control verbs, `gate`, `stage`).
+ *
+ * The gate's own refusal and a busy lock each become `refuse(reason)`, and
+ * neither releases anything, because nothing was taken. Any other acquisition
+ * fault rethrows. A held lock is released after `work`, however it ends.
+ *
+ * @param lock - The acquisition MECHANISM: true when held, false when busy, throwing the gate's refusal.
+ * @param refuse - Builds the operation's own refusal from a reason.
+ * @param work - What runs while the lock is held.
+ */
+export async function underGatedLock<T>(
+  lock: ControlLock, refuse: (reason: string) => T, work: () => Promise<T>,
+): Promise<T> {
   let acquired: boolean;
   try {
-    acquired = await acquireMutationLock(root, "ordinary");
+    acquired = await lock.acquire();
   } catch (error) {
     // THE GATE'S OWN CLASS. `RecoveryGateError` is the base, so this covers every
     // arm the gate has and any it grows — the same classification `prune` and
     // `sweep` already perform at their own acquisition.
-    if (error instanceof RecoveryGateError) return { ok: false, reason: error.message };
+    if (error instanceof RecoveryGateError) return refuse(error.message);
     throw error;
   }
-  if (!acquired) return { ok: false, reason: BUSY_LOCK_REFUSAL };
+  if (!acquired) return refuse(BUSY_LOCK_REFUSAL);
   try {
-    await appendPreparationTransitionLocked(root, binding, preparationRunPredecessor(run), transition);
-    return { ok: true };
+    return await work();
   } finally {
-    await releaseLock(root);
+    await lock.release();
   }
 }

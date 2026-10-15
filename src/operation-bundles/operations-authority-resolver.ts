@@ -33,6 +33,13 @@
  *    The real store-health gate is per-mutation adapter revalidation at
  *    apply/recovery time (design v2 §15 step 2), which still parks a genuinely
  *    sick target; a constant here loses no safety and removes the false-park.
+ *
+ * ONE BODY. {@link computeAuthoritySnapshotFrom} owns the recompute (the key
+ * epoch, then the profile, each failing closed with its own reason, then the
+ * synchronous components, every fault folded into `unavailable`) over
+ * {@link AuthorityStateReads}, none of which takes a project root. The built-in
+ * provider passes the local reads for the request's root, read once, lazily, at
+ * the first read, so a faulting `root` still fails closed exactly as before.
  */
 
 import { canonicalDigest } from "../profile/templates/signing/canonical.js";
@@ -44,7 +51,7 @@ import {
   type OperationAuthorityProvider,
   type OperationAuthoritySnapshot,
 } from "./authority.js";
-import { readOperationKey } from "./key-epoch.js";
+import { readOperationKey, type OperationKeyRead } from "./key-epoch.js";
 import { operationManifestDigest } from "./manifest-parse.js";
 import type { OperationPrincipal } from "./principal.js";
 import type { OperationBundleManifest, OperationDigest, OperationMutation } from "./types.js";
@@ -137,13 +144,32 @@ function notConfiguredDigest(component: string): OperationDigest {
   return canonicalDigest({ component, configured: false }) as OperationDigest;
 }
 
+/** The two state reads the recompute makes. No member takes a project root. */
+export interface AuthorityStateReads {
+  /** The current operation key epoch. */
+  readKey(): Promise<OperationKeyRead>;
+  /** The effective profile (the built-in default for a clean project); throws for a present-but-broken one. */
+  loadProfile(): Promise<{ digest: string }>;
+}
+
 /**
- * Recompute the key-epoch id from the on-disk operation key (never the request
+ * LOCAL DISK. The incumbent key and profile loaders for the request's root. The
+ * root is read ONCE, at the first read, so it is read inside the fail-closed
+ * boundary, as the recompute always read it.
+ */
+function diskAuthorityStateReads(request: Pick<AuthoritySnapshotRequest, "root">): AuthorityStateReads {
+  let root: string | undefined;
+  const rootOnce = (): string => (root ??= request.root);
+  return { readKey: () => readOperationKey(rootOnce()), loadProfile: () => loadProfile(rootOnce()) };
+}
+
+/**
+ * Recompute the key-epoch id from the operation key (never the request
  * copy). Returns null — a fail-closed signal — when the key is absent or
  * unreadable, so an in-flight bundle cannot settle on an unproven key.
  */
-async function recomputeKeyEpochId(root: string): Promise<OperationDigest | null> {
-  const key = await readOperationKey(root);
+async function recomputeKeyEpochId(reads: AuthorityStateReads): Promise<OperationDigest | null> {
+  const key = await reads.readKey();
   return key.status === "ok" ? key.keyEpochId : null;
 }
 
@@ -153,9 +179,9 @@ async function recomputeKeyEpochId(root: string): Promise<OperationDigest | null
  * PRESENT-but-broken profile — which fails closed (null), because the profile
  * governs the workspace and must not be guessed.
  */
-async function recomputeProfileDigest(root: string): Promise<OperationDigest | null> {
+async function recomputeProfileDigest(reads: AuthorityStateReads): Promise<OperationDigest | null> {
   try {
-    const loaded = await loadProfile(root);
+    const loaded = await reads.loadProfile();
     return `sha256:${loaded.digest}` as OperationDigest;
   } catch {
     return null;
@@ -212,10 +238,10 @@ function assembleSnapshot(sync: DerivedComponents, state: StateComponents): Oper
 }
 
 /** Read the two fail-closable state components, or the first unavailable reason. */
-async function readStateComponents(root: string): Promise<StateComponents | { unavailable: string }> {
-  const keyEpochId = await recomputeKeyEpochId(root);
+async function readStateComponents(reads: AuthorityStateReads): Promise<StateComponents | { unavailable: string }> {
+  const keyEpochId = await recomputeKeyEpochId(reads);
   if (keyEpochId === null) return { unavailable: "operation key is absent or unreadable" };
-  const profileDigest = await recomputeProfileDigest(root);
+  const profileDigest = await recomputeProfileDigest(reads);
   if (profileDigest === null) return { unavailable: "active profile could not be loaded" };
   return { keyEpochId, profileDigest };
 }
@@ -224,13 +250,15 @@ async function readStateComponents(root: string): Promise<StateComponents | { un
  * Compute one authority snapshot for a request by recomputing all twelve
  * components from authoritative current state. Fail-closed and never throwing:
  * any unreadable backing state or malformed manifest yields `unavailable`.
+ * THE ONE BODY.
  */
-async function computeSnapshot(
+export async function computeAuthoritySnapshotFrom(
+  reads: AuthorityStateReads,
   request: AuthoritySnapshotRequest,
   adapterKinds: readonly string[],
 ): Promise<AuthoritySnapshotResult> {
   try {
-    const state = await readStateComponents(request.root);
+    const state = await readStateComponents(reads);
     if ("unavailable" in state) return { status: "unavailable", reason: state.unavailable };
     const snapshot = assembleSnapshot(deriveSyncComponents(request, adapterKinds), state);
     return { status: "ok", snapshot, digest: authoritySnapshotDigest(snapshot) };
@@ -253,5 +281,5 @@ export function createOperationsAuthorityResolver(
   options: OperationsAuthorityResolverOptions,
 ): OperationAuthorityProvider {
   const adapterKinds = [...options.adapterKinds];
-  return { computeSnapshot: (request) => computeSnapshot(request, adapterKinds) };
+  return { computeSnapshot: (request) => computeAuthoritySnapshotFrom(diskAuthorityStateReads(request), request, adapterKinds) };
 }

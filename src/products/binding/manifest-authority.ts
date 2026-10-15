@@ -17,11 +17,11 @@
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { canonicalDigest } from "../../profile/templates/signing/canonical.js";
-import { readConfinedLeafBuffer } from "../../utils/confined-read.js";
 import { profileDigest } from "../../profile/digest.js";
 import { validateProfile } from "../../profile/validate.js";
 import type { LoadedProfile } from "../../profile/types.js";
 import { digestDirectoryName, type Sha256Digest } from "../ids.js";
+import { diskProductPackageReads, type ProductPackageReads } from "../packages/store.js";
 import { productStorePaths } from "../paths.js";
 import type { PackageMemberRefV1, ProductPackageManifestV1 } from "../types.js";
 import { ProductBindingError } from "./problems.js";
@@ -90,13 +90,11 @@ export function bindingComponentMismatch(
  * oversize leaf fails closed as a {@link ProductBindingError}.
  */
 async function readStoredMemberBuffer(
-  root: string, packageDigest: Sha256Digest, member: PackageMemberRefV1, maxBytes: number,
+  reads: ProductPackageReads, packageDigest: Sha256Digest, member: PackageMemberRefV1, maxBytes: number,
 ): Promise<Buffer> {
-  const paths = productStorePaths(root);
   const pkgHex = digestDirectoryName(packageDigest);
   const memberHex = digestDirectoryName(member.digest);
-  const read = await readConfinedLeafBuffer(
-    root, paths.memberFile(pkgHex, memberHex), paths.membersRoot(pkgHex), maxBytes, { requireSingleLink: true });
+  const read = await reads.readMemberLeaf(pkgHex, memberHex, maxBytes);
   if (read.kind !== "ok") throw new ProductBindingError(`${member.kind} member is ${read.kind}`);
   if (read.body.byteLength !== member.byteCount) throw new ProductBindingError(`${member.kind} member byte count disagrees`);
   if (createHash("sha256").update(read.body).digest("hex") !== memberHex) {
@@ -109,7 +107,15 @@ async function readStoredMemberBuffer(
 export async function readStoredMemberText(
   root: string, packageDigest: Sha256Digest, member: PackageMemberRefV1, maxBytes: number,
 ): Promise<string> {
-  return STRICT_UTF8.decode(await readStoredMemberBuffer(root, packageDigest, member, maxBytes));
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return readStoredMemberTextFrom(diskProductPackageReads(root), packageDigest, member, maxBytes);
+}
+
+/** {@link readStoredMemberText} over the package reads: THE ONE BODY. The cap is the caller's; the byte-count, digest and strict-UTF-8 checks are made here. */
+export async function readStoredMemberTextFrom(
+  reads: ProductPackageReads, packageDigest: Sha256Digest, member: PackageMemberRefV1, maxBytes: number,
+): Promise<string> {
+  return STRICT_UTF8.decode(await readStoredMemberBuffer(reads, packageDigest, member, maxBytes));
 }
 
 /** The absolute member-file path used as a product-mode profile's `loadedFrom`. */

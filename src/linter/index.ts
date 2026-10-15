@@ -4,35 +4,57 @@
  * Imports all lint rules, runs them concurrently, and aggregates
  * results into a summary with error/warning/info counts.
  * This is the main entry point for programmatic lint access.
+ *
+ * The run has ONE body, {@link collectTieredGroupsFrom}, over the lint sources
+ * of `lint-sources.ts`. It names no project root. `lint`, `lintByTier` and
+ * `lintBothViews` build the local-disk sources from their root and are views
+ * of that one body; `lintFrom` and `lintBothViewsFrom` are the same views for
+ * a caller that already holds sources.
  */
 
 import type { LintResult, LintRule, LintSummary, SchemaAwareLintRule } from "./types.js";
 import {
-  checkBrokenWikilinks,
-  checkOrphanedPages,
-  checkMissingSummaries,
-  checkDuplicateConcepts,
-  checkEmptyPages,
+  checkBrokenWikilinks, checkBrokenWikilinksFrom,
+  checkOrphanedPages, checkOrphanedPagesFrom,
+  checkMissingSummaries, checkMissingSummariesFrom,
+  checkDuplicateConcepts, checkDuplicateConceptsFrom,
+  checkEmptyPages, checkEmptyPagesFrom,
   checkBrokenCitations,
   checkMalformedClaimCitations,
-  checkLowConfidencePages,
-  checkContradictedPages,
-  checkInferredWithoutCitations,
+  checkLowConfidencePages, checkLowConfidencePagesFrom,
+  checkContradictedPages, checkContradictedPagesFrom,
+  checkInferredWithoutCitations, checkInferredWithoutCitationsFrom,
   checkSchemaCrossLinks,
-  checkStalePages,
+  checkStalePages, checkStalePagesFrom,
 } from "./rules.js";
-import { checkJournalHealth } from "./journal-rule.js";
-import { checkPendingEmbeddings } from "./pending-embeddings-rule.js";
-import { checkWorkflowRunHealth } from "./workflow-run-rule.js";
-import { loadSchema } from "../schema/index.js";
-import { buildFreshnessSnapshot } from "../freshness/index.js";
+import { checkBrokenCitationsFrom, checkMalformedClaimCitationsFrom } from "./rules-citations.js";
+import { checkSchemaCrossLinksFrom } from "./rules-crosslinks.js";
+import { checkJournalHealth, checkJournalHealthFrom } from "./journal-rule.js";
+import { checkPendingEmbeddings, checkPendingEmbeddingsFrom } from "./pending-embeddings-rule.js";
+import { checkWorkflowRunHealth, checkWorkflowRunHealthFrom } from "./workflow-run-rule.js";
+import { diskLintSources, type LintSources } from "./lint-sources.js";
+import { loadSchemaFrom, type SchemaConfig } from "../schema/index.js";
+import { buildFreshnessSnapshotFrom } from "../freshness/index.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
-import { loadProfile } from "../profile/load.js";
+import { loadProfileFrom } from "../profile/load.js";
+import { readStateClassifiedFrom } from "../utils/state.js";
 import {
   groupByDeclaredTier, tieredReport, type LintTierV1, type TieredLintReportV1, type TieredResultGroupV1,
 } from "./tiers.js";
-import { collectProfileLintFindings, collectProfileLintInput } from "../profile/lint.js";
+import { collectProfileLintFindings, collectProfileLintInputFrom } from "../profile/lint.js";
 import type { PageScope } from "./rules-shared.js";
+
+/**
+ * One registry entry. `rule` is the root-taking rule: its function NAME is the
+ * entry's label in {@link declaredRuleTiers}, and the run does not call it.
+ * `from` is what the run calls: the same rule's one body, handed the members
+ * of the lint sources it reads through and whatever else its registry passes.
+ */
+interface Registered<Rule, Extra extends unknown[]> {
+  rule: Rule;
+  from: (sources: LintSources, ...extra: Extra) => Promise<LintResult[]>;
+  tier: LintTierV1;
+}
 
 /** Rule-only lint checks that don't depend on the schema layer. */
 /**
@@ -42,34 +64,37 @@ import type { PageScope } from "./rules-shared.js";
  * because rule ids are computed in places (`profile/${kind}`) and a table keyed
  * by them could never be proven complete. Ordering is load-bearing: `lint`
  * flattens these in registry order and suites pin that output byte-for-byte.
+ *
+ * Every entry is handed the run's page scope; ONLY the broken-wikilink entry
+ * passes it on. Every other rule walks the generic pages, as before.
  */
-const RULES_WITHOUT_SCHEMA: ReadonlyArray<{ rule: LintRule; tier: LintTierV1 }> = [
-  { rule: checkBrokenWikilinks, tier: "deterministic" },
-  { rule: checkOrphanedPages, tier: "deterministic" },
-  { rule: checkMissingSummaries, tier: "deterministic" },
-  { rule: checkDuplicateConcepts, tier: "deterministic" },
-  { rule: checkEmptyPages, tier: "deterministic" },
-  { rule: checkBrokenCitations, tier: "deterministic" },
-  { rule: checkMalformedClaimCitations, tier: "deterministic" },
+const RULES_WITHOUT_SCHEMA: ReadonlyArray<Registered<LintRule, [scope: PageScope]>> = [
+  { rule: checkBrokenWikilinks, from: ({ pages, candidates }, scope) => checkBrokenWikilinksFrom({ pages, candidates }, scope), tier: "deterministic" },
+  { rule: checkOrphanedPages, from: ({ pages }) => checkOrphanedPagesFrom(pages), tier: "deterministic" },
+  { rule: checkMissingSummaries, from: ({ pages }) => checkMissingSummariesFrom(pages), tier: "deterministic" },
+  { rule: checkDuplicateConcepts, from: ({ pages }) => checkDuplicateConceptsFrom(pages), tier: "deterministic" },
+  { rule: checkEmptyPages, from: ({ pages }) => checkEmptyPagesFrom(pages), tier: "deterministic" },
+  { rule: checkBrokenCitations, from: ({ pages, cited }) => checkBrokenCitationsFrom({ pages, cited }), tier: "deterministic" },
+  { rule: checkMalformedClaimCitations, from: ({ pages }) => checkMalformedClaimCitationsFrom(pages), tier: "deterministic" },
   // A model's assessment of a page, not a fact about it.
-  { rule: checkLowConfidencePages, tier: "provider-judgement" },
-  { rule: checkContradictedPages, tier: "provider-judgement" },
-  { rule: checkInferredWithoutCitations, tier: "provider-judgement" },
-  { rule: checkJournalHealth, tier: "deterministic" },
+  { rule: checkLowConfidencePages, from: ({ pages }) => checkLowConfidencePagesFrom(pages), tier: "provider-judgement" },
+  { rule: checkContradictedPages, from: ({ pages }) => checkContradictedPagesFrom(pages), tier: "provider-judgement" },
+  { rule: checkInferredWithoutCitations, from: ({ pages }) => checkInferredWithoutCitationsFrom(pages), tier: "provider-judgement" },
+  { rule: checkJournalHealth, from: ({ journal }) => checkJournalHealthFrom(journal), tier: "deterministic" },
   // Embeddings not yet computed: a derived view is behind, nothing is wrong.
-  { rule: checkPendingEmbeddings, tier: "derived-view" },
-  { rule: checkWorkflowRunHealth, tier: "deterministic" },
+  { rule: checkPendingEmbeddings, from: ({ embeddings }) => checkPendingEmbeddingsFrom(embeddings), tier: "derived-view" },
+  { rule: checkWorkflowRunHealth, from: ({ workflows }) => checkWorkflowRunHealthFrom(workflows), tier: "deterministic" },
 ];
 
 /** Lint rules that need the resolved schema to know per-kind expectations. */
-const RULES_WITH_SCHEMA: ReadonlyArray<{ rule: SchemaAwareLintRule; tier: LintTierV1 }> = [
-  { rule: checkSchemaCrossLinks, tier: "deterministic" },
+const RULES_WITH_SCHEMA: ReadonlyArray<Registered<SchemaAwareLintRule, [schema: SchemaConfig]>> = [
+  { rule: checkSchemaCrossLinks, from: ({ pages }, schema) => checkSchemaCrossLinksFrom(pages, schema), tier: "deterministic" },
 ];
 
 type FreshnessLintRule = (root: string, snapshot: FreshnessSnapshot) => Promise<LintResult[]>;
-const RULES_WITH_FRESHNESS: ReadonlyArray<{ rule: FreshnessLintRule; tier: LintTierV1 }> = [
+const RULES_WITH_FRESHNESS: ReadonlyArray<Registered<FreshnessLintRule, [snapshot: FreshnessSnapshot]>> = [
   // A page whose sources moved on: regenerating fixes it.
-  { rule: checkStalePages, tier: "derived-view" },
+  { rule: checkStalePages, from: ({ pages }, snapshot) => checkStalePagesFrom(pages, snapshot), tier: "derived-view" },
 ];
 
 /**
@@ -97,12 +122,12 @@ function summarize(results: LintResult[]): LintSummary {
  * profile. A default/built-in profile (`loadedFrom === null`) returns the
  * default results UNCHANGED, so the default lint output stays byte-identical.
  */
-async function profileGroups(root: string, defaultResults: readonly LintResult[]): Promise<TieredResultGroupV1[]> {
-  const { profile, loadedFrom } = await loadProfile(root);
+async function profileGroupsFrom(sources: LintSources, defaultResults: readonly LintResult[]): Promise<TieredResultGroupV1[]> {
+  const { profile, loadedFrom } = await loadProfileFrom(sources.profile);
   if (loadedFrom === null) return [];
   // One entity collection feeds every profile check, including the declared
   // numeric confidence judgement, so a tiered view never walks entities twice.
-  const collected = await collectProfileLintFindings(await collectProfileLintInput(root, profile));
+  const collected = await collectProfileLintFindings(await collectProfileLintInputFrom(sources.entities, profile));
   // Only an overlapping default confidence finding wins; unrelated duplicates survive.
   const defaultConfidenceFiles = new Set(
     defaultResults.filter((r) => r.rule === "low-confidence").map((r) => r.file),
@@ -120,20 +145,27 @@ async function profileGroups(root: string, defaultResults: readonly LintResult[]
  * ORDER IS THE CONTRACT. `lint` flattens these groups in exactly the order the
  * registries and the profile appendix produce them, which is the order the
  * frozen parity suites pin — so this must never sort or regroup.
+ *
+ * THE ONE BODY, over {@link LintSources}. In order: the schema; the compile
+ * state and then the freshness snapshot built from it; every registered rule,
+ * started together in registry order; and last the profile appendix. Nothing a
+ * rule reads is shared with another rule or kept for a later step.
  */
-async function collectTieredGroups(root: string, scope: PageScope = "generic"): Promise<TieredResultGroupV1[]> {
-  const schema = await loadSchema(root);
-  const freshness = await buildFreshnessSnapshot(root);
+async function collectTieredGroupsFrom(sources: LintSources, scope: PageScope): Promise<TieredResultGroupV1[]> {
+  const schema = await loadSchemaFrom(sources.schema);
+  const freshness = await buildFreshnessSnapshotFrom(sources.sourceFreshness, await readStateClassifiedFrom(sources.state));
   const [plain, schemaGroups, freshnessGroups] = await Promise.all([
-    Promise.all(RULES_WITHOUT_SCHEMA.map(async (entry) => ({
-      tier: entry.tier,
-      results: await (entry.rule === checkBrokenWikilinks ? checkBrokenWikilinks(root, scope) : entry.rule(root)),
-    }))),
-    Promise.all(RULES_WITH_SCHEMA.map(async (entry) => ({ tier: entry.tier, results: await entry.rule(root, schema) }))),
-    Promise.all(RULES_WITH_FRESHNESS.map(async (entry) => ({ tier: entry.tier, results: await entry.rule(root, freshness) }))),
+    Promise.all(RULES_WITHOUT_SCHEMA.map(async (entry) => ({ tier: entry.tier, results: await entry.from(sources, scope) }))),
+    Promise.all(RULES_WITH_SCHEMA.map(async (entry) => ({ tier: entry.tier, results: await entry.from(sources, schema) }))),
+    Promise.all(RULES_WITH_FRESHNESS.map(async (entry) => ({ tier: entry.tier, results: await entry.from(sources, freshness) }))),
   ]);
   const defaultResults = [...plain, ...schemaGroups, ...freshnessGroups];
-  return [...defaultResults, ...await profileGroups(root, defaultResults.flatMap((group) => group.results))];
+  return [...defaultResults, ...await profileGroupsFrom(sources, defaultResults.flatMap((group) => group.results))];
+}
+
+/** LOCAL DISK. {@link collectTieredGroupsFrom} for the project at `root`. */
+async function collectTieredGroups(root: string, scope: PageScope = "generic"): Promise<TieredResultGroupV1[]> {
+  return collectTieredGroupsFrom(diskLintSources(root), scope);
 }
 
 /**
@@ -146,9 +178,21 @@ async function collectTieredGroups(root: string, scope: PageScope = "generic"): 
  * @returns A summary containing all diagnostics and severity counts.
  */
 export async function lint(root: string): Promise<LintSummary> {
+  return lintFrom(diskLintSources(root));
+}
+
+/**
+ * {@link lint} over {@link LintSources}: the flat summary of one run of the one
+ * body, under the generic page scope, with no project root. It builds no tiered
+ * report.
+ *
+ * @param sources - What the run reads through.
+ * @returns A summary containing all diagnostics and severity counts.
+ */
+export async function lintFrom(sources: LintSources): Promise<LintSummary> {
   // lint is intentionally not journaled to log.md — it is a read-only check,
   // and the MCP `lint_wiki` tool documents it as non-mutating.
-  return summarize((await collectTieredGroups(root)).flatMap((group) => group.results));
+  return summarize((await collectTieredGroupsFrom(sources, "generic")).flatMap((group) => group.results));
 }
 
 /**
@@ -196,6 +240,20 @@ export async function lintBothViews(
   root: string,
   scope: PageScope = "generic",
 ): Promise<{ summary: LintSummary; tiered: TieredLintReportV1 }> {
-  const groups = await collectTieredGroups(root, scope);
+  return lintBothViewsFrom(diskLintSources(root), scope);
+}
+
+/**
+ * {@link lintBothViews} over {@link LintSources}: both views of one run of the
+ * one body, with no project root.
+ *
+ * @param sources - What the run reads through.
+ * @param scope - The page scope the broken-wikilink rule walks.
+ */
+export async function lintBothViewsFrom(
+  sources: LintSources,
+  scope: PageScope = "generic",
+): Promise<{ summary: LintSummary; tiered: TieredLintReportV1 }> {
+  const groups = await collectTieredGroupsFrom(sources, scope);
   return { summary: summarize(groups.flatMap((group) => group.results)), tiered: tieredReport(groups) };
 }

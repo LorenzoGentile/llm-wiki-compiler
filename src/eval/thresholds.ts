@@ -13,12 +13,14 @@
  *   source_utilization_rate   — minimum fraction of sources cited (0.0–1.0)
  *   source_warnings_max       — maximum source-inventory warnings allowed (integer)
  *   claim_level_citation_rate — minimum fraction of citations with line ranges (0.0–1.0)
+ *
+ * The check has ONE body, {@link checkThresholdsFrom}, over {@link EvalFileReads}.
+ * `checkThresholds` hands it the local disk's reads.
  */
 
-import { readFile } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
 import yaml from "js-yaml";
+import { diskEvalFileReads, type EvalFileReads } from "./file-reads.js";
 import type { EvalReport } from "./types.js";
 
 const THRESHOLDS_FILE = path.join(".llmwiki", "eval", "thresholds.yaml");
@@ -43,10 +45,9 @@ interface ThresholdConfig {
 }
 
 /** Load the threshold config from disk, or return an empty config if absent. */
-async function loadThresholds(root: string): Promise<ThresholdConfig> {
-  const configPath = path.join(root, THRESHOLDS_FILE);
-  if (!existsSync(configPath)) return {};
-  const raw = await readFile(configPath, "utf-8");
+async function loadThresholds(reads: EvalFileReads): Promise<ThresholdConfig> {
+  if (!reads.existsSync(THRESHOLDS_FILE)) return {};
+  const raw = await reads.readText(THRESHOLDS_FILE);
   return (yaml.load(raw) as ThresholdConfig) ?? {};
 }
 
@@ -84,25 +85,8 @@ function checkNewThresholds(
   }
 }
 
-/**
- * Check the report against configured thresholds.
- * @param report - The completed eval report.
- * @param root - Absolute path to the project root.
- * @returns List of violation messages (empty = all pass).
- */
-export async function checkThresholds(
-  report: EvalReport,
-  root: string,
-): Promise<string[]> {
-  const config = await loadThresholds(root);
-  const violations: string[] = [];
-
-  if (config.health_score !== undefined && report.health.score < config.health_score) {
-    violations.push(
-      `health_score ${report.health.score} is below threshold ${config.health_score}`,
-    );
-  }
-
+/** Check the two citation-coverage thresholds: coverage, then precision. */
+function checkCitationCoverageThresholds(violations: string[], config: ThresholdConfig, report: EvalReport): void {
   if (
     config.citation_coverage_percent !== undefined &&
     report.citationCoverage.coveragePercent < config.citation_coverage_percent
@@ -120,7 +104,10 @@ export async function checkThresholds(
       `citation_precision_percent ${report.citationCoverage.precisionPercent.toFixed(1)}% is below threshold ${config.citation_precision_percent}%`,
     );
   }
+}
 
+/** Check the two judge thresholds, only when the report has judge data: mean support, then judge errors. */
+function checkCitationSupportThresholds(violations: string[], config: ThresholdConfig, report: EvalReport): void {
   if (
     config.citation_support_mean !== undefined &&
     report.citationSupport !== undefined &&
@@ -140,7 +127,43 @@ export async function checkThresholds(
       `citation_judge_errors ${report.citationSupport.judgeErrors} exceeds max ${config.citation_judge_error_max}`,
     );
   }
+}
 
+/**
+ * Check the report against configured thresholds.
+ * @param report - The completed eval report.
+ * @param root - Absolute path to the project root.
+ * @returns List of violation messages (empty = all pass).
+ */
+export async function checkThresholds(
+  report: EvalReport,
+  root: string,
+): Promise<string[]> {
+  return checkThresholdsFrom(report, diskEvalFileReads(root));
+}
+
+/**
+ * {@link checkThresholds} over {@link EvalFileReads}: THE ONE BODY. The file is
+ * optional; when present its YAML is loaded as it is, with no validation, and
+ * the checks run in a fixed order: health, the citation four, then source
+ * utilization, source warnings and claim-level rate.
+ *
+ * @param report - The completed eval report.
+ * @param reads - Whether the thresholds file is there, and its whole text.
+ * @returns List of violation messages (empty = all pass).
+ */
+export async function checkThresholdsFrom(report: EvalReport, reads: EvalFileReads): Promise<string[]> {
+  const config = await loadThresholds(reads);
+  const violations: string[] = [];
+
+  if (config.health_score !== undefined && report.health.score < config.health_score) {
+    violations.push(
+      `health_score ${report.health.score} is below threshold ${config.health_score}`,
+    );
+  }
+
+  checkCitationCoverageThresholds(violations, config, report);
+  checkCitationSupportThresholds(violations, config, report);
   checkNewThresholds(violations, config, report);
 
   return violations;

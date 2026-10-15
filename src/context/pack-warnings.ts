@@ -29,7 +29,7 @@
  */
 
 import { isRelationStoreUnavailableProblem } from "../profile/block.js";
-import { journalHealthWarning } from "../trust/journal-health-warning.js";
+import type { JournalWarning } from "../trust/journal-health-warning.js";
 import type { ProjectState } from "../project/state.js";
 import type { ViewerSnapshot } from "../viewer/types.js";
 import type { NormalizedOptions } from "./build.js";
@@ -155,13 +155,13 @@ export function appendArtifactWarning(pack: ContextPack, snapshot: ViewerSnapsho
 
 /**
  * Append an `incomplete-compile` / `journal-unavailable` warning when the
- * project's compile journal is pending / unavailable, via the SHARED read-only
- * {@link journalHealthWarning} mapper (the same signal status/lint/viewer/export
- * surface). A cleanly-compiled project's journal is `ok`, so the mapper returns
- * null and the pack is byte-identical. Read-only — the mapper never mutates disk.
+ * project's compile journal is pending / unavailable. `warning` is what the
+ * SHARED read-only journal-health mapper (the same signal status/lint/viewer/
+ * export surface) returned for the pack's journal read. A cleanly-compiled
+ * project's journal is `ok`, so the mapper returned null and the pack is
+ * byte-identical. Pure: the read was the orchestrator's.
  */
-export async function appendJournalWarning(pack: ContextPack, root: string): Promise<ContextPack> {
-  const warning = await journalHealthWarning(root);
+export function appendJournalWarning(pack: ContextPack, warning: JournalWarning | null): ContextPack {
   if (warning === null) return pack;
   return { ...pack, warnings: [...pack.warnings, warning] };
 }

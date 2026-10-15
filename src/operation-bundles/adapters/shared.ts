@@ -47,6 +47,29 @@ export function applyResultFromObservation(observation: OperationObservation, po
   return { status: "conflict", detail: observation.detail ?? "postcondition not met" };
 }
 
+/**
+ * The verdict of one create-only CONTENT write (retained sources, projections):
+ * identical bytes already there are an UNBOUND idempotent skip, since a
+ * content-addressed target carries no per-mutation binding; a write fault is
+ * `unavailable` when its message says so and a conflict otherwise. `write` and
+ * then `postStateDigest` run INSIDE the classification, in that order, and the
+ * digest is read exactly once, AFTER the write settles, as each adapter always
+ * read it; so a fault from either is classified too.
+ */
+export async function createOnlyWriteVerdict(
+  write: () => Promise<string>, postStateDigest: () => OperationDigest, fallbackDetail: string,
+): Promise<AdapterApply> {
+  try {
+    const result = await write();
+    return result === "same"
+      ? { status: "skipped-idempotent", postStateDigest: postStateDigest(), boundToMutation: false }
+      : { status: "applied", postStateDigest: postStateDigest() };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : fallbackDetail;
+    return { status: message.includes("unavailable") ? "unavailable" : "conflict", detail: message };
+  }
+}
+
 /** The plain-string binding the store seams accept, built field-by-field. */
 export function toOperationBinding(binding: OperationAuditBinding): OperationBinding {
   return { bundleId: binding.bundleId, runId: binding.runId, mutationId: binding.mutationId };

@@ -1,0 +1,117 @@
+/**
+ * @file src/storage/disk-handle-leaves.ts
+ * @description Reads of ONE LEAF on the local disk that keep a file handle open
+ * across more than one step and NEVER HAND IT OUT. Each function opens, does
+ * its several handle calls, closes, and returns a plain value. The legacy
+ * profile loader and the product-package member check are the callers, and
+ * these two bodies are what those modules did inline with a handle of their
+ * own.
+ *
+ * This is a LOCAL PHYSICAL IMPLEMENTATION BOUNDARY, like the other
+ * `storage/disk-*` files: one implementation, nothing injected, no port. No
+ * `FileHandle` and no opened-leaf value appears in an exported signature. A
+ * registered or hosted project uses `ProjectStore`; none of this is a step
+ * toward hosting these files.
+ *
+ * WHAT THESE DO NOT KNOW. Neither knows what a profile, a product, a package
+ * or a member is. They raise no domain error, choose no message, decode no
+ * format and parse nothing. Each reports what happened and its caller decides
+ * what that means.
+ *
+ * THE TWO ARE DIFFERENT ON PURPOSE and must not be merged with each other or
+ * with the reads in `disk-private-leaves.ts`, which they resemble. They differ
+ * from those, and from each other, in what a failed open means, whether a
+ * failed `stat` or read rejects, whether an over-size leaf reports its size,
+ * and what a failing `close` does:
+ *
+ *  - {@link readLeafTextNoFollowCapped} checks the LEAF ONLY and confines
+ *    nothing. It keeps a failed OPEN apart (as a value carrying the raw
+ *    error), reports an over-cap leaf WITH its size, and REJECTS for a failed
+ *    `stat`, a failed read, or a failing `close`.
+ *  - {@link checkConfinedLeafDigest} carries the existing confined open's
+ *    guard and never rejects once that open has returned: every failure after
+ *    a confirmed open is `"differs"`, and a failing `close` is ignored.
+ *
+ * Nothing here is newly confined, atomic or durable; each keeps exactly the
+ * behaviour of the caller it came from.
+ */
+
+import { constants } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { openConfinedLeaf, type ReadLeafOptions } from "../utils/confined-read.js";
+import { openFileNoFollow, readOpenedTextWithinCap } from "../utils/no-follow-open.js";
+import { streamConfinedDigest } from "../utils/stream-digest.js";
+
+/** What one capped no-follow text read found, kept apart so the caller can decide: the open failed, the leaf is over the cap, or its text. */
+export type CappedTextNoFollowRead =
+  | { kind: "not-opened"; error: unknown }
+  | { kind: "oversize"; size: number }
+  | { kind: "text"; text: string };
+
+/**
+ * LEAF-ONLY CHECK, NOT CONFINED. Open `leaf` without following a link
+ * (`O_RDONLY | O_NOFOLLOW`, flags read when called), take its size from the
+ * open handle, and read it as text only when that size is within `maxBytes`.
+ *
+ * A failed OPEN is the value `not-opened` carrying the raw error untouched
+ * (absent, a link, a refused non-regular leaf, a permission error: the caller
+ * tells them apart). A leaf over the cap is `oversize` with its size, and is
+ * NEVER read. Otherwise the content, decoded by Node's own lenient `"utf-8"`
+ * read: invalid bytes become replacement characters, they are not refused.
+ *
+ * A failed `stat` or a failed read REJECTS with the raw error. `close` runs
+ * in `finally`, exactly once after a successful open, and a failing `close`
+ * rejects too, replacing an `oversize` or `text` result that was ready. Those
+ * post-open steps are {@link readOpenedTextWithinCap}, which the event head
+ * read also runs after its OWN, different open; only that tail is shared.
+ */
+export async function readLeafTextNoFollowCapped(leaf: string, maxBytes: number): Promise<CappedTextNoFollowRead> {
+  let handle: FileHandle;
+  try {
+    handle = await openFileNoFollow(leaf, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    return { kind: "not-opened", error };
+  }
+  return readOpenedTextWithinCap(handle, maxBytes);
+}
+
+/** What one confined leaf is, against the bytes its caller expects. */
+export type ConfinedLeafDigestCheck = "absent" | "unavailable" | "matches" | "differs";
+
+/**
+ * CARRIES THE CONFINED OPEN'S GUARD. `openConfinedLeaf(root, leaf,
+ * expectedDir, opts)` exactly, with `opts` passed through unchanged (the
+ * production `requireSingleLink` included): anything short of a confirmed open
+ * is returned as that open's own `absent` or `unavailable`. `expected` is the
+ * bytes the caller expects: a lowercase hex SHA-256 and an exact byte count.
+ *
+ * On a confirmed open the leaf is hashed BY STREAM, never buffered whole. Its
+ * size is compared to `expected.byteCount` BEFORE any byte is read; the stream
+ * is capped at that count; and the handle is `stat`ed again afterwards and
+ * must still be the same file (device, inode, link count, size). `matches`
+ * only when all of that holds and the digest equals `expected.sha256Hex`.
+ *
+ * NEVER REJECTS after the open has returned: any other outcome, a thrown
+ * `stat` or read included, is `differs`. The handle is closed once on every
+ * path after a confirmed open, and a failing `close` is ignored.
+ */
+export async function checkConfinedLeafDigest(
+  root: string, leaf: string, expectedDir: string,
+  expected: { sha256Hex: string; byteCount: number }, opts: ReadLeafOptions = {},
+): Promise<ConfinedLeafDigestCheck> {
+  const opened = await openConfinedLeaf(root, leaf, expectedDir, opts);
+  if (opened.kind !== "confirmed") return opened.kind;
+  try {
+    if (opened.size !== expected.byteCount) return "differs";
+    const streamed = await streamConfinedDigest(opened, expected.byteCount);
+    if (streamed === null || streamed.total !== expected.byteCount) return "differs";
+    const after = await opened.handle.stat();
+    const stable = after.dev === opened.dev && after.ino === opened.ino
+      && after.nlink === opened.nlink && after.size === opened.size;
+    return stable && streamed.digest === expected.sha256Hex ? "matches" : "differs";
+  } catch {
+    return "differs";
+  } finally {
+    await opened.handle.close().catch(() => {});
+  }
+}

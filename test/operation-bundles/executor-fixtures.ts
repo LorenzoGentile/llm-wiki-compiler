@@ -236,10 +236,11 @@ export function failingProjectionAdapter(): OperationStoreAdapter {
  * A stateful source adapter double whose observed state tracks apply/compensate,
  * so the compensation protocol can be exercised without a real store: it observes
  * not-applied until applied, applied afterwards, and not-applied again once its
- * idempotent compensator runs.
+ * idempotent compensator runs. `alreadyApplied` starts it with the effect present
+ * (bound), as a fresh process observing an earlier run's effect would.
  */
-export function compensatingSourceAdapter(): OperationStoreAdapter {
-  let applied = false, reverted = false;
+export function compensatingSourceAdapter(alreadyApplied = false): OperationStoreAdapter {
+  let applied = alreadyApplied, reverted = false;
   return defineOperationStoreAdapter<"source-retain">({
     kind: "source-retain",
     async preflight() { return { status: "ready" }; },

@@ -51,7 +51,7 @@ async function plantFullBacklog(): Promise<void> {
 describe("priority drain — fresh ids survive a full backlog + failed refresh", () => {
   it("keeps the 2 just-changed ids in the durable marker after a FAILING refresh", async () => {
     await plantFullBacklog();
-    vi.spyOn(embeddings, "updateEmbeddingsLockedCore").mockRejectedValue(new Error("missing API key"));
+    vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom").mockRejectedValue(new Error("missing API key"));
 
     await refreshEmbeddingsDrainingPending(root, [FRESH_A, FRESH_B] as PageId[]);
 

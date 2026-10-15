@@ -19,8 +19,10 @@
  * second collector.
  */
 
-import { collectRawWikiPages, extractWikilinkSlugs, extractWikilinkTargets } from "../wiki/collect.js";
+import { collectRawWikiPagesFrom, extractWikilinkSlugs, extractWikilinkTargets } from "../wiki/collect.js";
 import type { RawWikiPage } from "../wiki/collect.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
 import { extractClaimCitations, slugify } from "../utils/markdown.js";
 import type { DefaultViewerPage, PageId, ViewerPage, ViewerPageId, ViewerWarning } from "./types.js";
 import type { PageDirectory } from "../export/types.js";
@@ -47,8 +49,13 @@ type PageIndexEntry = {
  * `ViewerWarning` objects derived from the underlying `parseStatus` flags.
  * Returns pages in collector order (concepts then queries).
  */
-export async function collectViewerPages(root: string): Promise<DefaultViewerPage[]> {
-  const raw = await collectRawWikiPages(root);
+export function collectViewerPages(root: string): Promise<DefaultViewerPage[]> {
+  return collectViewerPagesFrom(diskLocalEntityScans(root));
+}
+
+/** {@link collectViewerPages}, with both page directories scanned through `scans`. */
+export async function collectViewerPagesFrom(scans: LegacyLocalEntityScans): Promise<DefaultViewerPage[]> {
+  const raw = await collectRawWikiPagesFrom(scans);
   return decoratePages(raw);
 }
 

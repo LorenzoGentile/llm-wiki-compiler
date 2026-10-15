@@ -17,12 +17,9 @@
  * RE-EXPORTED below so existing importers of `candidates.ts` are unchanged.
  */
 
-import { realpath, unlink } from "fs/promises";
-import { atomicWrite } from "../utils/markdown.js";
 import {
   assertCandidateSlug,
   assertWritableCandidateId,
-  candidatePath,
 } from "./candidate-paths.js";
 import {
   listCandidates,
@@ -32,7 +29,7 @@ import {
 } from "./candidate-read.js";
 import {
   candidateTargetKey,
-  selectReadableCandidateEntriesForMutation,
+  selectReadableCandidateEntriesForMutationFrom,
 } from "./candidate-selection.js";
 import type { ReviewCandidate, SourceState } from "../utils/types.js";
 import { assertAnswerCandidateMetadata } from "../citations/answer-manifest.js";
@@ -42,18 +39,24 @@ import type { LintResult } from "../linter/types.js";
 import type { TrustDecision } from "../trust/decision.js";
 import type { ConnectorProvenance } from "../connectors/types.js";
 import {
-  assertCandidateNamespacesHealthy,
-  captureCandidateCustody,
+  assertCandidateNamespacesHealthyFrom,
+  captureCandidateCustodyFrom,
   CandidateCustodyUnavailableError,
-  moveCandidateWithCustody,
-  observeCandidateCustody,
+  diskCandidateCustodyReads,
+  moveCandidateWithCustodyFrom,
+  observeCandidateCustodyFrom,
   type CandidateCustodyReceipt,
+  type CandidateStoreMoveReads,
+  type CandidateStoreWriteReads,
 } from "./candidate-custody.js";
 import { captureCandidateCustodyReceipt } from "./candidate-custody-snapshot.js";
 import {
-  publishFreshCandidate,
+  candidatePublicationStoreFrom,
+  diskCandidatePublicationStore,
+  publishFreshCandidateFrom,
   writableCandidateId,
   type CandidatePublication,
+  type CandidatePublicationStore,
   type FreshCandidateWriteOptions,
 } from "./candidate-publication.js";
 
@@ -192,21 +195,38 @@ export async function writeCandidate(
   draft: CandidateDraft,
   options: CandidateWriteOptions = {},
 ): Promise<ReviewCandidate> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return writeCandidateFrom(diskCandidateCustodyReads(root), draft, options);
+}
+
+/**
+ * {@link writeCandidate} over the store mechanisms: THE ONE BODY. A validated
+ * answer takes the fresh allocator; otherwise the first identity is minted and
+ * validated before any store access, the tolerant selection finds every
+ * non-answer record with the same target key, the earliest is replaced under
+ * its exact receipt and the rest are deleted in order, and no match falls to
+ * the shared exclusive publisher.
+ */
+export async function writeCandidateFrom(
+  reads: CandidateStoreWriteReads,
+  draft: CandidateDraft,
+  options: CandidateWriteOptions = {},
+): Promise<ReviewCandidate> {
   // Validated answers always take a fresh id: a later import or generic write
   // for the same target must never rewrite an answer under its id or delete it.
-  if (Object.hasOwn(draft, "candidateKind")) return writeFreshCandidate(root, draft, options);
+  if (Object.hasOwn(draft, "candidateKind")) return writeFreshCandidateFrom(candidatePublicationStoreFrom(reads), draft, options);
   const generatedId = writableCandidateId(draft.slug, 0, options);
   const targetKey = candidateTargetKey(draft);
-  const matches = await selectReadableCandidateEntriesForMutation(
-    root,
+  const matches = await selectReadableCandidateEntriesForMutationFrom(
+    reads,
     (candidate) => !candidate.candidateKind && candidateTargetKey(candidate) === targetKey,
   );
   const [canonical, ...duplicates] = matches;
   if (canonical) {
-    return replaceCanonicalCandidate(root, draft, canonical.custodyReceipt,
+    return replaceCanonicalCandidateFrom(reads, draft, canonical.custodyReceipt,
       duplicates, options);
   }
-  return publishNewCandidate(root, draft, generatedId, options);
+  return publishNewCandidate(candidatePublicationStoreFrom(reads), draft, generatedId, options);
 }
 
 /** Persist a new candidate without target-key canonicalization. Used only by typed staging supersede. */
@@ -215,8 +235,22 @@ export async function writeFreshCandidate(
   draft: CandidateDraft,
   options: FreshCandidateWriteOptions = {},
 ): Promise<ReviewCandidate> {
+  // `async` so that a throw while minting the first identity or building the disk store REJECTS.
+  return writeFreshCandidateFrom(diskCandidatePublicationStore(root), draft, options);
+}
+
+/**
+ * {@link writeFreshCandidate} over a publication store: THE ONE BODY. The first
+ * identity is minted and validated before any store effect, then the record is
+ * built, serialized and published by the shared allocator.
+ */
+export async function writeFreshCandidateFrom(
+  store: CandidatePublicationStore,
+  draft: CandidateDraft,
+  options: FreshCandidateWriteOptions = {},
+): Promise<ReviewCandidate> {
   const firstId = writableCandidateId(draft.slug, 0, options);
-  return publishNewCandidate(root, draft, firstId, options);
+  return publishNewCandidate(store, draft, firstId, options);
 }
 
 /** Materialize one public candidate publication. */
@@ -227,19 +261,19 @@ function candidatePublication(draft: CandidateDraft, id: string): CandidatePubli
 
 /** Publish a newly allocated candidate through the shared exclusive allocator. */
 function publishNewCandidate(
-  root: string,
+  store: CandidatePublicationStore,
   draft: CandidateDraft,
   firstId: string,
   options: FreshCandidateWriteOptions,
 ): Promise<ReviewCandidate> {
-  return publishFreshCandidate(
-    root, draft.slug, firstId, (id) => candidatePublication(draft, id), options,
+  return publishFreshCandidateFrom(
+    store, draft.slug, firstId, (id) => candidatePublication(draft, id), options,
   );
 }
 
 /** Replace only the exact pending-only canonical custody snapshot. */
-async function replaceCanonicalCandidate(
-  root: string,
+async function replaceCanonicalCandidateFrom(
+  reads: CandidateStoreWriteReads,
   draft: CandidateDraft,
   receipt: CandidateCustodyReceipt,
   duplicates: readonly CandidateFileEntry[],
@@ -247,14 +281,12 @@ async function replaceCanonicalCandidate(
 ): Promise<ReviewCandidate> {
   assertWritableCandidateId(receipt.fileId);
   await options.beforePublishForTest?.(receipt.fileId, 0);
-  if (await observeCandidateCustody(root, receipt, "public") !== "restored") {
+  if (await observeCandidateCustodyFrom(reads, receipt, "public") !== "restored") {
     throw new CandidateCustodyUnavailableError();
   }
   const publication = candidatePublication(draft, receipt.fileId);
-  await atomicWrite(await candidatePath(root, receipt.fileId), publication.serialized, {
-    confineRoot: await realpath(root),
-  });
-  await deleteDuplicates(root, duplicates, options);
+  await reads.replaceLeaf(await reads.leafPath(receipt.fileId, "pending"), publication.serialized);
+  await deleteEntriesFrom(reads, duplicates, options);
   return publication.candidate;
 }
 
@@ -264,6 +296,10 @@ function serializeCandidate(candidate: ReviewCandidate): string {
 }
 
 /** Build a ReviewCandidate from a draft and chosen id. */
+/**
+ * Build the candidate record for `draft` under `id`, with no storage effect.
+ * This is the one place a draft becomes a record, whichever store keeps it.
+ */
 function buildCandidate(draft: CandidateDraft, id: string): ReviewCandidate {
   assertAnswerCandidateMetadata({ ...draft, id, reviewMode: draft.reviewMode ?? "forced" }, id);
   const candidate: ReviewCandidate = {
@@ -310,32 +346,32 @@ function setCandidateField<K extends keyof ReviewCandidate>(
   if (include) candidate[key] = value as ReviewCandidate[K];
 }
 
-/** Delete exact selected duplicates in deterministic order. */
-async function deleteDuplicates(
-  root: string,
+/** Delete exact selected entries (duplicates, or a slug's matches) in deterministic order. */
+async function deleteEntriesFrom(
+  reads: CandidateStoreWriteReads,
   entries: readonly CandidateFileEntry[],
   hooks: CandidateDeletionHooks,
 ): Promise<void> {
   for (const [index, entry] of entries.entries()) {
-    await deleteCandidateWithCustody(root, entry.custodyReceipt);
+    await deleteCandidateWithCustodyFrom(reads, entry.custodyReceipt);
     await hooks.afterCandidateDeleteForTest?.(entry.fileId, index);
   }
 }
 
 /** Remove only the exact pending object authorized by one custody receipt. */
-async function deleteCandidateWithCustody(
-  root: string,
+async function deleteCandidateWithCustodyFrom(
+  reads: CandidateStoreWriteReads,
   receipt: CandidateCustodyReceipt,
 ): Promise<boolean> {
   const captured = captureCandidateCustodyReceipt(receipt, "public");
-  await assertCandidateNamespacesHealthy(root);
-  if (await observeCandidateCustody(root, captured, "public") !== "restored") {
+  await assertCandidateNamespacesHealthyFrom(reads);
+  if (await observeCandidateCustodyFrom(reads, captured, "public") !== "restored") {
     throw new CandidateCustodyUnavailableError();
   }
-  await assertCandidateNamespacesHealthy(root);
-  const filePath = await candidatePath(root, captured.fileId);
+  await assertCandidateNamespacesHealthyFrom(reads);
+  const filePath = await reads.leafPath(captured.fileId, "pending");
   try {
-    await unlink(filePath);
+    await reads.removeLeaf(filePath);
     return true;
   } catch (error) {
     throw new CandidateCustodyUnavailableError();
@@ -348,11 +384,21 @@ export async function deleteCandidate(
   id: string,
   hooks: CandidateDeletionHooks = {},
 ): Promise<boolean> {
-  await assertCandidateNamespacesHealthy(root);
-  const custody = await captureCandidateCustody(root, id, undefined, "public");
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return deleteCandidateFrom(diskCandidateCustodyReads(root), id, hooks);
+}
+
+/** {@link deleteCandidate} over the store mechanisms: THE ONE BODY. */
+export async function deleteCandidateFrom(
+  reads: CandidateStoreWriteReads,
+  id: string,
+  hooks: CandidateDeletionHooks = {},
+): Promise<boolean> {
+  await assertCandidateNamespacesHealthyFrom(reads);
+  const custody = await captureCandidateCustodyFrom(reads, id, undefined, "public");
   if (custody === null) return false;
   await hooks.afterCustodyForTest?.(id);
-  return deleteCandidateWithCustody(root, custody.receipt);
+  return deleteCandidateWithCustodyFrom(reads, custody.receipt);
 }
 
 /**
@@ -372,16 +418,23 @@ export async function deleteCandidateBySlug(
   slug: string,
   hooks: CandidateDeletionHooks = {},
 ): Promise<boolean> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return deleteCandidateBySlugFrom(diskCandidateCustodyReads(root), slug, hooks);
+}
+
+/** {@link deleteCandidateBySlug} over the store mechanisms: THE ONE BODY. */
+export async function deleteCandidateBySlugFrom(
+  reads: CandidateStoreWriteReads,
+  slug: string,
+  hooks: CandidateDeletionHooks = {},
+): Promise<boolean> {
   assertCandidateSlug(slug);
-  const matching = await selectReadableCandidateEntriesForMutation(
-    root,
+  const matching = await selectReadableCandidateEntriesForMutationFrom(
+    reads,
     (candidate) => candidateTargetKey(candidate) === `concepts/${slug}`,
   );
   if (matching.length === 0) return false;
-  for (const [index, entry] of matching.entries()) {
-    await deleteCandidateWithCustody(root, entry.custodyReceipt);
-    await hooks.afterCandidateDeleteForTest?.(entry.fileId, index);
-  }
+  await deleteEntriesFrom(reads, matching, hooks);
   return true;
 }
 
@@ -393,9 +446,20 @@ export async function deleteCandidateBySlug(
  * @returns True when the candidate was found and archived.
  */
 export async function archiveCandidate(root: string, id: string): Promise<boolean> {
-  const custody = await captureCandidateCustody(root, id, undefined, "public");
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return archiveCandidateFrom(diskCandidateCustodyReads(root), root, id);
+}
+
+/**
+ * {@link archiveCandidate} over the store mechanisms: THE ONE BODY. The
+ * pending custody is captured under the public policy (absent is `false`), then
+ * moved to the archive under that exact receipt. `root` only fills the move
+ * request's validated legacy field; `reads` choose the project.
+ */
+export async function archiveCandidateFrom(reads: CandidateStoreMoveReads, root: string, id: string): Promise<boolean> {
+  const custody = await captureCandidateCustodyFrom(reads, id, undefined, "public");
   if (custody === null) return false;
-  return moveCandidateWithCustody({
+  return moveCandidateWithCustodyFrom(reads, {
     root,
     fileId: id,
     direction: "archive",

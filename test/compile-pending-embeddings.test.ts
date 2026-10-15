@@ -7,10 +7,11 @@
  * a failure-swallowing embeddings refresh. This pins that a FAILED refresh on a
  * source-changing compile records the changed page-id to
  * `.llmwiki/pending-embeddings.json`, and that a SUBSEQUENT no-source-change
- * compile DRAINS it — invoking `updateEmbeddingsLockedCore` with the prior id and
+ * compile DRAINS it — invoking `updateEmbeddingsLockedCoreFrom` with the prior id and
  * leaving the marker absent once the refresh succeeds.
  *
- * Fail/succeed is simulated by spying on `updateEmbeddingsLockedCore`: the first
+ * Fail/succeed is simulated by spying on `updateEmbeddingsLockedCoreFrom`, the core
+ * body the refresh calls with its bound sources: the first
  * compile's spy REJECTS (stands in for a missing API key / transient provider
  * error, which `safelyUpdateEmbeddings` swallows); the second compile's spy
  * RESOLVES.
@@ -59,7 +60,7 @@ describe("durable pending-embedding refresh list across compiles", () => {
     // Compile 1: a source changed, but the refresh FAILS (swallowed). The
     // write-ahead marker must survive with alpha's qualified page-id.
     const failSpy = vi
-      .spyOn(embeddings, "updateEmbeddingsLockedCore")
+      .spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
       .mockRejectedValueOnce(new Error("missing API key"));
     await compileAndReport(ctx.dir);
     expect(failSpy).toHaveBeenCalledTimes(1);
@@ -70,7 +71,7 @@ describe("durable pending-embedding refresh list across compiles", () => {
     // The core now returns what it embedded + the eligible universe; alpha is
     // both, so settlement clears it.
     const okSpy = vi
-      .spyOn(embeddings, "updateEmbeddingsLockedCore")
+      .spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
       .mockResolvedValue({ embedded: [ALPHA_ID], eligible: [ALPHA_ID], pruned: [] });
     const result = await compileAndReport(ctx.dir);
 

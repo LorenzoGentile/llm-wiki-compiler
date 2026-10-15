@@ -1,25 +1,40 @@
 /**
  * Wiki page collector for the export subsystem.
  *
- * Thin wrapper over `src/wiki/collect.ts::collectRawWikiPages()` that
+ * Thin wrapper over `src/wiki/collect.ts::collectRawWikiPagesFrom()` that
  * applies export-specific filters (drop orphaned and untitled pages) and
  * decorates each surviving record with the export-facing fields (summary,
  * sources, tags, timestamps, link slugs). The wikilink extraction regex
  * and slug-normalization helper live in `src/wiki/collect.ts` so both
  * export and viewer callers share one source.
+ *
+ * ONE BODY, {@link collectExportPagesFrom}, over raw sources
+ * ({@link ExportPageSources}): the two page directories through the existing
+ * entity-scan binding, the state record, and the sources directory. The raw
+ * page collection, the classified state read and the freshness snapshot are
+ * their readers' own one bodies over those sources, never finished answers.
+ * `collectExportPages(root)` hands it the local disk's sources, built per
+ * call. Naming the sources selects no backend and rules on no mechanism.
  */
 
 import path from "path";
-import { collectRawWikiPages, extractWikilinkSlugs } from "../wiki/collect.js";
+import { collectRawWikiPagesFrom, extractWikilinkSlugs } from "../wiki/collect.js";
 import type { RawWikiPage } from "../wiki/collect.js";
 import { readConnectorBlock } from "../connectors/fence.js";
-import { buildFreshnessSnapshot, computeFreshness } from "../freshness/index.js";
+import {
+  buildFreshnessSnapshotFrom, computeFreshness, diskSourceFreshnessSources, type SourceFreshnessSources,
+} from "../freshness/index.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
 import { extractClaimCitations } from "../utils/markdown.js";
 import { flattenCitations } from "../context/provenance.js";
 import type { PageKind } from "../schema/types.js";
 import type { ProvenanceState, ContradictionRef } from "../utils/types.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
+import { readStateClassifiedFrom } from "../utils/state.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import { diskLocalRecords } from "../storage/disk-local-records.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
 import {
   hashPageBody,
   resolveSourceHashes,
@@ -208,8 +223,38 @@ function toExportPage(
  * all pages. Returns the surviving pages sorted by title.
  */
 export async function collectExportPages(root: string): Promise<ExportPage[]> {
-  const raw = await collectRawWikiPages(root);
-  const snapshot = await buildFreshnessSnapshot(root);
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return collectExportPagesFrom(diskExportPageSources(root));
+}
+
+/**
+ * Everything {@link collectExportPagesFrom} reads. A narrow seam: not
+ * `ProjectStore`, not a hosted or access-control contract, and it selects no
+ * backend. Nothing ties the three to one project; production builds all from
+ * one root ({@link diskExportPageSources}).
+ */
+export interface ExportPageSources {
+  /** The two page directories, scanned with bodies, both started together, concepts first. Asked FIRST. */
+  scans: LegacyLocalEntityScans;
+  /** The state record, classified without side effects; read once, after the scan. */
+  records: LegacyLocalRecords;
+  /** The sources directory: opened once, after the state, and only when the state is `ok`. */
+  freshness: SourceFreshnessSources;
+}
+
+/** LOCAL DISK. The export page sources for the project at `root`. Building them does no I/O. In no package index. */
+export function diskExportPageSources(root: string): ExportPageSources {
+  return { scans: diskLocalEntityScans(root), records: diskLocalRecords(root), freshness: diskSourceFreshnessSources(root) };
+}
+
+/**
+ * {@link collectExportPages} over {@link ExportPageSources}: THE ONE BODY. One
+ * step after another: the raw pages; the classified state, then the freshness
+ * snapshot over it; then the filters, the decoration and the title sort.
+ */
+export async function collectExportPagesFrom(sources: ExportPageSources): Promise<ExportPage[]> {
+  const raw = await collectRawWikiPagesFrom(sources.scans);
+  const snapshot = await buildFreshnessSnapshotFrom(sources.freshness, await readStateClassifiedFrom(sources.records));
   const sourceHashes = sourceHashLookupFromSnapshot(snapshot);
   const kept = raw.filter((page) => page.parseStatus.hasTitle && !page.parseStatus.orphaned);
   const pages = kept

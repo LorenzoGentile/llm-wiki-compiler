@@ -14,29 +14,13 @@ import { relationContentHash } from "../../src/relations/digest.js";
 import { appendLine, appendRelation, buildRelationRef } from "../../src/relations/store.js";
 import { readRelationRecords } from "../../src/relations/store-read.js";
 import { writeProfileFile } from "../fixtures/profile-fixtures.js";
-import type { EntityId, ProfilePack } from "../../src/profile/types.js";
+import type { EntityId } from "../../src/profile/types.js";
 import type { OperationDigest, RelationOperationMutation } from "../../src/operation-bundles/types.js";
-import { makeBinding, makeContext, type BindingSet } from "./adapter-fixtures.js";
-
-const PROFILE: ProfilePack = {
-  schemaVersion: 1, profileId: "research",
-  entities: { experiments: { directory: "wiki/experiments" }, ideas: { directory: "wiki/ideas" } },
-  relations: { related: { from: ["experiments", "ideas"], to: ["experiments", "ideas"], direction: "symmetric" } },
-};
+import {
+  makeBinding, makeContext, RELATION_INPUT as relInput, RELATION_PROFILE as PROFILE, relationMutation,
+} from "./adapter-fixtures.js";
 
 const DUMMY = `sha256:${"1".repeat(64)}` as OperationDigest;
-const relInput = { type: "related", from: "experiments/a" as EntityId, to: "ideas/b" as EntityId };
-
-/** The digest the postcondition must attest: the store's own content hash. */
-const CANONICAL = `sha256:${buildRelationRef(PROFILE, relInput).contentHash}` as OperationDigest;
-
-function relationMutation(set: BindingSet, relationType = "related"): RelationOperationMutation {
-  return {
-    kind: "relation", index: 0, mutationId: set.onDisk.mutationId, dependsOn: [], reconciliationRefs: [],
-    operation: "create", target: { relationType, from: "experiments/a", to: "ideas/b" }, attributes: {},
-    precondition: { kind: "absent" }, postcondition: { digest: relationType === "related" ? CANONICAL : DUMMY, recordId: "rel_x" },
-  };
-}
 
 let root = "";
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "rel-adapter-")); await writeProfileFile(root, PROFILE); });

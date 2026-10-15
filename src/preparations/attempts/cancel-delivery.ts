@@ -10,11 +10,19 @@
  * leg it drives. It reads only the lock-free advisory `.cancel` file and writes
  * nothing durable: every outcome it produces is handed back to the executor's
  * commit path, which revalidates the lease and records the honest result.
+ *
+ * ONE BODY, {@link runAttemptLegWith}, over a {@link PreparationCancellationProbe}
+ * and a request it reads only the binding and the leg from. {@link runAttemptLeg}
+ * keeps its signature and passes a probe that asks the incumbent root reader
+ * with the request's root at each poll, as it always did.
  */
 
 import { meteredFaultUsage } from "../../capability-providers/runtime/observed-usage.js";
-import { preparationCancellationRequested } from "../cancellation.js";
+import { preparationCancellationRequested, type PreparationCancellationProbe } from "../cancellation.js";
 import type { AttemptExecutionRequestV1, AttemptLegOutcomeV1, SealedAttemptContextV1 } from "./types.js";
+
+/** What the delivery leg reads off the request: the run it polls for and the leg it runs, never the root. */
+export type AttemptLegRequest = Pick<AttemptExecutionRequestV1, "binding" | "leg">;
 
 /**
  * How often the executor re-reads the advisory `.cancel` file during a leg.
@@ -50,8 +58,8 @@ function cancelledBeforeLaunchOutcome(): AttemptLegOutcomeV1 {
  * forged, stale, or unreadable file yields false and the ordinary leg runs; only
  * a valid present request short-circuits to the effect-free cancelled outcome.
  */
-async function cancellationBeforeLaunch(request: AttemptExecutionRequestV1): Promise<boolean> {
-  return preparationCancellationRequested(request.root, request.binding.workspaceId, request.binding.runId);
+async function cancellationBeforeLaunch(probe: PreparationCancellationProbe, request: AttemptLegRequest): Promise<boolean> {
+  return probe(request.binding.workspaceId, request.binding.runId);
 }
 
 /** The bounded advisory poll interval, overridable for tests via env. */
@@ -88,12 +96,12 @@ interface CancellationPollV1 {
  * genuine operator cancel would never be delivered and the bounded cancel
  * deadline would never arm.
  */
-function startCancellationPoll(request: AttemptExecutionRequestV1, controller: AbortController): CancellationPollV1 {
+function startCancellationPoll(probe: PreparationCancellationProbe, request: AttemptLegRequest, controller: AbortController): CancellationPollV1 {
   let stopped = false;
   let delivered = false;
   const timer = setInterval(() => {
     if (stopped || delivered) return;
-    void preparationCancellationRequested(request.root, request.binding.workspaceId, request.binding.runId)
+    void probe(request.binding.workspaceId, request.binding.runId)
       .then((requested) => {
         if (!requested || stopped) return;
         delivered = true;
@@ -111,7 +119,7 @@ function startCancellationPoll(request: AttemptExecutionRequestV1, controller: A
  * signal into its Provider V2 invocation, so a mid-flight `controller.abort()`
  * reaches the running backend as a cooperative cancel plus forced termination.
  */
-async function runLegSafely(request: AttemptExecutionRequestV1, sealed: SealedAttemptContextV1, cancelSignal: AbortSignal): Promise<AttemptLegOutcomeV1> {
+async function runLegSafely(request: AttemptLegRequest, sealed: SealedAttemptContextV1, cancelSignal: AbortSignal): Promise<AttemptLegOutcomeV1> {
   try {
     return await request.leg({ attemptId: sealed.attemptId, lease: sealed.lease, sealed, cancelSignal });
   } catch (error) {
@@ -172,7 +180,7 @@ function cancelDeadlineExpiredOutcome(): AttemptLegOutcomeV1 {
  * recovery-required so the attempt is bounded end to end.
  */
 async function raceLegAgainstCancelDeadline(
-  request: AttemptExecutionRequestV1, sealed: SealedAttemptContextV1, controller: AbortController,
+  request: AttemptLegRequest, sealed: SealedAttemptContextV1, controller: AbortController,
 ): Promise<AttemptLegOutcomeV1> {
   const leg = runLegSafely(request, sealed, controller.signal).then((outcome) => ({ outcome }));
   const deadline = armCancelDeadline(controller.signal).then(() => ({ deadline: true as const }));
@@ -217,11 +225,18 @@ export interface AttemptLegDeliveryV1 {
 export async function runAttemptLeg(
   request: AttemptExecutionRequestV1, sealed: SealedAttemptContextV1,
 ): Promise<AttemptLegDeliveryV1> {
-  if (await cancellationBeforeLaunch(request)) {
+  return runAttemptLegWith((workspaceId, runId) => preparationCancellationRequested(request.root, workspaceId, runId), request, sealed);
+}
+
+/** {@link runAttemptLeg} over a {@link PreparationCancellationProbe}: THE ONE BODY. */
+export async function runAttemptLegWith(
+  probe: PreparationCancellationProbe, request: AttemptLegRequest, sealed: SealedAttemptContextV1,
+): Promise<AttemptLegDeliveryV1> {
+  if (await cancellationBeforeLaunch(probe, request)) {
     return { outcome: cancelledBeforeLaunchOutcome(), cancellationObserved: true };
   }
   const controller = new AbortController();
-  const poll = startCancellationPoll(request, controller);
+  const poll = startCancellationPoll(probe, request, controller);
   try {
     const outcome = await raceLegAgainstCancelDeadline(request, sealed, controller);
     return { outcome, cancellationObserved: poll.delivered() };

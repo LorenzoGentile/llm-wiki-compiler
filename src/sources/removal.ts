@@ -42,9 +42,17 @@
  * {@link regenerateDerivedLocked} also re-embeds any other eligible page that
  * has no stored vector yet, so a removal can issue provider calls for pages it
  * never touched. See that function's docstring for the detail.
+ *
+ * ONE BODY EACH for the plan and the apply: {@link planRemovalWith} and
+ * {@link applyRemovalWith} keep the fail-closed state read, the resume rule, the
+ * fresh-ownership refusal, the order source → pages → state and the freezing,
+ * over {@link SourceRemovalSteps}. The root forms keep their signatures and pass
+ * {@link localSourceRemovalSteps}, whose members call the incumbent store,
+ * page-delete, state, page, candidate and profile functions when asked. The
+ * derived-artifact step stays a separate root-sequenced call.
  */
 
-import { getSource, deleteSource, sourceFileMissing } from "./store.js";
+import { getSource, deleteSource, sourceFileMissing, type SourceRecord } from "./store.js";
 import { assertSafeSourceId } from "./source-record.js";
 import {
   computeRemovalPlan,
@@ -59,17 +67,56 @@ import {
   removeSourceFrom,
   applyFrozenSlugs,
   StateTooNewError,
+  type ClassifiedState,
 } from "../utils/state.js";
 import { collectAllPages } from "../linter/rules.js";
 import { listCandidates } from "../compiler/candidate-read.js";
-import { generateIndex } from "../compiler/indexgen.js";
-import { generateMOC } from "../compiler/obsidian.js";
-import { updateEmbeddingsLockedCore } from "../utils/embeddings.js";
+import { generateIndex, generateIndexFrom, type IndexGenerationSources } from "../compiler/indexgen.js";
+import { generateMOC, generateMOCFrom, type MocGenerationSources } from "../compiler/obsidian.js";
+import { updateEmbeddingsLockedCore, updateEmbeddingsLockedCoreFrom, type EmbeddingWriterSources } from "../utils/embeddings.js";
 import { handleSafeEmbeddingFailure } from "../utils/embeddings-batch.js";
 import { loadNonDefaultProfile } from "../profile/block.js";
 import type { WikiState } from "../utils/types.js";
+import type { PageId } from "../utils/page-id.js";
 
 export type { RemovalPlan } from "./removal-plan.js";
+
+/** What the removal plan and apply ask of the project. No member takes a project root. */
+export interface SourceRemovalSteps {
+  /** `state.json`, classified without side effects. */
+  readStateClassified(): Promise<ClassifiedState>;
+  /** Every wiki page, as the planner reads them. */
+  collectPages(): ReturnType<typeof collectAllPages>;
+  /** Every review candidate. */
+  listCandidates(): ReturnType<typeof listCandidates>;
+  /** The active non-default profile, or none. */
+  loadProfile(): ReturnType<typeof loadNonDefaultProfile>;
+  /** The live source record for `id`, or null when it is not a valid source. */
+  getSource(id: string): Promise<SourceRecord | null>;
+  /** Whether NOTHING at all is at `sources/<id>`. */
+  sourceFileMissing(id: string): Promise<boolean>;
+  /** Delete the source file; whether one was removed. */
+  deleteSource(id: string): Promise<boolean>;
+  /** Delete pages as one journalled batch under the held lock; the floor-skipped slugs. */
+  deletePages(slugs: string[]): Promise<{ skipped: SkippedDelete[] }>;
+  /** Persist the next state. */
+  writeState(state: WikiState): Promise<void>;
+}
+
+/** LOCAL DISK: the incumbent functions for one root, built per call, each called when asked. In no package index. */
+export function localSourceRemovalSteps(root: string): SourceRemovalSteps {
+  return {
+    readStateClassified: () => readStateClassified(root),
+    collectPages: () => collectAllPages(root),
+    listCandidates: () => listCandidates(root),
+    loadProfile: () => loadNonDefaultProfile(root),
+    getSource: (id) => getSource(root, id),
+    sourceFileMissing: (id) => sourceFileMissing(root, id),
+    deleteSource: (id) => deleteSource(root, id),
+    deletePages: (slugs) => deleteWikiPagesLocked(root, slugs),
+    writeState: (state) => writeState(root, state),
+  };
+}
 
 /**
  * Normalize a user-supplied `<source>` ref to a validated bare basename,
@@ -121,7 +168,7 @@ function toSourceId(ref: string): string | null {
  * to `readState` each fabricating their own state and printing their own
  * "Corrupt state.json" warning.
  *
- * @param root - Absolute project root.
+ * @param steps - The removal's steps; only the classified state read is asked.
  * @returns The parsed state. A `missing` file returns an empty state — that
  *   IS legitimate: the source simply has no derived pages yet, and `rm`
  *   should still be able to delete the source file itself.
@@ -130,8 +177,8 @@ function toSourceId(ref: string): string | null {
  *   cannot tell which pages came from which source, so it must refuse rather
  *   than guess.
  */
-async function readStateFailClosed(root: string): Promise<WikiState> {
-  const classified = await readStateClassified(root);
+async function readStateFailClosed(steps: SourceRemovalSteps): Promise<WikiState> {
+  const classified = await steps.readStateClassified();
   if (classified.status === "too-new") {
     throw new StateTooNewError(classified.state.version as number);
   }
@@ -188,15 +235,20 @@ async function readStateFailClosed(root: string): Promise<WikiState> {
  * @throws {Error} if state.json is corrupt — see {@link readStateFailClosed}.
  */
 export async function planRemoval(root: string, ref: string): Promise<RemovalPlan | null> {
+  return planRemovalWith(localSourceRemovalSteps(root), ref);
+}
+
+/** {@link planRemoval} over {@link SourceRemovalSteps}: THE ONE BODY. Read-only; asks the six reads in the incumbent order. */
+export async function planRemovalWith(steps: SourceRemovalSteps, ref: string): Promise<RemovalPlan | null> {
   const sourceFile = toSourceId(ref);
   if (sourceFile === null) return null;
   const [state, pages, candidates, profile, record, fileMissing] = await Promise.all([
-    readStateFailClosed(root),
-    collectAllPages(root),
-    listCandidates(root),
-    loadNonDefaultProfile(root),
-    getSource(root, sourceFile),
-    sourceFileMissing(root, sourceFile),
+    readStateFailClosed(steps),
+    steps.collectPages(),
+    steps.listCandidates(),
+    steps.loadProfile(),
+    steps.getSource(sourceFile),
+    steps.sourceFileMissing(sourceFile),
   ]);
   const sourcePresent = record !== null;
   const resumable = fileMissing && state.sources[sourceFile] !== undefined;
@@ -287,26 +339,31 @@ export interface RemovalApplyResult {
  *   BEFORE any mutation, so a refusal leaves the project untouched.
  */
 export async function applyRemovalLocked(root: string, plan: RemovalPlan): Promise<RemovalApplyResult> {
+  return applyRemovalWith(localSourceRemovalSteps(root), plan);
+}
+
+/** {@link applyRemovalLocked} over {@link SourceRemovalSteps}: THE ONE BODY. The caller holds the project lock. */
+export async function applyRemovalWith(steps: SourceRemovalSteps, plan: RemovalPlan): Promise<RemovalApplyResult> {
   // Read state FIRST, before any mutation, while the source's own state entry
   // is still present — partitionConcepts needs it to see which concepts this
   // source currently owns. Reused below for freezing and for removeSourceFrom,
   // so the whole apply works from one consistent under-lock snapshot.
-  const fresh = await readStateFailClosed(root);
+  const fresh = await readStateFailClosed(steps);
   const current = partitionConcepts(plan.sourceFile, fresh);
   assertOwnershipUnchanged(plan, current);
 
-  const sourceDeleted = await deleteSource(root, plan.sourceFile);
+  const sourceDeleted = await steps.deleteSource(plan.sourceFile);
   // Floor-skipped pages are RETURNED, never swallowed: compile surfaces its own
   // skips as errors (src/compiler/index.ts:225), and a page the user asked to
   // remove that silently stayed on disk is exactly the failure `rm` exists to
   // prevent.
-  const { skipped } = await deleteWikiPagesLocked(root, current.deleteSlugs);
+  const { skipped } = await steps.deletePages(current.deleteSlugs);
   const deleted = withoutSkipped(current.deleteSlugs, skipped);
 
   const frozen = new Set(fresh.frozenSlugs ?? []);
   for (const slug of current.keptSlugs) frozen.add(slug);
   const next = applyFrozenSlugs(removeSourceFrom(fresh, plan.sourceFile), frozen);
-  await writeState(root, next);
+  await steps.writeState(next);
 
   return { deleted, skipped, sourceDeleted };
 }
@@ -412,10 +469,45 @@ function sameSlugs(left: string[], right: string[]): boolean {
  * @param root - Absolute project root.
  */
 export async function regenerateDerivedLocked(root: string): Promise<void> {
-  await generateIndex(root);
-  await generateMOC(root);
+  return regenerateDerivedWith(diskDerivedRegenerationSteps(root));
+}
+
+/** The three steps derived regeneration takes, for ONE project. No member takes a project root. */
+export interface DerivedRegenerationSteps {
+  /** Regenerate `wiki/index.md`. */
+  generateIndex(): Promise<void>;
+  /** Regenerate the MOC. */
+  generateMOC(): Promise<void>;
+  /** Refresh embeddings under the held lock: the writer core, NOT the import's drain step. */
+  updateEmbeddings(changedPageIds: PageId[]): Promise<unknown>;
+}
+
+/** LOCAL DISK. The incumbent root forms for `root`, each called when asked. */
+function diskDerivedRegenerationSteps(root: string): DerivedRegenerationSteps {
+  return {
+    generateIndex: () => generateIndex(root),
+    generateMOC: () => generateMOC(root),
+    updateEmbeddings: (changedPageIds) => updateEmbeddingsLockedCore(root, changedPageIds),
+  };
+}
+
+/** The steps over each step's own root-free body and seam: THE ONE BOUND COMPOSITION. Building it does no I/O. */
+export function derivedRegenerationStepsOver(sources: {
+  index: IndexGenerationSources; moc: MocGenerationSources; embeddings: EmbeddingWriterSources;
+}): DerivedRegenerationSteps {
+  return {
+    generateIndex: () => generateIndexFrom(sources.index),
+    generateMOC: () => generateMOCFrom(sources.moc),
+    updateEmbeddings: (changedPageIds) => updateEmbeddingsLockedCoreFrom(sources.embeddings, changedPageIds),
+  };
+}
+
+/** {@link regenerateDerivedLocked} over its steps: THE ONE BODY. Index, MOC, then embeddings, whose failure warns (or rethrows when strict). */
+export async function regenerateDerivedWith(steps: DerivedRegenerationSteps): Promise<void> {
+  await steps.generateIndex();
+  await steps.generateMOC();
   try {
-    await updateEmbeddingsLockedCore(root, []);
+    await steps.updateEmbeddings([]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     handleSafeEmbeddingFailure(err, `Skipped embeddings update: ${message}`);

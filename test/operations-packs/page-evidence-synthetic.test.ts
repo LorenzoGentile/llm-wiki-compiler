@@ -20,8 +20,15 @@ import { mkdir, readFile } from "node:fs/promises";
 import { createWiki } from "../../src/sdk/wiki.js";
 import { appendRelation } from "../../src/relations/store.js";
 import { loadNonDefaultProfile } from "../../src/profile/block.js";
-import { capturePageEvidenceInput } from "../../src/products/page-evidence-capture.js";
-import { buildPageEvidenceSpecs } from "../../src/operations-packs/runtime/page-evidence.js";
+import { capturePageEvidenceInput, capturePageEvidenceInputFrom } from "../../src/products/page-evidence-capture.js";
+import { buildPageEvidenceSpecs, buildPageEvidenceSpecsFrom } from "../../src/operations-packs/runtime/page-evidence.js";
+import { pageEvidenceReadsOver } from "../../src/products/page-evidence-forms.js";
+import { diskArtifactStoreReads } from "../../src/artifacts/resolve.js";
+import { diskEffectiveProfileSources } from "../../src/profile/load.js";
+import { diskEntityPageReads } from "../../src/profile/lifecycle-read.js";
+import { diskGraphStoreReads } from "../../src/utils/jsonl-store.js";
+import { diskPreparationRunLookupReads } from "../../src/preparations/service-run-lookup.js";
+import { diskPreparationEvidenceLeafReads } from "../../src/preparations/evidence-store.js";
 import type { ProfilePack } from "../../src/profile/types.js";
 import type { PageEvidenceDescriptorV2 } from "../../src/operations-packs/recipe-types.js";
 import type { WorkspaceOperationsPackV2 } from "../../src/operations-packs/types.js";
@@ -250,5 +257,18 @@ describe("the page-evidence seam is generic: a product-free profile drives all p
     const contentOf = (specs: typeof builtFirst.built.specs): string[] =>
       specs.filter((spec) => spec.inputId === "in-report").map((spec) => Buffer.from(spec.bytes).toString("utf8"));
     expect(contentOf(builtSecond.built.specs)).toEqual(contentOf(builtFirst.built.specs));
+  });
+
+  it("BOUND: the capture and the runtime build over each reader's own seam answer exactly what the root forms answer", async () => {
+    const { root } = await gadgetProject();
+    const reads = pageEvidenceReadsOver({
+      profile: diskEffectiveProfileSources(root), store: diskArtifactStoreReads(root), pages: diskEntityPageReads(root),
+      graph: diskGraphStoreReads(root), runs: diskPreparationRunLookupReads(root), evidence: diskPreparationEvidenceLeafReads(root),
+    });
+    const captured = await capturePageEvidenceInputFrom(reads, packFor(gadgetDescriptor()), "syn.judge", INPUT);
+    expect(captured).toEqual(await capturePageEvidenceInput(root, packFor(gadgetDescriptor()), "syn.judge", INPUT));
+    if (!("input" in captured)) throw new Error(captured.refused);
+    expect(await buildPageEvidenceSpecsFrom(reads, gadgetDescriptor(), captured.input))
+      .toEqual(await buildPageEvidenceSpecs(root, gadgetDescriptor(), captured.input));
   });
 });

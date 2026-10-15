@@ -17,14 +17,30 @@
  * is left alone rather than guessed at, and so is one that prefixes none: a link
  * to a concept the wiki genuinely lacks is a signal about what is missing, not
  * noise to be hidden.
+ *
+ * `repairLinksFrom` is THE ONE BODY of the read-and-plan pass and holds no
+ * project root: it reaches the project only through {@link LinkRepairSources}.
+ * `repairLinks(root)` is a delegate over a private binding built per call. The
+ * sources answer FACTS (a listing, a page's text or that it was dropped,
+ * whether something is at a path, the pending candidate records); the body
+ * owns the order, the listing-failure rule, the dropped-page warning policy
+ * and the pending rule. Naming the sources selects no backend and rules on no
+ * mechanism; every member of the local binding is still local disk.
+ *
+ * NOT MIGRATED HERE: applying the planned writes. {@link repairAndApplyLinks}
+ * still takes a root and writes through the journalled page writer under the
+ * caller's project lock.
  */
 
 import path from "path";
-import { readdir } from "node:fs/promises";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import { diskLocalRecordDirs } from "../storage/disk-local-record-dirs.js";
+import type { LegacyLocalRecordDirs } from "../storage/legacy-local-record-dirs.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import { parseFrontmatter, slugify } from "../utils/markdown.js";
-import { readConfinedWikiPage, warnDroppedWikiReadIfPresent } from "./confined-wiki-read.js";
+import { warnDroppedReadIfPresentFrom } from "./confined-wiki-read.js";
 import { rewriteWikilinks } from "../wiki/wikilinks.js";
-import { listLinkResolvablePendingSlugs } from "./candidate-read.js";
+import { listLinkResolvablePendingSlugsFrom } from "./candidate-read.js";
 import { applyCompilePageWritesWithIdsLocked } from "./compile-write-ids.js";
 import type { PageId } from "../utils/page-id.js";
 import type { CompilePageNamespace, CompilePageWrite } from "./compile-write.js";
@@ -93,19 +109,49 @@ function repairBody(
   return { body: next, repaired };
 }
 
-/** Read only pages whose opened bytes remain within their expected directory. */
-async function collectRepairPages(root: string): Promise<Array<{ filePath: string; content: string }>> {
+/**
+ * Everything the read-and-plan pass asks of the project, in the order
+ * {@link repairLinksFrom} asks it: for concepts and then for queries, one
+ * listing and then one confined read per `.md` name, one after another; then,
+ * only when at least one page was read, the pending candidates.
+ */
+export interface LinkRepairSources {
+  /**
+   * The page reads. The body calls exactly three of its members and no other:
+   * `listNames` for each page directory (a rejection coded `ENOENT` is an
+   * empty directory; any other rejection fails the pass); `readConfinedPage`
+   * for each `.md` name (a dropped page is a VALUE); and, through the shared
+   * warning helper and only for a dropped page, `statNoFollow`.
+   */
+  pages: LegacyLocalReads;
+  /** The pending candidate records, read through the tolerant candidate list. Asked only after the pages, and not at all when there are none. */
+  candidates: LegacyLocalRecordDirs;
+}
+
+/** LOCAL DISK. The sources for the project at `root`, built per call and private to this module. Building them does no I/O. */
+function diskLinkRepairSources(root: string): LinkRepairSources {
+  return { pages: diskLocalReads(root), candidates: diskLocalRecordDirs(root) };
+}
+
+/**
+ * Read only pages whose opened bytes remain within their expected directory.
+ * A dropped page is left out, and is warned about ONLY when something is
+ * physically at its path: the shared helper makes the no-follow look, treats
+ * any failure of that look as "not there", and names the directory-qualified
+ * path. The warning is emitted before the next page is read.
+ */
+async function collectRepairPages(reads: LegacyLocalReads): Promise<Array<{ filePath: string; content: string }>> {
   const pages: Array<{ filePath: string; content: string }> = [];
   for (const dir of [CONCEPTS_DIR, QUERIES_DIR]) {
-    const files = await readdir(path.join(root, dir)).catch((error: NodeJS.ErrnoException) => {
+    const files = await reads.listNames(dir).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return [];
       throw error;
     });
     for (const file of files.filter(file => file.endsWith(".md"))) {
-      const filePath = path.join(root, dir, file);
-      const result = await readConfinedWikiPage(root, dir, file.slice(0, -3));
+      const filePath = path.join(dir, file);
+      const result = await reads.readConfinedPage(dir, file.slice(0, -3));
       if ("dropped" in result) {
-        await warnDroppedWikiReadIfPresent(filePath, path.join(dir, file), result.dropped);
+        await warnDroppedReadIfPresentFrom(reads, filePath, filePath, result.dropped);
         continue;
       }
       pages.push({ filePath, content: result.content });
@@ -114,7 +160,7 @@ async function collectRepairPages(root: string): Promise<Array<{ filePath: strin
   return pages;
 }
 
-/** Derive the compile namespace from a page's absolute file path. */
+/** Derive the compile namespace from a page's project-relative file path. */
 function namespaceForPage(filePath: string): CompilePageNamespace {
   return path.dirname(filePath).endsWith(path.basename(QUERIES_DIR)) ? "queries" : "concepts";
 }
@@ -131,11 +177,21 @@ function namespaceForPage(filePath: string): CompilePageNamespace {
  * @returns One write per page whose body actually changed.
  */
 export async function repairLinks(root: string): Promise<CompilePageWrite[]> {
-  const pages = await collectRepairPages(root);
+  return repairLinksFrom(diskLinkRepairSources(root));
+}
+
+/**
+ * {@link repairLinks} through `sources`: THE ONE BODY. Collect the pages; with
+ * none, return before the pending candidates are read; otherwise read them,
+ * build the resolver, plan one write per changed page in page order, and
+ * report the count once at the end.
+ */
+export async function repairLinksFrom(sources: LinkRepairSources): Promise<CompilePageWrite[]> {
+  const pages = await collectRepairPages(sources.pages);
   if (pages.length === 0) return [];
 
   const slugs = pages.map((page) => path.basename(page.filePath, ".md").toLowerCase());
-  const pending = await listLinkResolvablePendingSlugs(root);
+  const pending = await listLinkResolvablePendingSlugsFrom(sources.candidates);
   const resolve = createRepairResolver(slugs, pending);
 
   const writes: CompilePageWrite[] = [];

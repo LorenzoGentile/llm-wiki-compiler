@@ -28,11 +28,17 @@
  * The caller MUST already hold the project lock: this routes through the
  * lock-free {@link appendRelationLocked} (a self-locking append would deadlock
  * under the held import lock, mirroring the typed-doc leg).
+ *
+ * ONE BODY. {@link applyBundleRelationsWith} owns the leg (the untrusted no-op,
+ * the known-id set, per-entry imported/deduplicated/skipped-invalid, and the
+ * fail-closed abort of every remaining entry) over {@link RelationImportSteps},
+ * none of which takes a project root; {@link applyBundleRelations} keeps its
+ * signature and passes the local steps.
  */
 
 import { appendRelationLocked, type AppendRelationInput } from "../relations/store.js";
-import { readRelations } from "../relations/store-read.js";
-import { RelationEndpointError, type RelationId } from "../relations/types.js";
+import { readRelations, type ReadRelationsResult } from "../relations/store-read.js";
+import { RelationEndpointError, type RelationId, type RelationRef } from "../relations/types.js";
 import type { EntityId, ProfilePack } from "../profile/types.js";
 import type { BundleRelationEntry } from "../export/okf/bundle-block.js";
 
@@ -73,6 +79,22 @@ export function inertRelationOutcomes(
   return entries.map((entry) => outcomeFor(entry, outcome));
 }
 
+/** What applying bundle relations asks of the project. No member takes a project root; the caller holds the lock. */
+export interface RelationImportSteps {
+  /** Every live relation (for the known-id set). */
+  readRelations(): Promise<ReadRelationsResult>;
+  /** Append one relation, lock-free; a content-hash hit returns the EXISTING record; throws its refusals. */
+  append(profile: ProfilePack, input: AppendRelationInput): Promise<RelationRef>;
+}
+
+/** LOCAL DISK. The incumbent relation reader and lock-free append for `root`, each called when asked. */
+function diskRelationImportSteps(root: string): RelationImportSteps {
+  return {
+    readRelations: () => readRelations(root),
+    append: (profile, input) => appendRelationLocked(root, profile, input),
+  };
+}
+
 /**
  * Build the trusted write input from an untrusted entry: name each field
  * explicitly so the foreign `id`/`contentHash` can NEVER ride in. Endpoints pass
@@ -97,13 +119,13 @@ function toAppendInput(entry: BundleRelationEntry): AppendRelationInput {
  * error is rethrown for the caller to abort the remaining entries.
  */
 async function applyOneRelation(
-  root: string,
+  steps: RelationImportSteps,
   profile: ProfilePack,
   entry: BundleRelationEntry,
   known: Set<RelationId>,
 ): Promise<RelationImportOutcome> {
   try {
-    const ref = await appendRelationLocked(root, profile, toAppendInput(entry));
+    const ref = await steps.append(profile, toAppendInput(entry));
     const deduped = known.has(ref.id);
     known.add(ref.id);
     return outcomeFor(entry, deduped ? "deduplicated" : "imported");
@@ -127,20 +149,20 @@ function abortRemaining(entries: BundleRelationEntry[], error: unknown): Relatio
  * stops, but nothing throws — the page import stays intact.
  */
 async function applyTrustedRelations(
-  root: string,
+  steps: RelationImportSteps,
   profile: ProfilePack,
   entries: BundleRelationEntry[],
 ): Promise<RelationImportOutcome[]> {
   let known: Set<RelationId>;
   try {
-    known = new Set((await readRelations(root)).relations.map((rel) => rel.id));
+    known = new Set((await steps.readRelations()).relations.map((rel) => rel.id));
   } catch (error) {
     return abortRemaining(entries, error);
   }
   const outcomes: RelationImportOutcome[] = [];
   for (let i = 0; i < entries.length; i++) {
     try {
-      outcomes.push(await applyOneRelation(root, profile, entries[i], known));
+      outcomes.push(await applyOneRelation(steps, profile, entries[i], known));
     } catch (error) {
       return [...outcomes, ...abortRemaining(entries.slice(i), error)];
     }
@@ -166,6 +188,16 @@ export async function applyBundleRelations(
   entries: BundleRelationEntry[],
   trusted: boolean,
 ): Promise<RelationImportOutcome[]> {
+  return applyBundleRelationsWith(diskRelationImportSteps(root), profile, entries, trusted);
+}
+
+/** {@link applyBundleRelations} over {@link RelationImportSteps}: THE ONE BODY. */
+export async function applyBundleRelationsWith(
+  steps: RelationImportSteps,
+  profile: ProfilePack,
+  entries: BundleRelationEntry[],
+  trusted: boolean,
+): Promise<RelationImportOutcome[]> {
   if (!trusted) return inertRelationOutcomes(entries, "skipped-untrusted");
-  return applyTrustedRelations(root, profile, entries);
+  return applyTrustedRelations(steps, profile, entries);
 }

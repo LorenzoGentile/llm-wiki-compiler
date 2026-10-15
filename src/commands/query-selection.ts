@@ -10,6 +10,12 @@
  * A failed chunk pre-filter falls through to page-level retrieval. Page-level
  * failures propagate by default; explicit fallback retains the D29 recovery
  * capability with an `embedding-degraded` warning.
+ *
+ * Disk access: {@link selectRelevantPages} loads the profile, the embedding
+ * store and the journal warning from the project, then reads live pages through
+ * the local-disk `LivePageReads`. {@link selectRelevantPagesFrom} takes those
+ * three loaded values and a `LivePageReads` instead. Both narrow the store to
+ * the page scope exactly once and then run the same private selection.
  */
 
 import * as output from "../utils/output.js";
@@ -22,15 +28,17 @@ import {
 import type { ChunkEmbeddingEntry } from "../utils/embeddings.js";
 import {
   loadEmbeddingsForSearch,
-  findRelevantChunksV3,
-  findRelevantPagesV3,
+  findRelevantChunksV3From,
+  findRelevantPagesV3From,
 } from "../utils/embeddings-load.js";
+import { diskLivePageReads, type LivePageReads } from "../utils/page-registry.js";
 import { loadProfile } from "../profile/load.js";
 import { rerankWithBm25 } from "../utils/retrieval.js";
 import { journalHealthWarning } from "../trust/journal-health-warning.js";
 import {
-  selectFallbackRefs,
+  selectFallbackRefsFrom,
   withStaleWarning,
+  type LoadedSearchInputs,
   type SelectedPageRef,
   type SearchWarning,
   type RetrievalOptions,
@@ -103,11 +111,48 @@ export async function selectRelevantPages(
   options: RetrievalOptions = {},
 ): Promise<SelectedPages> {
   const profile = await loadProfile(root);
-  const outcome = narrowToScope(await loadEmbeddingsForSearch(root), pageScope);
+  const embeddings = narrowToScope(await loadEmbeddingsForSearch(root), pageScope);
+  const journalWarning = await journalHealthWarning(root);
+  return selectScopedPages(diskLivePageReads(root), { profile, embeddings, journalWarning }, question, debug, pageScope, options);
+}
+
+/**
+ * {@link selectRelevantPages} over already-loaded inputs, with every live page
+ * read made through `pages`. The loaded store is narrowed to `pageScope` here,
+ * once, before any lookup. Nothing here loads the profile, the store or the
+ * journal: those stay with the caller.
+ *
+ * @param pages - Where live pages are read from.
+ * @param inputs - The profile, embedding store outcome and journal warning.
+ */
+export async function selectRelevantPagesFrom(
+  pages: LivePageReads,
+  inputs: LoadedSearchInputs,
+  question: string,
+  debug: boolean,
+  pageScope?: readonly string[],
+  options: RetrievalOptions = {},
+): Promise<SelectedPages> {
+  const embeddings = narrowToScope(inputs.embeddings, pageScope);
+  return selectScopedPages(pages, { ...inputs, embeddings }, question, debug, pageScope, options);
+}
+
+/**
+ * The one selection both forms share. `inputs.embeddings` is ALREADY narrowed to
+ * `pageScope`; the scope is still passed on because the fallback needs it.
+ */
+async function selectScopedPages(
+  pages: LivePageReads,
+  inputs: LoadedSearchInputs,
+  question: string,
+  debug: boolean,
+  pageScope: readonly string[] | undefined,
+  options: RetrievalOptions,
+): Promise<SelectedPages> {
+  const { profile, embeddings: outcome, journalWarning } = inputs;
   // A pending/unavailable compile journal applies to the whole answer regardless
   // of which retrieval branch wins, so fold it into the base warnings ONCE. An
   // ok journal contributes nothing, so a healthy query's warnings are unchanged.
-  const journalWarning = await journalHealthWarning(root);
   const base: SearchWarning[] = journalWarning ? [journalWarning, ...outcome.warnings] : outcome.warnings;
   // Degrade warnings raised by THIS selection (e.g. a failed page-level embed).
   const degradeWarnings: SearchWarning[] = [];
@@ -121,21 +166,21 @@ export async function selectRelevantPages(
   });
 
   if (outcome.store) {
-    const chunkSelection = await trySelectViaChunks(root, outcome.store, question, debug, profile, stalePageIds);
+    const chunkSelection = await trySelectViaChunks(pages, outcome.store, question, debug, profile, stalePageIds);
     if (chunkSelection) return enrich(chunkSelection);
-    const candidates = await tryFindRelevantPages(root, outcome.store, question, profile, options);
+    const candidates = await tryFindRelevantPages(pages, outcome.store, question, profile, options);
     stalePageIds.push(...candidates.stalePageIds);
     if (candidates.warning) degradeWarnings.push(candidates.warning);
     if (candidates.hits.length > 0) return enrich(await selectFromCandidates(question, candidates.hits));
   }
 
-  const { refs, reasoning } = await selectFallbackRefs(root, question, "search", profile, pageScope);
+  const { refs, reasoning } = await selectFallbackRefsFrom(pages, question, "search", profile, pageScope);
   return enrich({ refs, reasoning, chunks: [], warnings: [] });
 }
 
 /** Page-level candidate hits plus the warning recorded when embedding failed. */
 interface PageLookup {
-  hits: Awaited<ReturnType<typeof findRelevantPagesV3>>["hits"];
+  hits: Awaited<ReturnType<typeof findRelevantPagesV3From>>["hits"];
   stalePageIds: PageId[];
   warning?: SearchWarning;
 }
@@ -145,14 +190,14 @@ interface PageLookup {
  * is requested. Recovery is reported as data rather than a stdout diagnostic.
  */
 async function tryFindRelevantPages(
-  root: string,
+  pages: LivePageReads,
   store: NonNullable<Awaited<ReturnType<typeof loadEmbeddingsForSearch>>["store"]>,
   question: string,
   profile: Awaited<ReturnType<typeof loadProfile>>,
   options: RetrievalOptions,
 ): Promise<PageLookup> {
   try {
-    return await findRelevantPagesV3(root, store, "search", question, EMBEDDING_TOP_K, profile);
+    return await findRelevantPagesV3From(pages, store, "search", question, EMBEDDING_TOP_K, profile);
   } catch (err) {
     if (options.embeddingFailure === "throw") throw err;
     const message = err instanceof Error ? err.message : String(err);
@@ -195,14 +240,14 @@ async function selectFromCandidates(
  * this returns null) so the caller can surface `embedding-entry-stale`.
  */
 async function trySelectViaChunks(
-  root: string,
+  pages: LivePageReads,
   store: NonNullable<Awaited<ReturnType<typeof loadEmbeddingsForSearch>>["store"]>,
   question: string,
   debug: boolean,
   profile: Awaited<ReturnType<typeof loadProfile>>,
   stalePageIds: PageId[],
 ): Promise<SelectedPages | null> {
-  const ranked = await tryFindRelevantChunks(root, store, question, profile);
+  const ranked = await tryFindRelevantChunks(pages, store, question, profile);
   stalePageIds.push(...ranked.stalePageIds);
   if (ranked.chunks.length === 0) return null;
 
@@ -306,19 +351,19 @@ interface ChunkLookup {
 
 /**
  * Chunk-level candidate lookup over the v3 store that never throws. Adapts each
- * live-rehydrated {@link findRelevantChunksV3} hit to the chunk-entry shape the
+ * live-rehydrated {@link findRelevantChunksV3From} hit to the chunk-entry shape the
  * BM25 reranker consumes (its `title` is the slug — query provenance shows the
  * slug, not the title) and forwards the read's `stalePageIds` so the caller can
  * surface `embedding-entry-stale`. Provider failures degrade to an empty list.
  */
 async function tryFindRelevantChunks(
-  root: string,
+  pages: LivePageReads,
   store: NonNullable<Awaited<ReturnType<typeof loadEmbeddingsForSearch>>["store"]>,
   question: string,
   profile: Awaited<ReturnType<typeof loadProfile>>,
 ): Promise<ChunkLookup> {
   try {
-    const { hits, stalePageIds } = await findRelevantChunksV3(root, store, "search", question, CHUNK_TOP_K, profile);
+    const { hits, stalePageIds } = await findRelevantChunksV3From(pages, store, "search", question, CHUNK_TOP_K, profile);
     return { chunks: hits.map((hit) => ({ chunk: toChunkEntry(hit), pageId: hit.pageId, score: hit.score })), stalePageIds };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

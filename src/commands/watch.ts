@@ -8,9 +8,9 @@
  */
 
 import { watch as chokidarWatch } from "chokidar";
-import { existsSync } from "fs";
 import path from "path";
 import { compile } from "../compiler/index.js";
+import { locationExistsSync } from "../storage/disk-locations.js";
 import { SOURCES_DIR } from "../utils/constants.js";
 import * as output from "../utils/output.js";
 
@@ -30,7 +30,7 @@ interface WatchCommandOptions {
 export default async function watchCommand(options: WatchCommandOptions = {}): Promise<void> {
   const sourcesPath = path.resolve(SOURCES_DIR);
 
-  if (!existsSync(sourcesPath)) {
+  if (!locationExistsSync(sourcesPath)) {
     output.status(
       "!",
       output.warn('No sources/ directory found. Run `llmwiki ingest <url>` first.'),

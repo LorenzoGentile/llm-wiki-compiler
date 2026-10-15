@@ -11,34 +11,40 @@
  * It imports only the shared path resolvers ({@link file://./candidate-paths.ts})
  * and never imports the write module, so `candidates.ts` can re-export these
  * symbols without forming an import cycle.
+ *
+ * The targeted loads and the bounded page each have ONE BODY over the record
+ * directories ({@link loadCandidateOrFailFrom}, {@link loadCandidateUnderLockOrFailFrom},
+ * {@link listCandidatePageFrom}); their root forms hand them the local disk's.
+ * Each body keeps its CLI output and exit code exactly as the root form had them.
  */
 
-import { candidatePath, UnsafeCandidateIdError } from "./candidate-paths.js";
-import { safeReadFile } from "../utils/markdown.js";
+import { candidateLeafFrom, UnsafeCandidateIdError } from "./candidate-paths.js";
+import { diskLocalRecordDirs } from "../storage/disk-local-record-dirs.js";
+import type { LegacyLocalRecordDirs, LocalRecordDirectory, LocalRecordLeaf } from "../storage/legacy-local-record-dirs.js";
 import { TextDecoder } from "node:util";
-import { opendir } from "node:fs/promises";
-import { listCandidateFileIds } from "../utils/candidate-store.js";
+import { listCandidateFileIdsFrom } from "../utils/candidate-store.js";
 import {
-  resolveConfinedCandidatesDir,
   UnsafeCandidateDirError,
 } from "./candidate-store-paths.js";
 import * as output from "../utils/output.js";
 import { CANDIDATES_DIR } from "../utils/constants.js";
 import {
-  assertCandidateStoreBinding,
-  captureCandidateCustody,
-  captureCandidateStoreBinding,
+  assertCandidateStoreBindingFrom,
+  captureCandidateCustodyFrom,
   CandidateCustodyUnavailableError,
   CandidateLeafUnavailableError,
+  diskCandidateCustodyReads,
   type CandidateCustodyRead,
+  type CandidateCustodyReads,
   type CandidateCustodyReceipt,
+  type CandidateStoreListReads,
+  type CandidateStoreScanReads,
   type CandidateStoreBinding,
 } from "./candidate-custody.js";
 import { sanitizeCandidate } from "./candidate-sanitize.js";
 import type { CandidateCustodyPolicy } from "./candidate-custody-limits.js";
 export { DEFAULT_HELD_REASONS } from "./candidate-sanitize.js";
 import type { ReviewCandidate } from "../utils/types.js";
-import { readFile } from "fs/promises";
 import type { StrictIoOptions } from "../utils/path-confine.js";
 import { assertAnswerCandidateMetadata, InvalidCandidateMetadataError } from "../citations/answer-manifest.js";
 
@@ -68,6 +74,8 @@ const MAX_MUTATION_JSON_LEAVES = 200;
 
 /** One archive entry plus the maximum JSON leaves may exist directly. */
 const MAX_MUTATION_DIRECT_ENTRIES = 201;
+/** Suffix of the entries the strict mutation scan names; the stem is the file id. */
+const MUTATION_LEAF_SUFFIX = ".json";
 
 /** Deterministic seams for candidate-store replacement tests. */
 export interface CandidateMutationScanHooks {
@@ -75,14 +83,20 @@ export interface CandidateMutationScanHooks {
   afterOpenForTest?: () => Promise<void>;
 }
 
-/** Validate the public store path, then capture one race-sensitive binding. */
-export async function captureCandidateMutationStoreBinding(
-  root: string,
+/**
+ * Validate the public store path, then capture one race-sensitive binding,
+ * over the custody-read mechanisms. The ordinary confined resolution (aliases
+ * allowed) decides absence first (`null`); only then is the binding captured,
+ * literal by default, and a binding that vanished in between is
+ * `CandidateCustodyUnavailableError`.
+ */
+export async function captureCandidateMutationStoreBindingFrom(
+  reads: CandidateCustodyReads,
   requireLiteral = true,
 ): Promise<CandidateStoreBinding | null> {
-  const resolved = await resolveConfinedCandidatesDir(root, CANDIDATES_DIR);
+  const resolved = await reads.captureDirectory(CANDIDATES_DIR);
   if (resolved === null) return null;
-  const binding = await captureCandidateStoreBinding(root, requireLiteral);
+  const binding = await reads.captureDirectory(CANDIDATES_DIR, requireLiteral);
   if (binding === null) throw new CandidateCustodyUnavailableError();
   return binding;
 }
@@ -107,7 +121,12 @@ export async function readCandidateBySlug(
  * stays broken after approval.
  */
 export async function listLinkResolvablePendingSlugs(root: string, options: StrictIoOptions = {}): Promise<Set<string>> {
-  const candidates = await listCandidates(root, options);
+  return listLinkResolvablePendingSlugsFrom(diskLocalRecordDirs(root), options);
+}
+
+/** {@link listLinkResolvablePendingSlugs} through `dirs`: THE ONE BODY. The tolerant pending list, then the one rule: typed candidates are left out. */
+export async function listLinkResolvablePendingSlugsFrom(dirs: LegacyLocalRecordDirs, options: StrictIoOptions = {}): Promise<Set<string>> {
+  const candidates = await listCandidatesFrom(dirs, options);
   return new Set(
     candidates.filter((candidate) => !candidate.targetEntityType).map((candidate) => candidate.slug),
   );
@@ -136,7 +155,12 @@ export async function loadCandidateOrFail(
   root: string,
   id: string,
 ): Promise<ReviewCandidate | null> {
-  const candidate = await readTargetedCandidate(root, id);
+  return loadCandidateOrFailFrom(diskLocalRecordDirs(root), id);
+}
+
+/** {@link loadCandidateOrFail} through `dirs`: THE ONE BODY. */
+export async function loadCandidateOrFailFrom(dirs: LegacyLocalRecordDirs, id: string): Promise<ReviewCandidate | null> {
+  const candidate = await readTargetedCandidate(dirs, id);
   if (candidate === undefined) return null;
   if (!candidate) return failWithError(`Candidate not found: ${id}`);
   return candidate;
@@ -157,7 +181,12 @@ export async function loadCandidateUnderLockOrFail(
   root: string,
   id: string,
 ): Promise<ReviewCandidate | null> {
-  const candidate = await readTargetedCandidate(root, id);
+  return loadCandidateUnderLockOrFailFrom(diskLocalRecordDirs(root), id);
+}
+
+/** {@link loadCandidateUnderLockOrFail} through `dirs`: THE ONE BODY. */
+export async function loadCandidateUnderLockOrFailFrom(dirs: LegacyLocalRecordDirs, id: string): Promise<ReviewCandidate | null> {
+  const candidate = await readTargetedCandidate(dirs, id);
   if (candidate === undefined) return null;
   if (!candidate) {
     return failWithError(`Candidate ${id} was removed by another process during review.`);
@@ -171,17 +200,26 @@ export async function loadCandidateUnderLockOrFail(
  * skipped with a warning rather than throwing, so `review list`/`show` never
  * crash due to a hand-edited or truncated candidate file.
  */
-export async function readCandidate(
+export function readCandidate(
   root: string,
   id: string,
   opts: CandidateReadOptions = {},
 ): Promise<ReviewCandidate | null> {
-  return (await readCandidateSnapshot(root, id, opts))?.candidate ?? null;
+  return readCandidateFrom(diskLocalRecordDirs(root), id, opts);
+}
+
+/** {@link readCandidate}, with the leaf resolved and read through `dirs`. */
+export async function readCandidateFrom(
+  dirs: LegacyLocalRecordDirs,
+  id: string,
+  opts: CandidateReadOptions = {},
+): Promise<ReviewCandidate | null> {
+  return (await readCandidateSnapshotFrom(dirs, id, opts))?.candidate ?? null;
 }
 
 /** Render typed admission failures without disguising them as missing files. */
-async function readTargetedCandidate(root: string, id: string): Promise<ReviewCandidate | null | undefined> {
-  try { return await readCandidate(root, id, { rejectInvalidMetadata: true }); }
+async function readTargetedCandidate(dirs: LegacyLocalRecordDirs, id: string): Promise<ReviewCandidate | null | undefined> {
+  try { return await readCandidateFrom(dirs, id, { rejectInvalidMetadata: true }); }
   catch (error) {
     if (!(error instanceof InvalidCandidateMetadataError)) throw error;
     failWithError(error.message);
@@ -190,10 +228,10 @@ async function readTargetedCandidate(root: string, id: string): Promise<ReviewCa
 }
 
 /** Preserve missing-file semantics while allowing snapshot callers to see faults. */
-async function readCandidateBytes(file: string, opts: StrictIoOptions): Promise<string> {
-  if (!opts.strictIo) return safeReadFile(file);
+async function readCandidateBytes(leaf: LocalRecordLeaf, opts: StrictIoOptions): Promise<string> {
+  if (!opts.strictIo) return leaf.readText().catch(() => "");
   try {
-    return await readFile(file, "utf-8");
+    return await leaf.readText();
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
     throw err;
@@ -201,12 +239,26 @@ async function readCandidateBytes(file: string, opts: StrictIoOptions): Promise<
 }
 
 /** Load once and retain original bytes for advisory evaluation revision/evidence identity. */
-export async function readCandidateSnapshot(
+export function readCandidateSnapshot(
   root: string,
   id: string,
   opts: CandidateReadOptions = {},
 ): Promise<{ candidate: ReviewCandidate; raw: string } | null> {
-  const raw = await readCandidateBytes(await candidatePath(root, id), opts);
+  return readCandidateSnapshotFrom(diskLocalRecordDirs(root), id, opts);
+}
+
+/**
+ * {@link readCandidateSnapshot}, with the leaf resolved and read through `dirs`.
+ * The leaf is resolved BEFORE the read and outside its error handling, so a
+ * resolution failure propagates and only a failed read is treated as absence.
+ * In no package index.
+ */
+export async function readCandidateSnapshotFrom(
+  dirs: LegacyLocalRecordDirs,
+  id: string,
+  opts: CandidateReadOptions = {},
+): Promise<{ candidate: ReviewCandidate; raw: string } | null> {
+  const raw = await readCandidateBytes(await candidateLeafFrom(dirs, id), opts);
   if (!raw) return null;
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
@@ -232,9 +284,23 @@ function parseCandidateEntry(
   fileId: string,
   custody: CandidateCustodyRead,
 ): CandidateFileEntry {
+  const candidate = parseCandidateRecord(fileId, custody.bytes);
+  return { fileId, candidate, custodyReceipt: custody.receipt };
+}
+
+/**
+ * Decode, validate and sanitize one stored candidate record from its bytes.
+ * Pure: it reads no store, so any proposal store shares this exact admission.
+ *
+ * @param fileId - The id the record is stored under (bound into its metadata check).
+ * @param bytes - The stored record bytes.
+ * @returns The sanitized candidate.
+ * @throws CandidateRecordMalformedError when the bytes are not a valid record.
+ */
+function parseCandidateRecord(fileId: string, bytes: Uint8Array): ReviewCandidate {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(CANDIDATE_DECODER.decode(custody.bytes));
+    parsed = JSON.parse(CANDIDATE_DECODER.decode(bytes));
   } catch {
     throw new CandidateRecordMalformedError();
   }
@@ -247,24 +313,29 @@ function parseCandidateEntry(
     throw error;
   }
   if (!isValidCandidate(parsed)) throw new CandidateRecordMalformedError();
-  return { fileId, candidate: sanitizeCandidate(parsed), custodyReceipt: custody.receipt };
+  return sanitizeCandidate(parsed);
 }
 
 /** Read one candidate entry, returning null only for a genuinely absent leaf. */
-async function readCandidateEntry(
-  root: string,
+async function readCandidateEntryFrom(
+  reads: CandidateCustodyReads,
   fileId: string,
   expectedStore?: CandidateStoreBinding,
   policy: CandidateCustodyPolicy = "bounded",
 ): Promise<CandidateFileEntry | null> {
-  const custody = await captureCandidateCustody(root, fileId, expectedStore, policy);
+  const custody = await captureCandidateCustodyFrom(reads, fileId, expectedStore, policy);
   return custody === null ? null : parseCandidateEntry(fileId, custody);
 }
 
 /** List tolerant-read identities while mapping store I/O to typed unavailability. */
-async function listCandidateFileIdsForRead(dir: string): Promise<string[]> {
+async function listCandidateFileIdsForRead(directory: LocalRecordDirectory): Promise<string[]> {
+  return idsOrCustodyUnavailable(() => listCandidateFileIdsFrom(directory));
+}
+
+/** Run one tolerant id listing; any failure of the listing itself means custody is unavailable. */
+async function idsOrCustodyUnavailable(list: () => Promise<string[]>): Promise<string[]> {
   try {
-    return await listCandidateFileIds(dir);
+    return await list();
   } catch {
     throw new CandidateCustodyUnavailableError();
   }
@@ -276,9 +347,23 @@ export async function readCandidateEntryForMutation(
   fileId: string,
   expectedStore?: CandidateStoreBinding,
 ): Promise<CandidateFileEntry> {
-  const entry = await readCandidateEntry(root, fileId, expectedStore);
-  if (entry === null) throw new CandidateCustodyUnavailableError();
-  return entry;
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return readCandidateEntryForMutationFrom(diskCandidateCustodyReads(root), fileId, expectedStore);
+}
+
+/**
+ * {@link readCandidateEntryForMutation} over the custody-read mechanisms: THE
+ * ONE BODY. A bounded custody capture, then the shared record admission; an
+ * absent leaf fails closed as unavailable custody.
+ */
+export async function readCandidateEntryForMutationFrom(
+  reads: CandidateCustodyReads,
+  fileId: string,
+  expectedStore?: CandidateStoreBinding,
+): Promise<CandidateFileEntry> {
+  const custody = await captureCandidateCustodyFrom(reads, fileId, expectedStore);
+  if (custody === null) throw new CandidateCustodyUnavailableError();
+  return parseCandidateEntry(fileId, custody);
 }
 
 /** Defensive type-guard so corrupted candidate files don't blow up the CLI. */
@@ -299,13 +384,28 @@ export async function listCandidateFileEntries(
   root: string,
   rejectUnsafeIds = false,
 ): Promise<CandidateFileEntry[]> {
-  const dir = await resolveConfinedCandidatesDir(root, CANDIDATES_DIR);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return listCandidateFileEntriesFrom(diskCandidateCustodyReads(root), rejectUnsafeIds);
+}
+
+/**
+ * {@link listCandidateFileEntries} over the custody-read mechanisms: THE ONE
+ * BODY. The confined resolution (aliases allowed) decides absence; the tolerant
+ * direct-file `.json` listing, the public-policy reads, which faults skip a
+ * leaf and which propagate, the skip note and the generation-then-UTF-8 order
+ * all stay here.
+ */
+export async function listCandidateFileEntriesFrom(
+  reads: CandidateStoreListReads,
+  rejectUnsafeIds = false,
+): Promise<CandidateFileEntry[]> {
+  const dir = (await reads.captureDirectory(CANDIDATES_DIR))?.realDir ?? null;
   if (dir === null) return []; // absent candidates dir → nothing pending
-  const ids = await listCandidateFileIdsForRead(dir);
+  const ids = await listCandidateFileIdsForRead(reads.recordDirectory(dir));
   const entries: CandidateFileEntry[] = [];
   for (const fileId of ids) {
     try {
-      const entry = await readCandidateEntry(root, fileId, undefined, "public");
+      const entry = await readCandidateEntryFrom(reads, fileId, undefined, "public");
       if (entry) entries.push(entry);
     } catch (error) {
       if (error instanceof UnsafeCandidateDirError ||
@@ -337,32 +437,34 @@ export async function listCandidateMutationFileIdsForBinding(
   binding: CandidateStoreBinding,
   hooks: CandidateMutationScanHooks = {},
 ): Promise<string[]> {
-  const ids: string[] = [];
-  let directEntries = 0;
-  let directory: Awaited<ReturnType<typeof opendir>> | undefined;
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return listCandidateMutationFileIdsForBindingFrom(diskCandidateCustodyReads(root), binding, hooks);
+}
+
+/**
+ * {@link listCandidateMutationFileIdsForBinding} over the custody-read
+ * mechanisms: THE ONE BODY. The scan's caps, suffix, store re-proof, overflow
+ * refusal, fault mapping and UTF-8 order stay here; the mechanism only streams.
+ */
+export async function listCandidateMutationFileIdsForBindingFrom(
+  reads: CandidateStoreScanReads,
+  binding: CandidateStoreBinding,
+  hooks: CandidateMutationScanHooks = {},
+): Promise<string[]> {
+  let ids: string[];
   try {
-    await hooks.afterInitialCustodyForTest?.();
-    await assertCandidateStoreBinding(root, binding);
-    directory = await opendir(binding.realDir);
-    await hooks.afterOpenForTest?.();
-    await assertCandidateStoreBinding(root, binding);
-    for await (const entry of directory) {
-      directEntries += 1;
-      if (directEntries > MAX_MUTATION_DIRECT_ENTRIES) {
-        throw new CandidateCustodyUnavailableError();
-      }
-      if (!entry.name.endsWith(".json")) continue;
-      if (ids.length >= MAX_MUTATION_JSON_LEAVES) {
-        throw new CandidateCustodyUnavailableError();
-      }
-      ids.push(entry.name.slice(0, -5));
-    }
-    await assertCandidateStoreBinding(root, binding);
+    ids = await reads.enumerate(binding, {
+      suffix: MUTATION_LEAF_SUFFIX,
+      maxDirectEntries: MAX_MUTATION_DIRECT_ENTRIES,
+      maxNames: MAX_MUTATION_JSON_LEAVES,
+      recheck: () => assertCandidateStoreBindingFrom(reads, binding),
+      overflow: () => new CandidateCustodyUnavailableError(),
+      beforeOpen: async () => { await hooks.afterInitialCustodyForTest?.(); },
+      afterOpen: async () => { await hooks.afterOpenForTest?.(); },
+    });
   } catch (error) {
     if (error instanceof CandidateCustodyUnavailableError) throw error;
     throw new CandidateCustodyUnavailableError();
-  } finally {
-    await directory?.close().catch(() => {});
   }
   return ids.sort(compareCandidateFileIdsUtf8);
 }
@@ -379,17 +481,17 @@ export function sortCandidateFileEntries(entries: CandidateFileEntry[]): Candida
  * @param root - Project root directory.
  * @returns Candidate file ids, or an empty list when the directory is absent.
  */
-async function pendingCandidateFileIds(root: string): Promise<string[]> {
-  const dir = await resolveConfinedCandidatesDir(root, CANDIDATES_DIR);
-  if (dir === null) return []; // absent candidates dir → nothing pending
-  return listCandidateFileIdsForRead(dir);
+async function pendingCandidateFileIds(dirs: LegacyLocalRecordDirs): Promise<string[]> {
+  const directory = await dirs.directory(CANDIDATES_DIR);
+  if (directory === null) return []; // absent candidates dir → nothing pending
+  return idsOrCustodyUnavailable(() => listCandidateFileIdsFrom(directory));
 }
 
 /** Read and sanitize the named candidates, dropping the ones that fail to parse. */
-async function readCandidatesByIds(root: string, ids: string[], opts: StrictIoOptions = {}): Promise<ReviewCandidate[]> {
+async function readCandidatesByIds(dirs: LegacyLocalRecordDirs, ids: string[], opts: StrictIoOptions = {}): Promise<ReviewCandidate[]> {
   const candidates: ReviewCandidate[] = [];
   for (const id of ids) {
-    const candidate = await readCandidate(root, id, opts);
+    const candidate = await readCandidateFrom(dirs, id, opts);
     if (candidate) candidates.push(candidate);
   }
   return candidates;
@@ -406,8 +508,17 @@ async function readCandidatesByIds(root: string, ids: string[], opts: StrictIoOp
  * @param opts - Strict I/O propagates per-file read faults while retaining admission warnings.
  * @returns All pending review candidates.
  */
-export async function listCandidates(root: string, opts: StrictIoOptions = {}): Promise<ReviewCandidate[]> {
-  const candidates = await readCandidatesByIds(root, await pendingCandidateFileIds(root), opts);
+export function listCandidates(root: string, opts: StrictIoOptions = {}): Promise<ReviewCandidate[]> {
+  return listCandidatesFrom(diskLocalRecordDirs(root), opts);
+}
+
+/**
+ * {@link listCandidates}, with the directory and each leaf resolved and read
+ * through `dirs`. Ordered by generation time ONLY: records generated at the
+ * same instant keep the backend's listing order, with no id tie-break.
+ */
+export async function listCandidatesFrom(dirs: LegacyLocalRecordDirs, opts: StrictIoOptions = {}): Promise<ReviewCandidate[]> {
+  const candidates = await readCandidatesByIds(dirs, await pendingCandidateFileIds(dirs), opts);
   candidates.sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
   return candidates;
 }
@@ -446,21 +557,33 @@ export interface CandidatePage {
  * @returns The bounded slice and the true pending total.
  */
 export async function listCandidatePage(root: string, limit: number): Promise<CandidatePage> {
-  const page = await listCandidateIdentityPage(root, limit);
+  return listCandidatePageFrom(diskLocalRecordDirs(root), limit);
+}
+
+/** {@link listCandidatePage} through `dirs`: THE ONE BODY. */
+export async function listCandidatePageFrom(dirs: LegacyLocalRecordDirs, limit: number): Promise<CandidatePage> {
+  const page = await listCandidateIdentityPageFrom(dirs, limit);
   return { candidates: page.entries.map(entry => entry.candidate), total: page.total };
 }
 
 /** Bounded read retaining the file identity used by targeted review commands. */
-export async function listCandidateIdentityPage(root: string, limit: number): Promise<{
+export function listCandidateIdentityPage(root: string, limit: number): Promise<{
+  entries: Array<{ fileId: string; candidate: ReviewCandidate }>; total: number;
+}> {
+  return listCandidateIdentityPageFrom(diskLocalRecordDirs(root), limit);
+}
+
+/** {@link listCandidateIdentityPage}, with the directory and each leaf resolved and read through `dirs`. */
+export async function listCandidateIdentityPageFrom(dirs: LegacyLocalRecordDirs, limit: number): Promise<{
   entries: Array<{ fileId: string; candidate: ReviewCandidate }>; total: number;
 }> {
   // Plain sort: lexicographic by UTF-16 code unit, so the slice is identical on
   // every machine. `localeCompare` would make it depend on the host locale.
-  const ids = (await pendingCandidateFileIds(root)).sort();
+  const ids = (await pendingCandidateFileIds(dirs)).sort();
   const served = ids.slice(0, limit);
   const entries = [];
   for (const fileId of served) {
-    const candidate = await readCandidate(root, fileId);
+    const candidate = await readCandidateFrom(dirs, fileId);
     if (candidate) entries.push({ fileId, candidate });
   }
   const unreadableInSlice = served.length - entries.length;
@@ -473,7 +596,12 @@ export async function listCandidateIdentityPage(root: string, limit: number): Pr
  * that disagree with what `review list` actually shows. Malformed JSON files
  * are skipped here exactly as they are by listCandidates.
  */
-export async function countCandidates(root: string): Promise<number> {
-  const candidates = await listCandidates(root);
+export function countCandidates(root: string): Promise<number> {
+  return countCandidatesFrom(diskLocalRecordDirs(root));
+}
+
+/** {@link countCandidates} through `dirs`: the length of the tolerant, NON-strict list. */
+export async function countCandidatesFrom(dirs: LegacyLocalRecordDirs): Promise<number> {
+  const candidates = await listCandidatesFrom(dirs);
   return candidates.length;
 }

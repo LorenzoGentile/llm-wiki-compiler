@@ -26,8 +26,8 @@
  */
 
 import path from "node:path";
-import { collectAllPages, type PageScope } from "./rules-shared.js";
-import { listLinkResolvablePendingSlugs } from "../compiler/candidates.js";
+import { collectAllPagesFrom, diskLintLinkSources, type LintLinkSources, type PageScope } from "./rules-shared.js";
+import { listLinkResolvablePendingSlugsFrom } from "../compiler/candidate-read.js";
 import { parseFrontmatter, slugify } from "../utils/markdown.js";
 import { findWikilinks } from "../wiki/wikilinks.js";
 
@@ -73,15 +73,23 @@ function pagesByTitleSlug(
  * @returns One entry per broken link: a concrete edit, or a recommendation.
  */
 export async function planLintFixes(root: string, scope: PageScope = "wiki-wide"): Promise<LintFixPlanV1[]> {
+  return planLintFixesFrom(diskLintLinkSources(root), scope);
+}
+
+/**
+ * {@link planLintFixes} through `sources`: THE ONE BODY. It holds no project
+ * root; the sources are the SAME ones the broken-wikilink rule reads.
+ */
+export async function planLintFixesFrom(sources: LintLinkSources, scope: PageScope = "wiki-wide"): Promise<LintFixPlanV1[]> {
   // Fix preview is an explicit new surface. Its scope matches the expanded
   // check exposed by tiered CLI lint, not the unchanged legacy flat command.
-  const pages = await collectAllPages(root, scope);
+  const pages = await collectAllPagesFrom(sources.pages, scope);
   const existing = new Set(pages.map((page) => path.basename(page.filePath, ".md").toLowerCase()));
   // The SAME pending set the linter consults: a link the linter reports as
   // info-level pending-target is not broken, and "cannot be repaired
   // automatically" would be wrong advice about a page that is merely awaiting
   // review. The two authorities must disagree about NO link.
-  const pending = await listLinkResolvablePendingSlugs(root);
+  const pending = await listLinkResolvablePendingSlugsFrom(sources.candidates);
   const byTitle = pagesByTitleSlug(pages);
   const plans: LintFixPlanV1[] = [];
   for (const page of pages) {

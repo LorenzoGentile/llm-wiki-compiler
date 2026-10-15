@@ -23,13 +23,22 @@
  * or binding through the shared {@link settleProduct} allowlist; the scaffolder
  * refuses any directory whose path escapes the project root (e.g. via a
  * pre-existing symlink) before creating it.
+ *
+ * ONE BODY. {@link productInitCommandWith} decides over {@link ProductInitSteps},
+ * none of which takes a project root: install, then activate the installed
+ * digest, then the re-resolve and its changed-identity refusal, then the scaffold
+ * set derived from that one snapshot, then the report. Install, the self-locking
+ * activation and the confined scaffolder are MECHANISM steps.
  */
 
-import { activateProductLocked } from "../../products/binding/activate.js";
+import { activateProductLocked, type ActivateResultV1 } from "../../products/binding/activate.js";
 import { ProductActivationError } from "../../products/binding/problems.js";
-import { resolveActiveProduct } from "../../products/binding/resolve.js";
+import {
+  resolveActiveProduct, resolveActiveProductFrom, type ActiveProductResolution, type ActiveProductSources,
+} from "../../products/binding/resolve.js";
+import type { PrincipalRefV1 } from "../../products/binding/types.js";
 import { withQuietJson } from "../../cli/shared.js";
-import { installLocalProductPackage } from "../../products/packages/install.js";
+import { installLocalProductPackage, type ProductInstallResultV1 } from "../../products/packages/install.js";
 import type { Sha256Digest } from "../../products/ids.js";
 import {
   scaffoldConfinedDirectories, type ScaffoldDirectoriesResultV1,
@@ -50,6 +59,35 @@ interface ColdInitResultV1 {
   readonly scaffold: ScaffoldDirectoriesResultV1;
 }
 
+/** What `product init` asks of the project. No member takes a project root. */
+export interface ProductInitSteps {
+  /** MECHANISM: install the operator's package directory. */
+  install(sourceDir: string): Promise<ProductInstallResultV1>;
+  /** MECHANISM: activate one installed digest; takes and releases the project lock itself. */
+  activate(packageDigest: Sha256Digest, principal: PrincipalRefV1): Promise<ActivateResultV1>;
+  /** The ONE active-product resolution. */
+  resolveActive(): Promise<ActiveProductResolution>;
+  /** MECHANISM: create each directory, confined, refusing any that escapes. */
+  scaffold(relDirs: readonly string[]): Promise<ScaffoldDirectoriesResultV1>;
+}
+
+/** LOCAL DISK. The incumbent install, activation, resolution and scaffolder for `root`, each called when asked. */
+function diskProductInitSteps(root: string): ProductInitSteps {
+  return {
+    install: (sourceDir) => installLocalProductPackage(root, sourceDir),
+    activate: (packageDigest, principal) => activateProductLocked(root, packageDigest, principal),
+    resolveActive: () => resolveActiveProduct(root),
+    scaffold: (relDirs) => scaffoldConfinedDirectories(root, relDirs),
+  };
+}
+
+/** The resolution over its own body and sources, with the caller's mechanisms. Building it does no I/O. */
+export function productInitStepsOver(
+  active: ActiveProductSources, mechanisms: Pick<ProductInitSteps, "install" | "activate" | "scaffold">,
+): ProductInitSteps {
+  return { ...mechanisms, resolveActive: () => resolveActiveProductFrom(active) };
+}
+
 /**
  * Install, activate, then scaffold the active profile's entity directories.
  *
@@ -63,20 +101,18 @@ interface ColdInitResultV1 {
  *
  * Throws a typed product/binding problem the caller settles to a refusal, or a
  * hard fault if a scaffold target escapes the root.
- * @param root - The project root to initialize.
+ * @param steps - The project steps.
  * @param sourceDir - The operator-supplied package directory.
  * @param onActivated - Test-only seam run between activation and the re-verify,
  *   used to witness the concurrent-reactivation guard deterministically.
  */
 async function coldInitProject(
-  root: string, sourceDir: string, onActivated?: () => Promise<void>,
+  steps: ProductInitSteps, sourceDir: string, onActivated?: () => Promise<void>,
 ): Promise<ColdInitResultV1> {
-  const install = await installLocalProductPackage(root, sourceDir);
-  const activation = await activateProductLocked(
-    root, install.packageDigest, CLI_ACTIVATION_PRINCIPAL,
-  );
+  const install = await steps.install(sourceDir);
+  const activation = await steps.activate(install.packageDigest, CLI_ACTIVATION_PRINCIPAL);
   if (onActivated !== undefined) await onActivated();
-  const active = await resolveActiveProduct(root);
+  const active = await steps.resolveActive();
   if (active.mode !== "product" || active.binding.packageDigest !== activation.packageDigest) {
     const now = active.mode === "product" ? active.binding.packageDigest : active.mode;
     throw new ProductActivationError(
@@ -84,7 +120,7 @@ async function coldInitProject(
     );
   }
   const entityDirs = Object.values(active.loaded.profile.entities).map((entity) => entity.directory);
-  const scaffold = await scaffoldConfinedDirectories(root, entityDirs);
+  const scaffold = await steps.scaffold(entityDirs);
   return {
     status: "initialized",
     productId: activation.productId,
@@ -119,9 +155,16 @@ function initPresentation(outcome: ColdInitResultV1 | ProductRefusalV1): Product
 export async function productInitCommand(
   root: string, sourceDir: string, options: ProductPackageOptions = {},
 ): Promise<number> {
+  return productInitCommandWith(diskProductInitSteps(root), sourceDir, options);
+}
+
+/** {@link productInitCommand} over {@link ProductInitSteps}: THE ONE BODY. */
+export async function productInitCommandWith(
+  steps: ProductInitSteps, sourceDir: string, options: ProductPackageOptions = {},
+): Promise<number> {
   const json = options.json === true;
   return withQuietJson(json, async () => {
-    const outcome = await settleProduct(() => coldInitProject(root, sourceDir));
+    const outcome = await settleProduct(() => coldInitProject(steps, sourceDir));
     return emitProduct(outcome, json, initPresentation(outcome));
   });
 }

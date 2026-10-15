@@ -10,9 +10,14 @@
  *
  * A healthy (`ok`) journal yields zero findings, so the default lint output
  * stays byte-identical (parity-safe).
+ *
+ * `checkJournalHealthFrom` is THE ONE BODY and holds no project root; the
+ * root-taking `checkJournalHealth` builds the local disk journal sources for
+ * that one call and delegates.
  */
 
-import { journalHealthWarning } from "../trust/journal-health-warning.js";
+import { diskJournalReadSources, type JournalReadSources } from "../trust/journal-classify.js";
+import { journalHealthWarningFrom } from "../trust/journal-health-warning.js";
 import { LLMWIKI_DIR } from "../utils/constants.js";
 import type { LintResult } from "./types.js";
 
@@ -29,7 +34,12 @@ const JOURNAL_REL_PATH = `${LLMWIKI_DIR}/journal`;
  * @returns A single-element result list when degraded; empty when healthy.
  */
 export async function checkJournalHealth(root: string): Promise<LintResult[]> {
-  const warning = await journalHealthWarning(root);
+  return checkJournalHealthFrom(diskJournalReadSources(root));
+}
+
+/** {@link checkJournalHealth} through `sources`: THE ONE BODY. */
+export async function checkJournalHealthFrom(sources: JournalReadSources): Promise<LintResult[]> {
+  const warning = await journalHealthWarningFrom(sources);
   if (warning === null) return [];
   return [
     {

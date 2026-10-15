@@ -17,7 +17,9 @@
  * keep that surface read-only.
  */
 
-import { journalHealth } from "./journal-health.js";
+import { diskJournalReadSources } from "./journal-classify.js";
+import type { JournalReadSources } from "./journal-classify.js";
+import { journalHealthFrom } from "./journal-health.js";
 
 /** Stable warning code for a `pending` journal (an incomplete compile to recover). */
 export const INCOMPLETE_COMPILE_CODE = "incomplete-compile" as const;
@@ -69,7 +71,12 @@ export interface JournalWarning extends ReadSurfaceWarning {
  * @returns The journal warning, or `null` when the journal is healthy.
  */
 export async function journalHealthWarning(root: string): Promise<JournalWarning | null> {
-  const { status } = await journalHealth(root);
+  return journalHealthWarningFrom(diskJournalReadSources(root));
+}
+
+/** {@link journalHealthWarning} over {@link JournalReadSources}: the one mapping, on the one health body. */
+export async function journalHealthWarningFrom(sources: JournalReadSources): Promise<JournalWarning | null> {
+  const { status } = await journalHealthFrom(sources);
   if (status === "pending") {
     return { code: INCOMPLETE_COMPILE_CODE, message: INCOMPLETE_COMPILE_MESSAGE };
   }

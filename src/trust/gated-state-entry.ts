@@ -16,18 +16,45 @@
  * forever instead of hard-failing. A relation Unmet still short-circuits (the artifact
  * enforcer need not run — nothing beats a denial), but a relation park no longer
  * preempts an artifact denial discovered afterward.
+ *
+ * ONE BODY: {@link enforceGatedStateEntryFrom} owns the order, the capture of
+ * exactly the four known outcomes and the ranking over {@link GatedStateEntryChecks},
+ * the two enforcers as whole operations. The root form keeps its signature and
+ * passes the exported root enforcers, called at call time, each of which runs its
+ * own root-free body over its own store reads.
  */
 import {
   RelationPreconditionUnmetError,
   RelationPreconditionUnverifiableError,
   enforceRelationPreconditions,
+  type EnforceRelationPreconditionsArgs,
 } from "../relations/enforce-precondition.js";
 import {
   ArtifactPreconditionUnmetError,
   ArtifactPreconditionUnverifiableError,
   enforceArtifactPreconditions,
+  type EnforceArtifactPreconditionsArgs,
 } from "../artifacts/enforce-precondition.js";
 import type { LifecycleDef, ProfilePack } from "../profile/types.js";
+
+/**
+ * The two state-entry checks the seam ranks. No member takes a project root. Each
+ * resolves on a pass and throws its own Unmet/Unverifiable outcome otherwise.
+ */
+export interface GatedStateEntryChecks {
+  /** Relation-count preconditions. Local: `enforceRelationPreconditions({ root, ...args })`. */
+  relations(args: Omit<EnforceRelationPreconditionsArgs, "root">): Promise<void>;
+  /** Artifact-existence preconditions. Local: `enforceArtifactPreconditions({ root, ...args })`. */
+  artifacts(args: Omit<EnforceArtifactPreconditionsArgs, "root">): Promise<void>;
+}
+
+/** LOCAL DISK. The two exported root enforcers for one root, built per call; each called when asked. */
+function diskGatedStateEntryChecks(root: string): GatedStateEntryChecks {
+  return {
+    relations: (args) => enforceRelationPreconditions({ root, ...args }),
+    artifacts: (args) => enforceArtifactPreconditions({ root, ...args }),
+  };
+}
 
 /** Inputs to {@link enforceGatedStateEntry}; the caller has already resolved `enteredState` to a real state string. */
 export interface GatedStateEntryInput {
@@ -71,15 +98,23 @@ async function capturePrecondition(fn: () => Promise<void>): Promise<Error | und
  * @throws {ArtifactPreconditionUnmetError|ArtifactPreconditionUnverifiableError}
  */
 export async function enforceGatedStateEntry(input: GatedStateEntryInput): Promise<void> {
-  const { root, profile, entityType, slug, enteredState, lifecycle, meta } = input;
+  const { root, ...request } = input;
+  return enforceGatedStateEntryFrom(diskGatedStateEntryChecks(root), request);
+}
+
+/** {@link enforceGatedStateEntry} over {@link GatedStateEntryChecks}: THE ONE BODY (relation, then artifact, then the ranking). */
+export async function enforceGatedStateEntryFrom(
+  checks: GatedStateEntryChecks, input: Omit<GatedStateEntryInput, "root">,
+): Promise<void> {
+  const { profile, entityType, slug, enteredState, lifecycle, meta } = input;
   const relationError = await capturePrecondition(() =>
-    enforceRelationPreconditions({ root, profile, entityType, slug, enteredState, lifecycle }),
+    checks.relations({ profile, entityType, slug, enteredState, lifecycle }),
   );
   // Nothing beats a relation denial — the artifact enforcer need not run.
   if (relationError instanceof RelationPreconditionUnmetError) throw relationError;
 
   const artifactError = await capturePrecondition(() =>
-    enforceArtifactPreconditions({ root, profile, entityType, slug, enteredState, lifecycle, meta }),
+    checks.artifacts({ profile, entityType, slug, enteredState, lifecycle, meta }),
   );
   // An artifact denial beats a held relation park — THE fix.
   if (artifactError instanceof ArtifactPreconditionUnmetError) throw artifactError;

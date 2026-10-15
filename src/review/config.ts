@@ -36,7 +36,15 @@ const MODE_VALUES = new Set<ReviewPolicyMode>([
 
 /** Load and normalize review policy from `.llmwiki/config.json`. */
 export async function loadReviewPolicy(root: string): Promise<ReviewPolicy> {
-  const raw = await loadProjectConfig(root);
+  return reviewPolicyFromConfig(await loadProjectConfig(root));
+}
+
+/**
+ * The review policy for project configuration already read, or the off policy
+ * when the project has no configuration. Shared by every reader of a project's
+ * configuration so "no config" means the same policy everywhere.
+ */
+export function reviewPolicyFromConfig(raw: Record<string, unknown> | null): ReviewPolicy {
   return raw === null ? { ...REVIEW_POLICY_OFF } : normalizeReviewPolicy(raw);
 }
 

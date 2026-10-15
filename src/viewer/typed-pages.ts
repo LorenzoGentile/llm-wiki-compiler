@@ -27,12 +27,21 @@
  * field contract is not promoted to a real graph node, and is likewise not
  * offered as a readable page. It stays visible as a `field-violation` problem in
  * the envelope's `profileProblems`.
+ *
+ * ONE BODY: {@link collectTypedViewerInputs} runs
+ * {@link collectTypedViewerInputsFrom} over local-disk {@link TypedViewerSources}.
+ * The default-profile gate, declaration order, the invalid-page filter, the edge
+ * projection and "any relation failure is no edges" are decided here.
  */
 
-import { collectEntityPages, invalidEntityPagePaths } from "../profile/collect.js";
-import { loadNonDefaultProfile } from "../profile/block.js";
+import { collectEntityPagesFrom, invalidEntityPagePaths } from "../profile/collect.js";
+import { loadNonDefaultProfileFrom } from "../profile/block.js";
+import { diskEffectiveProfileSources, type EffectiveProfileSources } from "../profile/load.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../utils/jsonl-store.js";
 import { buildPipelineDefinitions } from "./pipeline.js";
-import { readLiveValidRelations } from "../relations/live-valid.js";
+import { readLiveValidRelationsFrom } from "../relations/live-valid.js";
 import type { EntityPageNode, GraphBuildOptions, RelationEdge } from "./graph.js";
 import type { PipelineDefinitions } from "./pipeline.js";
 import type { EntityPage, ProfilePack } from "../profile/types.js";
@@ -69,9 +78,32 @@ export interface TypedViewerInputs {
 export async function collectTypedViewerInputs(
   root: string,
 ): Promise<TypedViewerInputs | undefined> {
-  const loaded = await loadNonDefaultProfile(root);
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return collectTypedViewerInputsFrom({
+    profile: diskEffectiveProfileSources(root), scans: diskLocalEntityScans(root), graph: diskGraphStoreReads(root),
+  });
+}
+
+/** Everything {@link collectTypedViewerInputsFrom} reads. Nothing ties the three to one project; production builds all from one root. */
+export interface TypedViewerSources {
+  /** The effective profile; the built-in default ends the read before anything else is asked. */
+  profile: EffectiveProfileSources;
+  /** The declared entity directories, through the existing entity-scan binding. */
+  scans: LegacyLocalEntityScans;
+  /** The relation store, through the graph-store read. */
+  graph: GraphStoreReads;
+}
+
+/**
+ * {@link collectTypedViewerInputs} over {@link TypedViewerSources}: THE ONE BODY.
+ * The profile is loaded once; for the built-in default nothing else is read.
+ */
+export async function collectTypedViewerInputsFrom(
+  sources: TypedViewerSources,
+): Promise<TypedViewerInputs | undefined> {
+  const loaded = await loadNonDefaultProfileFrom(sources.profile);
   if (loaded === undefined) return undefined;
-  const { pages, problems } = await collectEntityPages(root, loaded.profile);
+  const { pages, problems } = await collectEntityPagesFrom(sources.scans, loaded.profile);
   const invalid = invalidEntityPagePaths(problems);
   const valid = pages.filter((page) => !invalid.has(page.filePath));
   return {
@@ -79,7 +111,7 @@ export async function collectTypedViewerInputs(
     pages: valid,
     graph: {
       entityPages: valid.map(toEntityPageNode),
-      relations: await readTypedRelations(root, loaded.profile),
+      relations: await readTypedRelations(sources.graph, loaded.profile),
     },
     pipeline: buildPipelineDefinitions(loaded.profile),
     artifactDefinitions: structuredClone(loaded.profile.artifacts ?? {}),
@@ -110,9 +142,9 @@ function toEntityPageNode(page: EntityPage): EntityPageNode {
  * and the graph agrees with status/export/lint (which exclude the same
  * profile-invalid relations) instead of reanimating stale edges.
  */
-async function readTypedRelations(root: string, profile: ProfilePack): Promise<RelationEdge[]> {
+async function readTypedRelations(graph: GraphStoreReads, profile: ProfilePack): Promise<RelationEdge[]> {
   try {
-    const valid = await readLiveValidRelations(root, profile);
+    const valid = await readLiveValidRelationsFrom(graph, profile);
     return valid.map((rel) => {
       const def = profile.relations?.[rel.type];
       return {

@@ -3,6 +3,9 @@
  * @description Pass-one quarantine/reset classification from one closed unit
  * observation. Only current-key-authenticated records can settle active work;
  * old receipts remain candidates for pass-two retirement reconciliation.
+ *
+ * ONE BODY, {@link classifyQuarantinePassOneFrom}, over the classifiers' leaf-read
+ * seam; the root form passes the namespace's confined disk reads.
  */
 
 import path from "node:path";
@@ -20,10 +23,6 @@ import {
   type LifecycleUnitObservation,
 } from "../lifecycle-fs/observe.js";
 import {
-  lifecycleRegularLeaf,
-  readLifecycleLeaf,
-} from "../lifecycle-fs/leaf-observation.js";
-import {
   lifecycleQuarantineUnitPaths,
 } from "../lifecycle-fs/paths.js";
 import type { CapturedLifecycleKey } from "../lifecycle-fs/key-observation.js";
@@ -40,7 +39,9 @@ import {
   quarantineProgress,
 } from "./postconditions.js";
 import {
+  diskLifecycleLeafReads,
   lifecycleObservationDisposition,
+  type LifecycleLeafReads,
   type LifecyclePassOneUnit,
 } from "./classifier-types.js";
 import type {
@@ -98,6 +99,7 @@ function unavailable(
 
 /** Verify the closed unsigned pre-plan reset grammar. */
 async function prePlanReset(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   observation: LifecycleUnitObservation,
   bounds: LifecycleScanBounds,
@@ -108,33 +110,24 @@ async function prePlanReset(
   const rootNames = observation.directory?.names ?? [];
   if (!rootNames.includes(intent) ||
       rootNames.some((name) => ![intent, pendingKey, bytes].includes(name))) return false;
-  const read = await readLifecycleLeaf({
-    root: namespace.root.realPath,
-    file: paths.resetIntentFile,
-    expectedDir: observation.unitRoot,
-    maxBytes: bounds.maxReceiptBytes,
-  });
+  const read = await reads.readLeaf(paths.resetIntentFile, observation.unitRoot, bounds.maxReceiptBytes);
   if (read.status !== "ok") return false;
   const parsed = parseResetIntent(read.body.toString("utf8"));
   if (parsed.unitId !== observation.unitId) return false;
-  if (!(await validPendingKey(namespace, observation, bounds))) return false;
-  return validPrePlanBytes(namespace, observation, parsed.reason);
+  if (!(await validPendingKey(reads, namespace, observation, bounds))) return false;
+  return validPrePlanBytes(reads, observation, parsed.reason);
 }
 
 /** Validate optional pending reset key syntax without authorizing it. */
 async function validPendingKey(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   observation: LifecycleUnitObservation,
   bounds: LifecycleScanBounds,
 ): Promise<boolean> {
   const names = quarantineNames(namespace, observation.unitId);
   if (!observation.directory?.names.includes(names.pendingKey)) return true;
-  const read = await readLifecycleLeaf({
-    root: namespace.root.realPath,
-    file: names.paths.pendingResetKeyFile,
-    expectedDir: observation.unitRoot,
-    maxBytes: bounds.maxReceiptBytes,
-  });
+  const read = await reads.readLeaf(names.paths.pendingResetKeyFile, observation.unitRoot, bounds.maxReceiptBytes);
   if (read.status !== "ok") return false;
   const pending = parsePendingResetKey(read.body.toString("utf8"));
   return pendingResetKeyShapeValid(pending, observation.unitId);
@@ -160,7 +153,7 @@ function pendingResetKeyShapeValid(
 
 /** Accept empty bytes scaffolding and only the forced flow's old-key leaf. */
 async function validPrePlanBytes(
-  namespace: PreparationLifecycleNamespaceV1,
+  reads: LifecycleLeafReads,
   observation: LifecycleUnitObservation,
   reason: "missing-key" | "unreadable-key-forced",
 ): Promise<boolean> {
@@ -169,8 +162,7 @@ async function validPrePlanBytes(
   if (reason !== "unreadable-key-forced" ||
       observation.bytes.names.length !== 1 ||
       observation.bytes.names[0] !== "old-key") return false;
-  return lifecycleRegularLeaf(
-    namespace.root.realPath,
+  return reads.regularLeaf(
     path.join(observation.bytes.path, "old-key"),
     observation.bytes.path,
   );
@@ -204,6 +196,7 @@ function planInventoryClosed(
 
 /** Classify an authenticated planned quarantine/reset unit. */
 async function classifyAuthenticatedPlan(input: {
+  reads: LifecycleLeafReads;
   namespace: PreparationLifecycleNamespaceV1;
   observation: LifecycleUnitObservation;
   planned: LifecycleReceiptObservation;
@@ -220,7 +213,7 @@ async function classifyAuthenticatedPlan(input: {
   ).bytesRoot;
   if (input.completed === "absent") {
     const state = await quarantineProgress(
-      input.namespace, bytesRoot, plan, input.bounds,
+      input.reads, input.namespace, bytesRoot, plan, input.bounds,
     );
     return activeResult(input.observation, operation, state);
   }
@@ -229,7 +222,7 @@ async function classifyAuthenticatedPlan(input: {
   }
   const completion = input.completed.receipt as QuarantineReceiptV1;
   const custody = await quarantineCompletedCustody(
-    input.namespace, bytesRoot, completion, input.bounds,
+    input.reads, bytesRoot, completion, input.bounds,
   );
   return {
     unit: {
@@ -259,6 +252,7 @@ function activeResult(
 
 /** Classify one quarantine unit in pass one. */
 async function classifyQuarantineRecords(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   observation: LifecycleUnitObservation,
   key: CapturedLifecycleKey,
@@ -266,17 +260,17 @@ async function classifyQuarantineRecords(
 ): Promise<LifecyclePassOneUnit> {
   const names = quarantineNames(namespace, observation.unitId);
   const planned = await observeBoundLifecycleReceipt(
-    namespace, names.paths.plannedReceiptFile, observation.unitRoot,
+    reads, names.paths.plannedReceiptFile, observation.unitRoot,
     observation.unitId, "quarantine-planned", key, bounds,
   );
   if (planned === "absent") {
-    if (await prePlanReset(namespace, observation, bounds)) {
+    if (await prePlanReset(reads, namespace, observation, bounds)) {
       return activeResult(observation, "project-key-reset", "awaiting-continuation");
     }
     return unavailable(namespace, observation, "nonempty quarantine unit has no authenticated plan");
   }
   const completed = await observeBoundLifecycleReceipt(
-    namespace, names.paths.completedReceiptFile, observation.unitRoot,
+    reads, names.paths.completedReceiptFile, observation.unitRoot,
     observation.unitId, "quarantine-completed", key, bounds,
   );
   if (!planned.authenticated) {
@@ -290,7 +284,7 @@ async function classifyQuarantineRecords(
     );
   }
   return classifyAuthenticatedPlan({
-    namespace, observation, planned, completed, bounds,
+    reads, namespace, observation, planned, completed, bounds,
   });
 }
 
@@ -306,6 +300,16 @@ interface QuarantineClassifierInput {
 export async function classifyQuarantinePassOne(
   input: QuarantineClassifierInput,
 ): Promise<LifecyclePassOneUnit> {
+  return classifyQuarantinePassOneFrom(diskLifecycleLeafReads(input.namespace), input);
+}
+
+/**
+ * {@link classifyQuarantinePassOne} over {@link LifecycleLeafReads}: THE ONE BODY.
+ * The namespace is the path schema only; every leaf it names is read through `reads`.
+ */
+export async function classifyQuarantinePassOneFrom(
+  reads: LifecycleLeafReads, input: QuarantineClassifierInput,
+): Promise<LifecyclePassOneUnit> {
   const { namespace, observation, key, bounds } = input;
   const disposition = lifecycleObservationDisposition(observation);
   if (disposition.status === "unavailable") {
@@ -313,7 +317,7 @@ export async function classifyQuarantinePassOne(
   }
   if (disposition.status === "inert") return activeResult(observation, null, "inert");
   try {
-    return await classifyQuarantineRecords(namespace, observation, key, bounds);
+    return await classifyQuarantineRecords(reads, namespace, observation, key, bounds);
   } catch (error) {
     const code = error instanceof LifecycleReceiptReadError ||
       error instanceof LifecyclePostconditionError ? error.code : "unit-unavailable";

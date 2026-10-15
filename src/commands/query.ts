@@ -14,28 +14,33 @@
  * `refs`/`selectedPages`) are built from the HYDRATED pages — the ones actually
  * rendered into the prompt — so a selected page that failed to hydrate is never
  * reported as grounding; it surfaces as a `page-hydration-dropped` warning.
+ *
+ * The CLI controller has ONE BODY, {@link queryCommandWith}, over
+ * {@link QueryCommandSteps}, none of which takes a project root: the save-option
+ * refusal, the missing-index guard (a message and a normal return, never a
+ * thrown error or a non-zero exit), then the answer and its presentation.
  */
 
-import { existsSync } from "fs";
 import path from "path";
 import { callClaude } from "../utils/llm.js";
+import { locationExistsSync } from "../storage/disk-locations.js";
 import { safeReadFile, parseFrontmatter } from "../utils/markdown.js";
 import { languageDirective } from "../utils/output-language.js";
 import * as output from "../utils/output.js";
 import { verbose } from "../utils/output.js";
 import { INDEX_FILE, CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
-import { loadSelectedRefRecords } from "../search/retrieval.js";
 import { slugFromPageId, type PageId } from "../utils/page-id.js";
 import type { PageRecordWithId } from "../utils/page-registry.js";
-import { selectRelevantPages, type SelectedPages } from "./query-selection.js";
+import type { SelectedPages } from "./query-selection.js";
 import { timeStage } from "../utils/stage-timing.js";
-import { maybeSaveQueryPage, assertQuerySaveOptions } from "./query-publication.js";
+import { assertQuerySaveOptions } from "./query-publication.js";
 export { assertQuerySaveOptions } from "./query-publication.js";
 import { buildQueryDocument } from "./query-document.js";
-import { printAnswerCitationReport, reportQueryAnswerCitations } from "./query-citation-report.js";
+import { printAnswerCitationReport } from "./query-citation-report.js";
+import { diskQueryAnswerReads, type QueryAnswerReads } from "./query-reads.js";
 // Preserve the existing summary helper import for consumers/tests.
 export { summarizeAnswer } from "./query-save.js";
-import { appendLog, formatWikilinkList } from "../utils/activity-log.js";
+import { formatWikilinkList } from "../utils/activity-log.js";
 import type { ChunkCitation, QueryResult, QueryWarning, RetrievalDebug } from "../utils/types.js";
 
 /** Directories to search when loading selected pages, in priority order. */
@@ -165,15 +170,29 @@ export async function generateAnswer(
   question: string,
   options: GenerateAnswerOptions = {},
 ): Promise<QueryResult> {
+  return generateAnswerFrom(diskQueryAnswerReads(root), question, options);
+}
+
+/**
+ * {@link generateAnswer} over {@link QueryAnswerReads}: THE ONE BODY. Nothing
+ * here takes a project root. The steps are taken in this order: the index
+ * look, selection, hydration, then (with grounding) the answer LLM, the
+ * citation report, publication and the activity log.
+ */
+export async function generateAnswerFrom(
+  reads: QueryAnswerReads,
+  question: string,
+  options: GenerateAnswerOptions = {},
+): Promise<QueryResult> {
   // `review` without `save` is rejected by the user-facing query surfaces (the
   // CLI action, `queryCommand`, and the SDK facade's `wiki.query`). This lower-
   // level function is also exported for compatibility, and here `review` alone
   // only selects review-mode grounding; nothing is published unless `save` is set.
-  if (!existsSync(path.join(root, INDEX_FILE))) {
+  if (!(await reads.indexPresent())) {
     throw new Error("Wiki index not found. Run `llmwiki compile` first.");
   }
 
-  const selection = await timeStage("query.retrieval", () => selectRelevantPages(root, question, Boolean(options.debug), options.pageScope, {
+  const selection = await timeStage("query.retrieval", () => reads.select(question, Boolean(options.debug), options.pageScope, {
     embeddingFailure: options.embeddingFailure ?? "fallback",
   }));
   // Human/log surfaces use the QUALIFIED pageId so same-slug pages
@@ -186,7 +205,7 @@ export async function generateAnswer(
   // Hydrate via the qualified-id loader (confined, namespace-correct per pageId):
   // a `papers/foo` ref loads wiki/<papers-dir>/foo.md, never wiki/concepts/foo.md.
   // The live pairs are the grounding identity: only pages the model is shown.
-  const hydratedPairs = await loadSelectedRefRecords(root, selection.refs);
+  const hydratedPairs = await reads.hydrate(selection.refs);
   const pagesContent = renderRefRecords(hydratedPairs);
   verbose(`context pack: ${pagesContent.length} chars`);
 
@@ -202,8 +221,8 @@ export async function generateAnswer(
   // Advisory citation report over the canonical saved body: a snapshot for the
   // caller, never permission to publish. Its failure preserves the answer.
   const { document, body } = buildQueryDocument(question, answer, new Date().toISOString());
-  const citationFields = await reportQueryAnswerCitations(root, body);
-  const publication = await maybeSaveQueryPage({ root, question, answer, save: Boolean(options.save), review: options.review, document });
+  const citationFields = await reads.answerCitations(body);
+  const publication = await reads.publish({ question, answer, save: Boolean(options.save), review: options.review, document });
 
   // Preserve the public activity log for ordinary CLI/MCP questions, even when
   // not saved as pages. Explicitly scoped reads and review proposals retain
@@ -211,9 +230,7 @@ export async function generateAnswer(
   // Log only after generation succeeds, naming only the hydrated grounding.
   const resultFields = buildResultFields(selection, hydratedPairs);
   if (options.review !== true && (options.save === true || options.pageScope === undefined)) {
-    await appendLog(root, "query", question, {
-      details: resultFields.pageIds.length > 0 ? [`Pages: ${formatWikilinkList(resultFields.pageIds)}`] : [],
-    });
+    await reads.log(question, resultFields.pageIds.length > 0 ? [`Pages: ${formatWikilinkList(resultFields.pageIds)}`] : []);
   }
 
   return { answer, ...publication, ...resultFields, ...citationFields };
@@ -284,6 +301,30 @@ function warningsField(
   return warnings.length === 0 ? {} : { warnings };
 }
 
+/** The options the `query` command accepts. */
+type QueryCommandOptions = { save?: boolean; debug?: boolean; review?: boolean };
+
+/** What `llmwiki query` asks of the project. No member takes a project root. */
+export interface QueryCommandSteps {
+  /** Whether the compiled wiki index exists; answered synchronously, as the guard always was. */
+  indexExists(): boolean;
+  /** The answer to `question`, generated over the project. */
+  answer(question: string, options: GenerateAnswerOptions): Promise<QueryResult>;
+}
+
+/** LOCAL DISK. The incumbent index look and answer pipeline for `root`, each called when asked. */
+function diskQueryCommandSteps(root: string): QueryCommandSteps {
+  return {
+    indexExists: () => locationExistsSync(path.join(root, INDEX_FILE)),
+    answer: (question, options) => generateAnswer(root, question, options),
+  };
+}
+
+/** The answer over its own body and reads, with the caller's index look. Building it does no I/O. */
+export function queryCommandStepsOver(reads: QueryAnswerReads, indexExists: () => boolean): QueryCommandSteps {
+  return { indexExists, answer: (question, options) => generateAnswerFrom(reads, question, options) };
+}
+
 /**
  * Run a two-step LLM-powered query against the knowledge wiki.
  * @param root - Absolute path to the project root directory.
@@ -293,17 +334,26 @@ function warningsField(
 export default async function queryCommand(
   root: string,
   question: string,
-  options: { save?: boolean; debug?: boolean; review?: boolean },
+  options: QueryCommandOptions,
+): Promise<void> {
+  return queryCommandWith(diskQueryCommandSteps(root), question, options);
+}
+
+/** {@link queryCommand} over {@link QueryCommandSteps}: THE ONE BODY. */
+export async function queryCommandWith(
+  steps: QueryCommandSteps,
+  question: string,
+  options: QueryCommandOptions,
 ): Promise<void> {
   assertQuerySaveOptions(options);
-  if (!existsSync(path.join(root, INDEX_FILE))) {
+  if (!steps.indexExists()) {
     output.status("!", output.error("Wiki index not found. Run `llmwiki compile` first."));
     return;
   }
 
   output.header("Selecting relevant pages");
 
-  const result = await generateAnswer(root, question, {
+  const result = await steps.answer(question, {
     save: options.save,
     review: options.review,
     debug: options.debug,

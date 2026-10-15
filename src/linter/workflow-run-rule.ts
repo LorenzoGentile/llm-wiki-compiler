@@ -17,7 +17,10 @@
  * byte-identical (parity-safe).
  */
 
-import { workflowStatus, type RunStatus } from "../workflow-history/status.js";
+import type { RunStatus } from "../workflow-history/status.js";
+import {
+  diskWorkflowStatusSources, workflowStatusFrom, type WorkflowStatusSources,
+} from "../workflow-history/status-read.js";
 import { LLMWIKI_DIR } from "../utils/constants.js";
 import type { LintResult } from "./types.js";
 
@@ -56,6 +59,11 @@ function toFinding(status: RunStatus): LintResult {
  * @returns One warning per flagged run; empty when every run is healthy / none exist.
  */
 export async function checkWorkflowRunHealth(root: string): Promise<LintResult[]> {
-  const statuses = await workflowStatus(root);
+  return checkWorkflowRunHealthFrom(diskWorkflowStatusSources(root));
+}
+
+/** {@link checkWorkflowRunHealth} over {@link WorkflowStatusSources}: THE ONE BODY. */
+export async function checkWorkflowRunHealthFrom(sources: WorkflowStatusSources): Promise<LintResult[]> {
+  const statuses = await workflowStatusFrom(sources);
   return statuses.filter(isFlagged).map(toFinding);
 }

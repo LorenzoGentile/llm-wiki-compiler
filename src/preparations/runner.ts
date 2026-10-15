@@ -21,6 +21,13 @@
  * property of how many phases happen to be running, and letting it manufacture
  * a retry failure is the load-dependent defect class this program exists to
  * remove. A gate suspension is likewise a resumable state, not a park.
+ *
+ * ONE BODY, {@link runPreparationWith}, over {@link RunnerSteps} (see
+ * `runner-steps.ts`) and an input without a root: every state classification,
+ * refusal, gate dispatch, busy retry, materializer check, no-obligation settle,
+ * manifest classification and handoff error mapping is here. The root forms keep
+ * their signatures, capture the input exactly as before, and pass the local steps
+ * for the captured root.
  */
 
 import { PackMaterializationError } from "../operations-packs/problems.js";
@@ -28,29 +35,24 @@ import { createHash } from "node:crypto";
 import type { OperationAdapterMap } from "../operation-bundles/adapter-registry.js";
 import type { OperationPrincipal } from "../operation-bundles/principal.js";
 import type { Sha256Digest } from "../capability-providers/types.js";
-import { executePhaseAttempt } from "./attempts/execute.js";
 import type {
   AttemptAuthorityResolverV1, AttemptClockV1, AttemptLegRunnerV1,
 } from "./attempts/types.js";
-import { finalizePreparationForHandoff } from "./finalization.js";
-import { handoffPreparation, HandoffError } from "./handoff.js";
+import { HandoffError } from "./handoff.js";
 import {
   MaterializationCaptureError, NoObligationError, captureMaterializationResult, classifyMaterializationManifests,
   type MaterializationResultV1,
 } from "./materialization.js";
-import { handoffRequest, readManifestBack, readPayloadsBack } from "./runner-reconstruct.js";
-import { readPreparationEvidenceBytes } from "./evidence-store.js";
-import { readPreparationManifest } from "./manifest-store.js";
+import { handoffRequest } from "./runner-reconstruct.js";
+import { diskRunnerSteps, type RunnerBodyInputV1, type RunnerSteps } from "./runner-steps.js";
 import { derivePhaseInstanceId, singleExpansionIdentity } from "./ids.js";
-import { driveMapPhase, driveRepeatPhase } from "./fan-out-driver.js";
-import { blockAtGate, resumeFromGate, hasProceedDecision, type GatePhaseV1 } from "./gate-driver.js";
+import { hasProceedDecision, type GatePhaseV1 } from "./gate-driver.js";
 import { canonicalDigest } from "../profile/templates/signing/canonical.js";
 import { parseSha256Digest } from "../capability-providers/ids.js";
 import { phaseIsReady, readyPhaseSchedule } from "./readiness.js";
 import type { PhaseInstanceState } from "./run-types.js";
 import type { NormalizedPhaseV1 } from "./plan-types.js";
 import type { PreparationPolicyContractV1 } from "./selection.js";
-import { appendPreparationTransitionLocked, readPreparationRun } from "./run-store.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
 import type {
   PreparationPrincipalV1, PreparationRunBinding, PreparationRunV1,
@@ -156,13 +158,25 @@ async function runPreparationCore(
   callerInput: RunPreparationInputV1, faults: RunnerFaultsForTestV1 | undefined,
 ): Promise<RunPreparationResultV1> {
   const input = captureRunnerInput(callerInput);
+  return runPreparationWith(diskRunnerSteps(input), input, faults);
+}
+
+/**
+ * {@link runPreparation} over {@link RunnerSteps}: THE ONE BODY. The input is
+ * captured again here, synchronously, so a direct caller gets the same pinned
+ * snapshot the facade takes. In no package index.
+ */
+export async function runPreparationWith(
+  steps: RunnerSteps, callerInput: RunnerBodyInputV1, faults?: RunnerFaultsForTestV1,
+): Promise<RunPreparationResultV1> {
+  const input = captureRunnerBody(callerInput, capturedMaterializer(callerInput));
   // Classify the run state FIRST: a terminal run (cancelled, cancelled-with-effects,
   // failed, …) reports its outcome without ever needing materialization limits, so
   // surfacing `cancelled-with-effects` (unit F) must not depend on the plan's
   // materialization triple. Limits are required only to DRIVE or RECONSTRUCT.
-  const state = await runState(input);
+  const state = await runState(steps, input);
   if (typeof state !== "string") return state;
-  const limits = await declaredMaterializationLimits(input);
+  const limits = await declaredMaterializationLimits(steps, input);
   if (limits === null) {
     return { status: "refused", runId: input.binding.runId, reason: "plan does not declare the materialization limits" };
   }
@@ -173,15 +187,15 @@ async function runPreparationCore(
     if (input.materializer.handlerContractDigest !== input.handlerContractDigest) {
       return { status: "refused", runId: input.binding.runId, reason: "materializer contract does not match the plan pin" };
     }
-    const driven = await drivePhases(input);
+    const driven = await drivePhases(steps, input);
     if (driven !== null) return driven;
-    const finalized = await materializeAndFinalize(input, input.materializer, limits);
+    const finalized = await materializeAndFinalize(steps, input, input.materializer, limits);
     if (finalized !== null) return finalized;
     // TEST-ONLY crash seam: finalization has committed the run to `handoff-ready`,
     // the hand-off has NOT started. Undefined (a no-op) in production.
     await faults?.afterFinalized?.();
   }
-  return reconstructAndHandoff(input, limits, faults);
+  return reconstructAndHandoff(steps, input, limits, faults);
 }
 
 /**
@@ -191,12 +205,23 @@ async function runPreparationCore(
  * later method swap on the caller's retained object changes nothing here).
  */
 function captureRunnerInput(input: RunPreparationInputV1): RunPreparationInputV1 {
-  const materializer = input.materializer === undefined ? undefined : {
+  // The incumbent read order: the materializer, then the root, then the rest.
+  const materializer = capturedMaterializer(input);
+  const root = input.root;
+  return { root, ...captureRunnerBody(input, materializer) };
+}
+
+/** The materializer, pinned to the function reference present now; absent stays absent. */
+function capturedMaterializer(input: RunnerBodyInputV1): PreparationMaterializerV1 | undefined {
+  return input.materializer === undefined ? undefined : {
     handlerContractDigest: input.materializer.handlerContractDigest,
     materialize: input.materializer.materialize.bind(input.materializer),
   };
+}
+
+/** Everything but the root, captured in the incumbent order, with the already-captured `materializer`. */
+function captureRunnerBody(input: RunnerBodyInputV1, materializer: PreparationMaterializerV1 | undefined): RunnerBodyInputV1 {
   return {
-    root: input.root,
     binding: { ...input.binding },
     ...(materializer === undefined ? {} : { materializer }),
     legFor: input.legFor.bind(input),
@@ -231,9 +256,9 @@ function captureRunnerInput(input: RunPreparationInputV1): RunPreparationInputV1
  * a resumable suspension, never a park (design §7).
  */
 async function runState(
-  input: RunPreparationInputV1,
+  steps: RunnerSteps, input: RunnerBodyInputV1,
 ): Promise<"drive" | "reconstruct" | RunPreparationResultV1> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") {
     return { status: "refused", runId: input.binding.runId, reason: `run unreadable: ${read.status}` };
   }
@@ -272,17 +297,17 @@ function terminalMapping(state: string, runId: string): RunPreparationResultV1 {
 }
 
 /** Drive every unsettled plan phase through one committed attempt; null = done. */
-async function drivePhases(input: RunPreparationInputV1): Promise<RunPreparationResultV1 | null> {
-  const manifest = await readPreparationManifest(input.root, input.binding.workspaceId, input.binding.preparationId);
+async function drivePhases(steps: RunnerSteps, input: RunnerBodyInputV1): Promise<RunPreparationResultV1 | null> {
+  const manifest = await steps.readManifest();
   if (manifest.status !== "ok") {
     return { status: "refused", runId: input.binding.runId, reason: "preparation manifest unreadable" };
   }
   const phases = manifest.manifest.plan.phases;
   const planDigest = parseSha256Digest(canonicalDigest(manifest.manifest.plan));
   for (const phase of readyPhaseSchedule(phases)) {
-    const blocked = await guardReadiness(input, phases, phase);
+    const blocked = await guardReadiness(steps, input, phases, phase);
     if (blocked !== null) return blocked;
-    const outcome = await drivePhase(input, phase, planDigest);
+    const outcome = await drivePhase(steps, input, phase, planDigest);
     if (outcome !== null) return outcome;
   }
   return null;
@@ -302,9 +327,9 @@ const SUCCEEDED_PHASE_STATES: ReadonlySet<PhaseInstanceState> = new Set(["succee
  * the failure.
  */
 async function guardReadiness(
-  input: RunPreparationInputV1, phases: readonly NormalizedPhaseV1[], phase: NormalizedPhaseV1,
+  steps: RunnerSteps, input: RunnerBodyInputV1, phases: readonly NormalizedPhaseV1[], phase: NormalizedPhaseV1,
 ): Promise<RunPreparationResultV1 | null> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") return { status: "refused", runId: input.binding.runId, reason: "run unreadable" };
   if (phaseIsReady(phase, satisfiedPredecessors(read.run, phases))) return null;
   return { status: "blocked", runId: input.binding.runId, reason: `phase ${phase.logicalPhaseId} has an unsatisfied predecessor` };
@@ -327,14 +352,14 @@ function satisfiedPredecessors(run: PreparationRunV1, phases: readonly Normalize
 
 /** Dispatch a phase by its expansion: one instance, or a fanned-out set. */
 async function drivePhase(
-  input: RunPreparationInputV1, phase: NormalizedPhaseV1, planDigest: Sha256Digest,
+  steps: RunnerSteps, input: RunnerBodyInputV1, phase: NormalizedPhaseV1, planDigest: Sha256Digest,
 ): Promise<RunPreparationResultV1 | null> {
-  if (phase.role === "gate") return driveGatePhase(input, phase, planDigest);
+  if (phase.role === "gate") return driveGatePhase(steps, input, phase, planDigest);
   const driveInstance = (logicalPhaseId: string, expansionIdentity: string): Promise<RunPreparationResultV1 | null> =>
-    driveOnePhase(input, logicalPhaseId, expansionIdentity);
-  if (phase.expansion.kind === "map") return driveMapPhase(input, phase, phase.expansion, driveInstance);
-  if (phase.expansion.kind === "bounded-repeat") return driveRepeatPhase(input, phase, phase.expansion, driveInstance);
-  return driveOnePhase(input, phase.logicalPhaseId, singleExpansionIdentity());
+    driveOnePhase(steps, input, logicalPhaseId, expansionIdentity);
+  if (phase.expansion.kind === "map") return steps.driveMap(input, phase, phase.expansion, driveInstance);
+  if (phase.expansion.kind === "bounded-repeat") return steps.driveRepeat(input, phase, phase.expansion, driveInstance);
+  return driveOnePhase(steps, input, phase.logicalPhaseId, singleExpansionIdentity());
 }
 
 /**
@@ -345,7 +370,7 @@ async function drivePhase(
  * outcome the caller drives again after the operator decides.
  */
 async function driveGatePhase(
-  input: RunPreparationInputV1, phase: NormalizedPhaseV1, planDigest: Sha256Digest,
+  steps: RunnerSteps, input: RunnerBodyInputV1, phase: NormalizedPhaseV1, planDigest: Sha256Digest,
 ): Promise<RunPreparationResultV1 | null> {
   const gate: GatePhaseV1 = {
     logicalPhaseId: phase.logicalPhaseId, gateId: phase.gate?.gateId ?? phase.logicalPhaseId,
@@ -355,19 +380,19 @@ async function driveGatePhase(
       expansionIdentity: singleExpansionIdentity(),
     }),
   };
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") return { status: "refused", runId: input.binding.runId, reason: "run unreadable" };
   return hasProceedDecision(read.run, gate)
-    ? resumeDecidedGate(input, gate, read.run.state)
-    : blockUndecidedGate(input, gate, read.run.state);
+    ? resumeDecidedGate(steps, input, gate, read.run.state)
+    : blockUndecidedGate(steps, input, gate, read.run.state);
 }
 
 /** A decided gate: resume `awaiting-gate → running`, or pass through if already resumed. */
 async function resumeDecidedGate(
-  input: RunPreparationInputV1, gate: GatePhaseV1, state: PreparationRunV1["state"],
+  steps: RunnerSteps, input: RunnerBodyInputV1, gate: GatePhaseV1, state: PreparationRunV1["state"],
 ): Promise<RunPreparationResultV1 | null> {
   if (state !== "awaiting-gate") return null; // decided and already resumed — gate passed
-  const moved = await resumeFromGate(input.root, input.binding, gate, input.principal, input.clock.now());
+  const moved = await steps.resumeFromGate(gate, input.principal, input.clock.now());
   return moved.status === "refused"
     ? { status: "refused", runId: input.binding.runId, reason: `gate resume: ${moved.reason}` } : null;
 }
@@ -378,10 +403,10 @@ async function resumeDecidedGate(
  * caller is told "suspended" while no durable gate exists to decide.
  */
 async function blockUndecidedGate(
-  input: RunPreparationInputV1, gate: GatePhaseV1, state: PreparationRunV1["state"],
+  steps: RunnerSteps, input: RunnerBodyInputV1, gate: GatePhaseV1, state: PreparationRunV1["state"],
 ): Promise<RunPreparationResultV1> {
   if (state === "running" || state === "planned") {
-    const moved = await blockAtGate(input.root, input.binding, gate, input.principal, input.clock.now());
+    const moved = await steps.blockAtGate(gate, input.principal, input.clock.now());
     if (moved.status === "refused") {
       return { status: "refused", runId: input.binding.runId, reason: `gate block: ${moved.reason}` };
     }
@@ -392,26 +417,26 @@ async function blockUndecidedGate(
 
 /** One phase to committed, retrying only lock contention; null = settled. */
 async function driveOnePhase(
-  input: RunPreparationInputV1, logicalPhaseId: string, expansionIdentity: string,
+  steps: RunnerSteps, input: RunnerBodyInputV1, logicalPhaseId: string, expansionIdentity: string,
 ): Promise<RunPreparationResultV1 | null> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") return { status: "refused", runId: input.binding.runId, reason: "run unreadable" };
   const phaseInstanceId = derivePhaseInstanceId({
     manifestDigest: input.binding.manifestDigest, logicalPhaseId, expansionIdentity,
   });
   const summary = read.run.phaseSummaries.find((entry) => entry.phaseInstanceId === phaseInstanceId);
   if (summary !== undefined && summary.state !== "pending" && summary.state !== "ready") return null;
-  return attemptUntilSettled(input, phaseInstanceId, logicalPhaseId, summary?.attemptCount ?? 0);
+  return attemptUntilSettled(steps, input, phaseInstanceId, logicalPhaseId, summary?.attemptCount ?? 0);
 }
 
 /** Run attempts, retrying only lock contention under the bound; null = committed. */
 async function attemptUntilSettled(
-  input: RunPreparationInputV1, phaseInstanceId: ReturnType<typeof derivePhaseInstanceId>,
+  steps: RunnerSteps, input: RunnerBodyInputV1, phaseInstanceId: ReturnType<typeof derivePhaseInstanceId>,
   logicalPhaseId: string, attemptIndex: number,
 ): Promise<RunPreparationResultV1 | null> {
   for (let busy = 0; ; busy += 1) {
-    const outcome = await executePhaseAttempt({
-      root: input.root, binding: input.binding, phaseInstanceId, logicalPhaseId,
+    const outcome = await steps.executeAttempt({
+      binding: input.binding, phaseInstanceId, logicalPhaseId,
       attemptIndex, authorityResolver: input.authorityResolver,
       leg: input.legFor(logicalPhaseId), principal: input.principal, clock: input.clock,
     });
@@ -430,12 +455,12 @@ async function attemptUntilSettled(
  * persisted, not from anything the caller holds in memory.
  */
 async function materializeAndFinalize(
-  input: RunPreparationInputV1, materializer: PreparationMaterializerV1,
+  steps: RunnerSteps, input: RunnerBodyInputV1, materializer: PreparationMaterializerV1,
   limits: { manifestBytes: number; payloadBytes: number; evidenceItemBytes: number },
 ): Promise<RunPreparationResultV1 | null> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") return { status: "refused", runId: input.binding.runId, reason: "run unreadable" };
-  const evidence = await readPayloadsBackByRefs(input, read.run, limits.evidenceItemBytes);
+  const evidence = await readPayloadsBackByRefs(steps, input, read.run, limits.evidenceItemBytes);
   if (typeof evidence === "string") return { status: "refused", runId: input.binding.runId, reason: evidence };
   let result: MaterializationResultV1;
   let payloads: Map<string, Buffer>;
@@ -448,7 +473,7 @@ async function materializeAndFinalize(
       payloads.set(createHash("sha256").update(copy).digest("hex"), copy);
     }
   } catch (cause) {
-    if (cause instanceof NoObligationError) return settleWithNoObligation(input, read.run, cause);
+    if (cause instanceof NoObligationError) return settleWithNoObligation(steps, input, read.run, cause);
     // Typed materialization refusals CARRY THEIR ATTRIBUTION (which phase,
     // which completeness class); masking them as "materializer failed" hid
     // the judge lane's stage-1/stage-2 distinction from every caller.
@@ -456,8 +481,8 @@ async function materializeAndFinalize(
       ? cause.message : "materializer failed";
     return { status: "refused", runId: input.binding.runId, reason };
   }
-  const finalized = await finalizePreparationForHandoff({
-    root: input.root, binding: input.binding, result,
+  const finalized = await steps.finalize({
+    binding: input.binding, result,
     operationPrincipal: input.operationPrincipal, handlerContractDigest: input.handlerContractDigest,
     payloads, principal: input.principal, at: input.clock.now(),
   });
@@ -481,11 +506,11 @@ async function materializeAndFinalize(
  * not `handed-off`, which would claim a bundle that does not exist.
  */
 async function settleWithNoObligation(
-  input: RunPreparationInputV1, run: PreparationRunV1, cause: NoObligationError,
+  steps: RunnerSteps, input: RunnerBodyInputV1, run: PreparationRunV1, cause: NoObligationError,
 ): Promise<RunPreparationResultV1> {
   try {
-    await appendPreparationTransitionLocked(
-      input.root, input.binding, preparationRunPredecessor(run),
+    await steps.appendTransition(
+      preparationRunPredecessor(run),
       {
         type: "succeeded", stateAfter: "succeeded", payload: { kind: "none" },
         actor: input.principal, at: input.clock.now(),
@@ -504,22 +529,22 @@ async function settleWithNoObligation(
 
 /** Reconstruct obligations from the persisted manifest and hand off (§3.4). */
 async function reconstructAndHandoff(
-  input: RunPreparationInputV1,
+  steps: RunnerSteps, input: RunnerBodyInputV1,
   limits: { manifestBytes: number; payloadBytes: number },
   faults: RunnerFaultsForTestV1 | undefined,
 ): Promise<RunPreparationResultV1> {
-  const read = await readPreparationRun(input.root, input.binding);
+  const read = await steps.readRun();
   if (read.status !== "ok") return { status: "refused", runId: input.binding.runId, reason: "run unreadable" };
   const classified = classifyMaterializationManifests(read.run.evidenceRefs);
   if (classified.status !== "one") {
     return { status: "refused", runId: input.binding.runId, reason: `materialization manifests: ${classified.status}` };
   }
-  const parsed = await readManifestBack(input, classified.ref.digest, limits.manifestBytes);
+  const parsed = await steps.readManifestBack(classified.ref.digest, limits.manifestBytes);
   if (typeof parsed === "string") return { status: "refused", runId: input.binding.runId, reason: parsed };
-  const payloads = await readPayloadsBack(input, parsed.body, limits.payloadBytes);
+  const payloads = await steps.readPayloadsBack(parsed.body, limits.payloadBytes);
   if (typeof payloads === "string") return { status: "refused", runId: input.binding.runId, reason: payloads };
   try {
-    const settled = await handoffPreparation(input.root, handoffRequest(input, read.run, parsed, payloads, faults));
+    const settled = await steps.handoff(handoffRequest(input, read.run, parsed, payloads, faults));
     return { status: settled.outcome, runId: input.binding.runId, bundleManifestDigest: settled.bundleManifestDigest };
   } catch (cause) {
     if (cause instanceof HandoffError) {
@@ -539,13 +564,12 @@ async function reconstructAndHandoff(
 
 /** R1-read every durable evidence object the run's attempts recorded. */
 async function readPayloadsBackByRefs(
-  input: RunPreparationInputV1, run: PreparationRunV1, itemCap: number,
+  steps: RunnerSteps, input: RunnerBodyInputV1, run: PreparationRunV1, itemCap: number,
 ): Promise<Map<string, Buffer> | string> {
-  const location = { workspaceId: input.binding.workspaceId, preparationId: input.binding.preparationId };
   const evidence = new Map<string, Buffer>();
   for (const ref of run.evidenceRefs) {
     const bare = ref.digest.startsWith("sha256:") ? ref.digest.slice("sha256:".length) : ref.digest;
-    const bytes = await readPreparationEvidenceBytes(input.root, location, bare, itemCap);
+    const bytes = await steps.evidenceBytes(bare, itemCap);
     if (bytes.status !== "ok") return `attempt evidence ${bare} ${bytes.status}`;
     evidence.set(bare, bytes.bytes);
   }
@@ -554,9 +578,9 @@ async function readPayloadsBackByRefs(
 
 /** The declared materialization limits, or null when the plan is not runner-managed. */
 async function declaredMaterializationLimits(
-  input: RunPreparationInputV1,
+  steps: RunnerSteps, input: RunnerBodyInputV1,
 ): Promise<{ manifestBytes: number; payloadBytes: number; evidenceItemBytes: number } | null> {
-  const manifest = await readPreparationManifest(input.root, input.binding.workspaceId, input.binding.preparationId);
+  const manifest = await steps.readManifest();
   if (manifest.status !== "ok") return null;
   const capacity = manifest.manifest.plan.outputContract.handoffCapacity;
   const manifestBytes = capacity?.maximumMaterializationManifestBytes;

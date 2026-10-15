@@ -113,14 +113,24 @@ export function parseManifest(raw: unknown): ArtifactManifest | null {
 /** Sidecar ceiling is independent of the profile's artifact body ceiling. */
 export const ARTIFACT_MANIFEST_MAX_BYTES = 64 * 1024;
 
-export async function readArtifactManifest(root: string, paths: { manifestPath: string; expectedDir: string }, maxBytes = ARTIFACT_MANIFEST_MAX_BYTES): Promise<ManifestRead> {
-  const read = await readConfinedLeaf(root, paths.manifestPath, paths.expectedDir, maxBytes);
+/**
+ * What a manifest leaf read MEANS. `absent` and `unavailable` pass through;
+ * text that is not JSON, or is not a well-shaped manifest, is `malformed`.
+ * PURE: it reads nothing. It is the second half of
+ * {@link readArtifactManifest}, apart so that the resolver, which is handed
+ * the sidecar's text by its own leaf reads, runs this same classification.
+ */
+export function manifestReadOf(read: CappedLeafRead): ManifestRead {
   if (read.kind === "absent") return { kind: "absent" };
   if (read.kind === "unavailable") return { kind: "unavailable" };
   let parsed: unknown;
   try { parsed = JSON.parse(read.body); } catch { return { kind: "malformed" }; }
   const manifest = parseManifest(parsed);
   return manifest ? { kind: "ok", manifest } : { kind: "malformed" };
+}
+
+export async function readArtifactManifest(root: string, paths: { manifestPath: string; expectedDir: string }, maxBytes = ARTIFACT_MANIFEST_MAX_BYTES): Promise<ManifestRead> {
+  return manifestReadOf(await readConfinedLeaf(root, paths.manifestPath, paths.expectedDir, maxBytes));
 }
 
 /**

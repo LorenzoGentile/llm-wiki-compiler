@@ -24,6 +24,8 @@ import { scanPreparationLifecycle } from "../../src/preparations/lifecycle-snaps
 import { lifecycleStagedDeleteName } from "../../src/preparations/paths.js";
 import {
   lifecycleSnapshotFixture,
+  plantPlannedQuarantine,
+  plantRetainedQuarantine,
   quarantineObject,
   writePruneReceipts,
   writeQuarantineReceipts,
@@ -102,13 +104,8 @@ describe("preparation lifecycle snapshot", () => {
 
   it("reports current retained and absent completed custody honestly", async () => {
     const fixture = await lifecycleSnapshotFixture(root.dir);
-    const retained = quarantineObject(fixture.namespace, "qtn-retained");
+    await plantRetainedQuarantine(fixture, "qtn-retained");
     const absent = quarantineObject(fixture.namespace, "qtn-absent");
-    await writeQuarantineReceipts({
-      ...fixture, unitId: "qtn-retained", objects: [retained.object], completed: true,
-    });
-    await mkdir(lifecycleQuarantineUnitPaths(fixture.namespace, "qtn-retained").bytesRoot);
-    await writeFile(retained.destination, retained.body);
     await writeQuarantineReceipts({
       ...fixture, unitId: "qtn-absent", objects: [absent.object], completed: true,
     });
@@ -123,13 +120,8 @@ describe("preparation lifecycle snapshot", () => {
 
   it("distinguishes planned from applying quarantine protocol positions", async () => {
     const fixture = await lifecycleSnapshotFixture(root.dir);
-    const planned = quarantineObject(fixture.namespace, "qtn-planned");
+    await plantPlannedQuarantine(fixture, "qtn-planned");
     const applying = quarantineObject(fixture.namespace, "qtn-applying");
-    await mkdir(planned.source.slice(0, planned.source.lastIndexOf("/")), { recursive: true });
-    await writeFile(planned.source, planned.body);
-    await writeQuarantineReceipts({
-      ...fixture, unitId: "qtn-planned", objects: [planned.object],
-    });
     await writeQuarantineReceipts({
       ...fixture, unitId: "qtn-applying", objects: [applying.object],
     });

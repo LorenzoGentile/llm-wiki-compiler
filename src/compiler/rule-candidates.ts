@@ -10,10 +10,17 @@
  *
  * Candidate JSON is the canonical the rule importer import shape: camelCase keys, tagged
  * evidence, lowercase status/confidence. Do not reshape it for local use.
+ *
+ * ONE BODY PER OPERATION, OVER THE STORE'S OWN LEAVES. The `…From` bodies keep
+ * the JSON shape, validation, the active/archive choice, sorting and the status
+ * flip over {@link RuleCandidateLeaves}, which answers by file id. The root forms
+ * keep their signatures and pass {@link diskRuleCandidateLeaves}: the realpath
+ * confinement, the unconfined atomic write and the archive move stay inside it.
  */
 
 import { createHash } from "node:crypto";
-import { atomicWrite, safeReadFile, slugify } from "../utils/markdown.js";
+import { writeLeafAtomicUnconfined } from "../storage/disk-guarded-leaves.js";
+import { safeReadFile, slugify } from "../utils/markdown.js";
 import {
   candidateFileId,
   listCandidateFileIds,
@@ -66,6 +73,42 @@ function ruleCandidatePath(root: string, id: string): Promise<string> {
 /** Absolute, REALPATH-confined path to the archived JSON file for a rejected rule candidate. */
 function ruleArchivePath(root: string, id: string): Promise<string> {
   return confinedCandidateFilePath(root, RULE_CANDIDATES_ARCHIVE_DIR, id, unsafeRuleCandidateId);
+}
+
+/**
+ * What the rule-candidate operations ask of the store, by file id. An unsafe id
+ * or an escaping candidates directory rejects. No member takes a project root.
+ */
+export interface RuleCandidateLeaves {
+  /** One candidate file's text; the empty string when it is missing or unreadable. */
+  readText(fileId: string, location: "active" | "archive"): Promise<string>;
+  /**
+   * Replace one ACTIVE candidate file with the text `render` returns; the path written.
+   * `render` is called only after the confined path resolved, as the incumbent did.
+   */
+  writeText(fileId: string, render: () => string): Promise<string>;
+  /** Every active candidate file id, or null when the active directory is absent. */
+  listFileIds(): Promise<string[] | null>;
+  /** Move one active candidate file into the archive; true when it existed. */
+  archive(fileId: string): Promise<boolean>;
+}
+
+/** LOCAL DISK: the incumbent confined paths and writes for one root, built per call, each called when asked. In no package index. */
+export function diskRuleCandidateLeaves(root: string): RuleCandidateLeaves {
+  return {
+    readText: async (fileId, location) =>
+      safeReadFile(await (location === "archive" ? ruleArchivePath(root, fileId) : ruleCandidatePath(root, fileId))),
+    writeText: async (fileId, render) => {
+      const target = await ruleCandidatePath(root, fileId);
+      await writeLeafAtomicUnconfined(target, render());
+      return target;
+    },
+    listFileIds: async () => {
+      const dir = await resolveConfinedCandidatesDir(root, RULE_CANDIDATES_DIR);
+      return dir === null ? null : listCandidateFileIds(dir);
+    },
+    archive: async (fileId) => moveCandidateToArchive(await ruleCandidatePath(root, fileId), await ruleArchivePath(root, fileId)),
+  };
 }
 
 /** the rule importer contract caps (mirrored from the rule-import contract rule_candidate_validation.rs). */
@@ -327,10 +370,13 @@ export async function writeRuleCandidate(
   root: string,
   candidate: RuleCandidate,
 ): Promise<string> {
+  return writeRuleCandidateFrom(diskRuleCandidateLeaves(root), candidate);
+}
+
+/** {@link writeRuleCandidate} over the store's own leaves: the one body. */
+export async function writeRuleCandidateFrom(leaves: RuleCandidateLeaves, candidate: RuleCandidate): Promise<string> {
   const fileId = candidateFileId(candidate.id);
-  const target = await ruleCandidatePath(root, fileId);
-  await atomicWrite(target, JSON.stringify(candidate, null, 2));
-  return target;
+  return leaves.writeText(fileId, () => JSON.stringify(candidate, null, 2));
 }
 
 /** Defensive type-guard so corrupted candidate files don't blow up the CLI. */
@@ -344,8 +390,16 @@ export async function readRuleCandidate(
   fileId: string,
   location: "active" | "archive" = "active",
 ): Promise<RuleCandidate | null> {
-  const filePath = location === "archive" ? ruleArchivePath(root, fileId) : ruleCandidatePath(root, fileId);
-  const raw = await safeReadFile(await filePath);
+  return readRuleCandidateFrom(diskRuleCandidateLeaves(root), fileId, location);
+}
+
+/** {@link readRuleCandidate} over the store's own leaves: the one body. */
+export async function readRuleCandidateFrom(
+  leaves: RuleCandidateLeaves,
+  fileId: string,
+  location: "active" | "archive" = "active",
+): Promise<RuleCandidate | null> {
+  const raw = await leaves.readText(fileId, location);
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -361,12 +415,16 @@ export async function readRuleCandidate(
  * @param root - Project root directory.
  */
 export async function listRuleCandidates(root: string): Promise<RuleCandidate[]> {
-  const dir = await resolveConfinedCandidatesDir(root, RULE_CANDIDATES_DIR);
-  if (dir === null) return []; // absent rule-candidates dir → nothing pending
-  const fileIds = await listCandidateFileIds(dir);
+  return listRuleCandidatesFrom(diskRuleCandidateLeaves(root));
+}
+
+/** {@link listRuleCandidates} over the store's own leaves: the one body. */
+export async function listRuleCandidatesFrom(leaves: RuleCandidateLeaves): Promise<RuleCandidate[]> {
+  const fileIds = await leaves.listFileIds();
+  if (fileIds === null) return []; // absent rule-candidates dir → nothing pending
   const candidates: RuleCandidate[] = [];
   for (const fileId of fileIds) {
-    const candidate = await readRuleCandidate(root, fileId);
+    const candidate = await readRuleCandidateFrom(leaves, fileId);
     if (candidate) candidates.push(candidate);
   }
 
@@ -388,13 +446,19 @@ export async function setRuleCandidateStatus(
   fileId: string,
   status: RuleStatus,
 ): Promise<RuleCandidate | null> {
-  const candidate = await readRuleCandidate(root, fileId);
+  return setRuleCandidateStatusFrom(diskRuleCandidateLeaves(root), fileId, status);
+}
+
+/** {@link setRuleCandidateStatus} over the store's own leaves: the one body. */
+export async function setRuleCandidateStatusFrom(
+  leaves: RuleCandidateLeaves,
+  fileId: string,
+  status: RuleStatus,
+): Promise<RuleCandidate | null> {
+  const candidate = await readRuleCandidateFrom(leaves, fileId);
   if (!candidate) return null;
   const updated: RuleCandidate = { ...candidate, status };
-  await atomicWrite(
-    await ruleCandidatePath(root, fileId),
-    JSON.stringify(updated, null, 2),
-  );
+  await leaves.writeText(fileId, () => JSON.stringify(updated, null, 2));
   return updated;
 }
 
@@ -408,8 +472,5 @@ export async function archiveRuleCandidate(
   root: string,
   fileId: string,
 ): Promise<boolean> {
-  return moveCandidateToArchive(
-    await ruleCandidatePath(root, fileId),
-    await ruleArchivePath(root, fileId),
-  );
+  return diskRuleCandidateLeaves(root).archive(fileId);
 }

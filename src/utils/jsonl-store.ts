@@ -21,11 +21,20 @@
  * a new call site without the no-follow leaf defense.
  * Where the native flag is unavailable, {@link openFileNoFollow} verifies leaf
  * identities before returning a handle and creates missing stores exclusively.
+ *
+ * THE APPEND, HANDLE-HELD. {@link GraphStoreAppend} is the append half a store's
+ * write body is handed: ONE operation that keeps the open leaf to itself and
+ * asks the body's pure {@link GraphAppendPlan} what to write for the size it
+ * found. {@link appendToGraphLeaf} is its local-disk body; each store composes
+ * it from its OWN wrappers (directory resolve and no-follow append open), so the
+ * confinement and leaf defenses above are still reached across modules and
+ * still throw the store's own error classes. No `FileHandle` leaves this file
+ * through the port.
  */
 
 import { constants as fsConstants } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { lstat } from "fs/promises";
+import { lstat, mkdir } from "fs/promises";
 import { NoFollowOpenError, openFileNoFollow } from "./no-follow-open.js";
 import path from "path";
 import { WIKI_GRAPH_DIR } from "./constants.js";
@@ -65,19 +74,94 @@ export interface GraphStoreReadConfig {
 }
 
 /**
+ * The confined graph-store read as something a reader can be handed. The
+ * CALLER'S configuration goes through unchanged, error factories included, so
+ * what a link or an oversize store MEANS stays with the store that asks. A
+ * graph directory that is not confined is this mechanism's own
+ * {@link GraphDirConfinementError}. Accepted for the relation reader and for
+ * the event reader, each asking with its own store's configuration.
+ */
+export interface GraphStoreReads {
+  /** The store's whole text, or `null` when the directory or the file is absent. REJECTS as {@link readConfinedGraphStore} does. */
+  readStore(config: GraphStoreReadConfig): Promise<string | null>;
+}
+
+/**
+ * What one append writes, decided from the store leaf's CURRENT byte size. It is
+ * called ONCE, after the leaf was opened and its size taken and before any
+ * write, and must return a SYNCHRONOUS iterable that is pulled lazily: each
+ * chunk is written and its write awaited before the next one is pulled. A throw
+ * from the call or from any pull stops the append there; the chunks already
+ * written stay written. It decides; it never touches the store.
+ */
+export type GraphAppendPlan = (existingBytes: number) => Iterable<string>;
+
+/**
+ * The append half of one graph store, as something a write body can be handed.
+ * The store, its file name and its typed errors are fixed when it is built.
+ */
+export interface GraphStoreAppend {
+  /**
+   * Append to the store leaf what `plan` returns for its current size. The leaf
+   * is created when absent, never followed when a link, and must be a regular
+   * file; nothing is written unless `plan` yields. REJECTS with what `plan`
+   * throws, with the store's typed errors, or raw.
+   */
+  appendStore(plan: GraphAppendPlan): Promise<void>;
+}
+
+/** How one store's disk append reaches its leaf: the store's OWN wrappers, called at call time, and its leaf name. */
+export interface GraphLeafAppendSteps {
+  /** The confined graph directory (the DIR defense); REJECTS on a confinement fault. */
+  resolveDir(): Promise<{ dir: string }>;
+  /** The no-follow, regular-file append open of `file` (the LEAF defense), with the store's typed link error. */
+  openAppend(file: string): Promise<FileHandle>;
+  /** The store's leaf name inside the graph directory. */
+  fileName: string;
+}
+
+/**
+ * LOCAL DISK. The handle-held append: resolve the directory, create it, open the
+ * leaf through the store's wrapper, `fstat` the HANDLE, ask `plan` for the
+ * chunks and write each through the SAME handle in order, awaiting each write
+ * before the next pull, and close in `finally` (a failing close wins, as it
+ * always did). The handle never leaves this function. In no package index.
+ *
+ * @param steps - The store's own directory resolve and append open, and its leaf name.
+ * @param plan - What to write for the size found (see {@link GraphAppendPlan}).
+ */
+export async function appendToGraphLeaf(steps: GraphLeafAppendSteps, plan: GraphAppendPlan): Promise<void> {
+  const { dir } = await steps.resolveDir(); // throws on symlink escape (DIR)
+  await mkdir(dir, { recursive: true });
+  const handle = await steps.openAppend(path.join(dir, steps.fileName)); // throws on symlink leaf (LEAF)
+  try {
+    const existing = (await handle.stat()).size;
+    for (const chunk of plan(existing)) await handle.write(chunk);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** LOCAL DISK. The graph-store read for the project at `root`. Building it does no I/O. In no package index. */
+export function diskGraphStoreReads(root: string): GraphStoreReads {
+  return { readStore: (config) => readConfinedGraphStore(root, config) };
+}
+
+/**
  * Read a confined graph store file's raw bytes, or `null` when the dir/file is
  * absent. Resolves the confined graph dir (DIR defense), opens the leaf with
  * `O_NOFOLLOW` (LEAF defense), `fstat`s the HANDLE and FAILS CLOSED above
  * `maxBytes` before the whole-file read (so an attacker/sync-controlled multi-GB
  * file is rejected before it could exhaust memory), then reads the body. The
- * handle is always closed in `finally`. Shared by the relation and event readers
- * so the confinement + size-cap discipline is defined ONCE.
+ * handle is always closed in `finally`. MODULE-PRIVATE: the relation and event
+ * readers reach it only through {@link diskGraphStoreReads}, so the confinement
+ * + size-cap discipline is still defined ONCE.
  *
  * @param root - Absolute project root.
  * @param config - The store's leaf name, symlink/oversize errors, and size cap.
  * @returns The raw file body, or `null` when the store is absent.
  */
-export async function readConfinedGraphStore(
+async function readConfinedGraphStore(
   root: string,
   config: GraphStoreReadConfig,
 ): Promise<string | null> {

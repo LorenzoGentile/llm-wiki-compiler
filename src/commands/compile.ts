@@ -4,8 +4,8 @@
  * to process all new and changed source files into wiki pages.
  */
 
-import { existsSync } from "fs";
 import { compile } from "../compiler/index.js";
+import { locationExistsSync } from "../storage/disk-locations.js";
 import * as output from "../utils/output.js";
 import { SOURCES_DIR } from "../utils/constants.js";
 import type { CompileOptions } from "../utils/types.js";
@@ -16,7 +16,7 @@ import type { CompileOptions } from "../utils/types.js";
  * @param options - Optional behaviour overrides forwarded from the CLI flag set.
  */
 export default async function compileCommand(options: CompileOptions = {}): Promise<void> {
-  if (!existsSync(SOURCES_DIR)) {
+  if (!locationExistsSync(SOURCES_DIR)) {
     output.status(
       "!",
       output.warn('No sources found. Run `llmwiki ingest <url>` first.'),

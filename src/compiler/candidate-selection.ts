@@ -6,16 +6,19 @@
  */
 
 import {
-  captureCandidateMutationStoreBinding,
-  listCandidateFileEntries,
-  listCandidateMutationFileIdsForBinding,
-  readCandidateEntryForMutation,
+  captureCandidateMutationStoreBindingFrom,
+  listCandidateFileEntriesFrom,
+  listCandidateMutationFileIdsForBindingFrom,
+  readCandidateEntryForMutationFrom,
   sortCandidateFileEntries,
   type CandidateFileEntry,
   type CandidateMutationScanHooks,
 } from "./candidate-read.js";
 import {
-  assertCandidateStoreBinding,
+  assertCandidateStoreBindingFrom,
+  diskCandidateCustodyReads,
+  type CandidateStoreListReads,
+  type CandidateStoreScanReads,
 } from "./candidate-custody.js";
 import { assertCandidateId, UnsafeCandidateIdError } from "./candidate-paths.js";
 import type { ReviewCandidate } from "../utils/types.js";
@@ -141,16 +144,31 @@ export async function selectReadableCandidateEntriesForMutation(
   bounds?: CandidateSelectionBounds,
   hooks: CandidateMutationSelectionHooks = {},
 ): Promise<CandidateFileEntry[]> {
-  const binding = await captureCandidateMutationStoreBinding(root, false);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return selectReadableCandidateEntriesForMutationFrom(diskCandidateCustodyReads(root), selector, bounds, hooks);
+}
+
+/**
+ * {@link selectReadableCandidateEntriesForMutation} over the custody-read
+ * mechanisms: THE ONE BODY. The alias-tolerant store binding, the hooks, the
+ * tolerant public listing, the selector over the whole listing before the cap,
+ * the selected-batch identity checks and the final store re-proof stay here.
+ */
+export async function selectReadableCandidateEntriesForMutationFrom(
+  reads: CandidateStoreListReads, selector: CandidateMutationSelector,
+  bounds?: CandidateSelectionBounds,
+  hooks: CandidateMutationSelectionHooks = {},
+): Promise<CandidateFileEntry[]> {
+  const binding = await captureCandidateMutationStoreBindingFrom(reads, false);
   if (binding === null) return [];
   await hooks.afterInitialCustodyForTest?.();
   await hooks.afterOpenForTest?.();
-  const selected = (await listCandidateFileEntries(root, true)).filter(entry => selector(entry.candidate));
+  const selected = (await listCandidateFileEntriesFrom(reads, true)).filter(entry => selector(entry.candidate));
   await hooks.afterEnumerationForTest?.();
   if (bounds && selected.length > bounds.maxSelected) throw bounds.overflowError();
   assertCandidateEntriesWritable(selected);
   await hooks.beforeReturnForTest?.();
-  await assertCandidateStoreBinding(root, binding);
+  await assertCandidateStoreBindingFrom(reads, binding);
   return selected;
 }
 
@@ -161,15 +179,33 @@ export async function selectCandidateEntriesForMutationWithTotal(
   bounds?: CandidateSelectionBounds,
   hooks: CandidateMutationSelectionHooks = {},
 ): Promise<CandidateMutationSelection> {
-  const binding = await captureCandidateMutationStoreBinding(root);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return selectCandidateEntriesForMutationWithTotalFrom(diskCandidateCustodyReads(root), selector, bounds, hooks);
+}
+
+/**
+ * {@link selectCandidateEntriesForMutationWithTotal} over the custody-read
+ * mechanisms: THE ONE BODY. The literal binding, the bounded enumeration, the
+ * sequential strict reads with every record counted against the byte budget
+ * before the selector runs, the selection cap before materialization, the
+ * deterministic order, the whole-batch identity checks, the frozen result and
+ * the final store re-proof all stay here.
+ */
+export async function selectCandidateEntriesForMutationWithTotalFrom(
+  reads: CandidateStoreScanReads,
+  selector: CandidateMutationSelector,
+  bounds?: CandidateSelectionBounds,
+  hooks: CandidateMutationSelectionHooks = {},
+): Promise<CandidateMutationSelection> {
+  const binding = await captureCandidateMutationStoreBindingFrom(reads);
   if (binding === null) return Object.freeze({ totalPending: 0, entries: Object.freeze([]) });
-  const fileIds = await listCandidateMutationFileIdsForBinding(root, binding, hooks);
+  const fileIds = await listCandidateMutationFileIdsForBindingFrom(reads, binding, hooks);
   await hooks.afterEnumerationForTest?.();
   const selected: CandidateFileEntry[] = [];
   const byteLimit = mutationScanByteLimit(hooks.maxMutationBytesForTest);
   let scannedBytes = 0;
   for (const fileId of fileIds) {
-    const entry = await readCandidateEntryForMutation(root, fileId, binding);
+    const entry = await readCandidateEntryForMutationFrom(reads, fileId, binding);
     scannedBytes = addScannedBytes(scannedBytes, entry.custodyReceipt.byteCount, byteLimit);
     if (!selector(entry.candidate)) continue;
     if (bounds && selected.length >= bounds.maxSelected) throw bounds.overflowError();
@@ -182,6 +218,6 @@ export async function selectCandidateEntriesForMutationWithTotal(
     entries: Object.freeze(selected),
   });
   await hooks.beforeReturnForTest?.();
-  await assertCandidateStoreBinding(root, binding);
+  await assertCandidateStoreBindingFrom(reads, binding);
   return result;
 }

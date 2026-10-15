@@ -22,6 +22,12 @@
  *    review — fail to review, never fail open.
  *  - {@link previewTypedOutcomes}: the dry-run projection (no I/O).
  *
+ * ONE BODY. {@link applyTypedDocsWith} owns the apply leg (doc order, the
+ * typed-vs-fallback choice, which staging errors fall back and which abort,
+ * trusted promotion and what a vanished or refused promotion leaves) over
+ * {@link TypedImportSteps}, none of which takes a project root;
+ * {@link applyTypedDocs} keeps its signature and passes the local steps.
+ *
  * DEFAULT PARITY (D-7.6.10): the caller only invokes this leg when
  * {@link loadNonDefaultProfile} returns a non-default profile, so a default-profile
  * project routes every doc through the untyped path exactly as before.
@@ -41,9 +47,12 @@ import {
   BlockedStagedWriteError,
   EntityFieldContractError,
   LifecycleTransitionError,
+  type StageEntityPageInput,
 } from "../trust/staging.js";
+import type { StagedChange } from "../trust/staged-change.js";
 import { applyTypedCandidate } from "../trust/promote.js";
-import { writeCandidate, readCandidate, deleteCandidate } from "../compiler/candidates.js";
+import { writeCandidate, readCandidate, deleteCandidate, type CandidateDraft } from "../compiler/candidates.js";
+import type { ReviewCandidate } from "../utils/types.js";
 import type { EntityTypeDef, ProfilePack } from "../profile/types.js";
 import type { HeldReason } from "../review/policy.js";
 import type { MappedTypedOkfDoc, RawOkfDoc, TypedImportOutcome } from "./types.js";
@@ -201,6 +210,34 @@ export function partitionProfileDocs(
 /** The `imported-okf` held reason imported OKF pages carry (mirrors the untyped `stageAll`). */
 const IMPORTED_HELD: HeldReason = { code: "imported-okf" };
 
+/**
+ * What applying typed docs asks of the project. No member takes a project root;
+ * the caller already holds the import lock.
+ */
+export interface TypedImportSteps {
+  /** Stage one typed entity page as a review candidate; throws the typed staging refusals. */
+  stageEntity(input: StageEntityPageInput): Promise<StagedChange>;
+  /** Write one untyped review candidate (the mismatch fallback). */
+  writeCandidate(draft: CandidateDraft): Promise<unknown>;
+  /** One candidate, or null when it is gone. */
+  readCandidate(id: string): Promise<ReviewCandidate | null>;
+  /** Promote one typed candidate live, lock-free; throws its promotion refusal. */
+  promoteTyped(candidate: ReviewCandidate): Promise<unknown>;
+  /** Remove one candidate from the queue. */
+  deleteCandidate(id: string): Promise<unknown>;
+}
+
+/** LOCAL DISK. The incumbent staging, candidate store and promotion for `root`, each called when asked. */
+function diskTypedImportSteps(root: string): TypedImportSteps {
+  return {
+    stageEntity: (input) => stageEntityPage(root, input),
+    writeCandidate: (draft) => writeCandidate(root, draft),
+    readCandidate: (id) => readCandidate(root, id),
+    promoteTyped: (candidate) => applyTypedCandidate(root, candidate),
+    deleteCandidate: (id) => deleteCandidate(root, id),
+  };
+}
+
 /** True for a staging error that routes to the untyped fallback rather than aborting the import (D-7.6.5). */
 function isFallbackStagingError(error: unknown): boolean {
   return (
@@ -213,12 +250,12 @@ function isFallbackStagingError(error: unknown): boolean {
 
 /** Stage a doc's UNTYPED concept form as the mismatch/unknown-type fallback (never goes live). */
 async function stageMismatchFallback(
-  root: string,
+  steps: TypedImportSteps,
   doc: MappedTypedOkfDoc,
   reason: string,
 ): Promise<TypedImportOutcome> {
   const page = doc.untyped;
-  await writeCandidate(root, {
+  await steps.writeCandidate({
     title: page.title, slug: page.slug, summary: page.summary, sources: page.sources, body: page.body,
     reviewMode: "imported", heldReasons: [{ code: "imported-okf", detail: `profile-mismatch: ${reason}` }],
     targetDirectory: "concepts", okfPath: page.okfPath,
@@ -232,13 +269,13 @@ async function stageMismatchFallback(
  * planner/validation stage) the candidate is RETAINED — fail to review, never fail
  * open — and the report says so.
  */
-async function promoteStaged(root: string, doc: MappedTypedOkfDoc, candidateId: string): Promise<TypedImportOutcome> {
+async function promoteStaged(steps: TypedImportSteps, doc: MappedTypedOkfDoc, candidateId: string): Promise<TypedImportOutcome> {
   const base = { okfPath: doc.okfPath, slug: doc.slug, entityType: doc.entityType };
-  const candidate = await readCandidate(root, candidateId);
+  const candidate = await steps.readCandidate(candidateId);
   if (!candidate) return { ...base, outcome: "staged-typed", reason: "candidate vanished before promotion" };
   try {
-    await applyTypedCandidate(root, candidate);
-    await deleteCandidate(root, candidateId);
+    await steps.promoteTyped(candidate);
+    await steps.deleteCandidate(candidateId);
     return { ...base, outcome: "promoted-typed" };
   } catch (error) {
     return { ...base, outcome: "staged-typed", reason: `promotion-refused: ${(error as Error).message}` };
@@ -247,27 +284,27 @@ async function promoteStaged(root: string, doc: MappedTypedOkfDoc, candidateId: 
 
 /** Stage one typed doc (and promote it when trusted), falling back to untyped staging on a typed error. */
 async function applyOneTypedDoc(
-  root: string,
+  steps: TypedImportSteps,
   doc: MappedTypedOkfDoc,
   profile: ProfilePack,
   trusted: boolean,
 ): Promise<TypedImportOutcome> {
   if (doc.entityType === undefined || doc.typedBody === undefined) {
-    return stageMismatchFallback(root, doc, doc.fallbackReason ?? "unknown entity type");
+    return stageMismatchFallback(steps, doc, doc.fallbackReason ?? "unknown entity type");
   }
   let candidateId: string;
   try {
-    const staged = await stageEntityPage(root, {
+    const staged = await steps.stageEntity({
       entityType: doc.entityType, slug: doc.slug, body: doc.typedBody, profile,
       existingStagedCount: 0, reviewMode: "imported", heldReasons: [IMPORTED_HELD],
     });
     candidateId = staged.id;
   } catch (error) {
-    if (isFallbackStagingError(error)) return stageMismatchFallback(root, doc, (error as Error).message);
+    if (isFallbackStagingError(error)) return stageMismatchFallback(steps, doc, (error as Error).message);
     throw error;
   }
   if (!trusted) return { okfPath: doc.okfPath, slug: doc.slug, entityType: doc.entityType, outcome: "staged-typed" };
-  return promoteStaged(root, doc, candidateId);
+  return promoteStaged(steps, doc, candidateId);
 }
 
 /**
@@ -290,8 +327,22 @@ export async function applyTypedDocs(
   profile: ProfilePack,
   trusted: boolean,
 ): Promise<TypedImportOutcome[]> {
+  return applyTypedDocsWith(diskTypedImportSteps(root), typed, profile, trusted);
+}
+
+/**
+ * {@link applyTypedDocs} over {@link TypedImportSteps}: THE ONE BODY. Docs are
+ * applied in order; the typed-vs-fallback choice, the staging-error
+ * classification and the trusted promotion are decided here.
+ */
+export async function applyTypedDocsWith(
+  steps: TypedImportSteps,
+  typed: MappedTypedOkfDoc[],
+  profile: ProfilePack,
+  trusted: boolean,
+): Promise<TypedImportOutcome[]> {
   const outcomes: TypedImportOutcome[] = [];
-  for (const doc of typed) outcomes.push(await applyOneTypedDoc(root, doc, profile, trusted));
+  for (const doc of typed) outcomes.push(await applyOneTypedDoc(steps, doc, profile, trusted));
   return outcomes;
 }
 

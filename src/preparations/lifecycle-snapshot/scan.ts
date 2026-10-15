@@ -3,6 +3,19 @@
  * @description Public Task 9B scanner: capture one bound key observation,
  * enumerate both registries once, classify in two passes, revalidate every
  * authority identity, erase key bytes, and publish one immutable digest.
+ *
+ * ONE BODY, {@link scanPreparationLifecycleFrom}, over {@link LifecycleScanReads}:
+ * the namespace and key re-proofs, the key capture, the registry observation, the
+ * per-unit identity re-proof, the storage revalidation, and the classifiers' leaf
+ * reads. All are confined MECHANISM reads, and none takes a project root; every
+ * decision (pass one and two, races, ordering, completeness, digest, key erasure)
+ * is in the body. {@link scanPreparationLifecycle} keeps its signature and its brand
+ * check, and passes the namespace's disk reads.
+ *
+ * AUTHORITY IS UNCHANGED. The body is exported for its witness only and is in no
+ * package index. A snapshot it returns is NOT a recorded lifecycle read:
+ * `read.ts` records only the reads it mints itself around the root form, so a
+ * caller that supplies its own reads cannot forge a successful lifecycle read.
  */
 
 import { canonicalDigest } from "../../profile/templates/signing/canonical.js";
@@ -19,14 +32,15 @@ import {
   lifecycleUnitStillCurrent,
   revalidateLifecycleStorage,
 } from "../lifecycle-fs/revalidate.js";
-import type { PreparationLifecycleNamespaceV1 } from "../lifecycle-fs/types.js";
-import { lifecycleScanBounds } from "../lifecycle-fs/bounds.js";
-import type { LifecyclePassOneUnit } from "./classifier-types.js";
-import { classifyPrunePassOne } from "./prune-classifier.js";
-import { classifyQuarantinePassOne } from "./quarantine-classifier.js";
+import type { LifecycleObservationSet, PreparationLifecycleNamespaceV1 } from "../lifecycle-fs/types.js";
+import { lifecycleScanBounds, type LifecycleScanBounds } from "../lifecycle-fs/bounds.js";
+import { diskLifecycleLeafReads, type LifecycleLeafReads, type LifecyclePassOneUnit } from "./classifier-types.js";
+import { classifyPrunePassOneFrom } from "./prune-classifier.js";
+import { classifyQuarantinePassOneFrom } from "./quarantine-classifier.js";
 import {
   assertLifecycleKeyObservationCurrent,
   captureLifecycleKey,
+  type CapturedLifecycleKey,
 } from "../lifecycle-fs/key-observation.js";
 import { projectPreparationLifecycleStorage } from "./storage.js";
 import type {
@@ -35,6 +49,37 @@ import type {
   PreparationLifecycleSnapshotV1,
   PreparationLifecycleUnitV1,
 } from "./types.js";
+
+/** The confined reads one scan makes, each bound to one namespace. No member takes a project root. */
+export interface LifecycleScanReads {
+  /** Re-prove the namespace's root, private root, registries and key binding; THROWS on drift. */
+  assertNamespaceCurrent(): Promise<void>;
+  /** Capture the bound key observation once. */
+  captureKey(): Promise<CapturedLifecycleKey>;
+  /** Enumerate both registries once within `bounds`. */
+  observeRegistries(bounds: LifecycleScanBounds, onEnumerated?: (registry: "quarantine" | "prune") => void): Promise<LifecycleObservationSet>;
+  /** Whether one observed unit's identity still holds. */
+  unitStillCurrent(observation: LifecycleUnitObservation): Promise<boolean>;
+  /** Re-observe the registries' storage against the first observation. */
+  revalidateStorage(storage: LifecycleObservationSet["storage"]): ReturnType<typeof revalidateLifecycleStorage>;
+  /** Re-prove the captured key observation; THROWS on drift. */
+  assertKeyCurrent(key: CapturedLifecycleKey): Promise<void>;
+  /** The classifiers' leaf reads. */
+  readonly leaves: LifecycleLeafReads;
+}
+
+/** LOCAL DISK. The confined incumbents for `namespace`, each called when asked. Exported for the scan witness only; in no package index. */
+export function diskLifecycleScanReads(namespace: PreparationLifecycleNamespaceV1): LifecycleScanReads {
+  return {
+    assertNamespaceCurrent: () => assertPreparationLifecycleNamespaceCurrent(namespace),
+    captureKey: () => captureLifecycleKey(namespace),
+    observeRegistries: (bounds, onEnumerated) => observeLifecycleRegistries(namespace, bounds, onEnumerated),
+    unitStillCurrent: (observation) => lifecycleUnitStillCurrent(observation),
+    revalidateStorage: (storage) => revalidateLifecycleStorage(namespace, storage),
+    assertKeyCurrent: (key) => assertLifecycleKeyObservationCurrent(namespace, key),
+    leaves: diskLifecycleLeafReads(namespace),
+  };
+}
 
 /** Recursively freeze the plain snapshot graph before it leaves the scanner. */
 function deepFreeze<T>(value: T): T {
@@ -45,14 +90,15 @@ function deepFreeze<T>(value: T): T {
 
 /** Classify one observed unit through its physical registry's sole classifier. */
 async function classifyPassOne(
+  leaves: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   observation: LifecycleUnitObservation,
   key: Awaited<ReturnType<typeof captureLifecycleKey>>,
   bounds: ReturnType<typeof lifecycleScanBounds>,
 ): Promise<LifecyclePassOneUnit> {
   return observation.registry === "quarantine"
-    ? classifyQuarantinePassOne({ namespace, observation, key, bounds })
-    : classifyPrunePassOne(namespace, observation, key, bounds);
+    ? classifyQuarantinePassOneFrom(leaves, { namespace, observation, key, bounds })
+    : classifyPrunePassOneFrom(leaves, namespace, observation, key, bounds);
 }
 
 /** Build the active-key retirement map, rejecting contradictory attestations. */
@@ -127,6 +173,7 @@ function racedUnit(
 
 /** Classify and then re-prove each unit identity before accepting its result. */
 async function classifyAll(
+  reads: LifecycleScanReads,
   namespace: PreparationLifecycleNamespaceV1,
   observations: readonly LifecycleUnitObservation[],
   key: Awaited<ReturnType<typeof captureLifecycleKey>>,
@@ -135,11 +182,11 @@ async function classifyAll(
 ): Promise<LifecyclePassOneUnit[]> {
   const results: LifecyclePassOneUnit[] = [];
   for (const observation of observations) {
-    results.push(await classifyPassOne(namespace, observation, key, bounds));
+    results.push(await classifyPassOne(reads.leaves, namespace, observation, key, bounds));
   }
   await afterClassification?.();
   for (const [index, observation] of observations.entries()) {
-    if (!(await lifecycleUnitStillCurrent(observation))) {
+    if (!(await reads.unitStillCurrent(observation))) {
       results[index] = racedUnit(namespace, observation);
     }
   }
@@ -198,20 +245,31 @@ export async function scanPreparationLifecycle(
   options: PreparationLifecycleScanOptionsV1 = {},
 ): Promise<PreparationLifecycleSnapshotV1> {
   assertPreparationLifecycleNamespaceBrand(namespace);
-  await assertPreparationLifecycleNamespaceCurrent(namespace);
-  const key = await captureLifecycleKey(namespace);
+  return scanPreparationLifecycleFrom(diskLifecycleScanReads(namespace), namespace, options);
+}
+
+/**
+ * {@link scanPreparationLifecycle} over {@link LifecycleScanReads}: THE ONE BODY.
+ * Exported for its witness only; in no package index, and its snapshots are never
+ * recorded lifecycle reads.
+ */
+export async function scanPreparationLifecycleFrom(
+  reads: LifecycleScanReads,
+  namespace: PreparationLifecycleNamespaceV1,
+  options: PreparationLifecycleScanOptionsV1 = {},
+): Promise<PreparationLifecycleSnapshotV1> {
+  await reads.assertNamespaceCurrent();
+  const key = await reads.captureKey();
   try {
     await options.afterKeyCapturedForTest?.();
     const bounds = lifecycleScanBounds(options);
-    const observed = await observeLifecycleRegistries(
-      namespace, bounds, options.onRegistryEnumeratedForTest,
-    );
+    const observed = await reads.observeRegistries(bounds, options.onRegistryEnumeratedForTest);
     const passOne = await classifyAll(
-      namespace, observed.units, key, bounds, options.afterClassificationForTest,
+      reads, namespace, observed.units, key, bounds, options.afterClassificationForTest,
     );
-    const currentStorage = await revalidateLifecycleStorage(namespace, observed.storage);
-    await assertPreparationLifecycleNamespaceCurrent(namespace);
-    await assertLifecycleKeyObservationCurrent(namespace, key);
+    const currentStorage = await reads.revalidateStorage(observed.storage);
+    await reads.assertNamespaceCurrent();
+    await reads.assertKeyCurrent(key);
     const projected = passTwoUnits(passOne);
     const registryProblems = observed.problems.filter((problem) => problem.unitId === undefined);
     const problems = [...registryProblems, ...projected.problems]

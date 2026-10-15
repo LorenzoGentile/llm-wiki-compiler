@@ -16,9 +16,9 @@ import type { PreparationLifecycleNamespaceV1 } from "../lifecycle-fs/types.js";
 import type { LifecycleScanBounds } from "../lifecycle-fs/bounds.js";
 import {
   LifecycleObservationError,
-  observeLifecyclePlannedLeaf,
   type LifecyclePlannedLeafState,
 } from "../lifecycle-fs/leaf-observation.js";
+import type { LifecycleLeafReads } from "./classifier-types.js";
 import type { CompletedCustodyStateV1 } from "./types.js";
 
 /** Typed postcondition refusal with a stable scan problem category. */
@@ -39,7 +39,7 @@ type ObjectState = LifecyclePlannedLeafState;
 
 /** Observe one absent or exact planned object without following a leaf symlink. */
 async function observeObject(input: {
-  namespace: PreparationLifecycleNamespaceV1;
+  reads: LifecycleLeafReads;
   file: string;
   expectedDir: string;
   object: { logicalPath: string; byteCount: number; digest: string | null };
@@ -47,8 +47,7 @@ async function observeObject(input: {
   bounds: LifecycleScanBounds;
 }): Promise<ObjectState> {
   try {
-    return await observeLifecyclePlannedLeaf({
-      root: input.namespace.root.realPath,
+    return await input.reads.observePlannedLeaf({
       file: input.file,
       expectedDir: input.expectedDir,
       object: input.object,
@@ -72,6 +71,7 @@ async function observeObject(input: {
 
 /** Observe one quarantine object's source and custody destination. */
 async function quarantineEnds(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   bytesRoot: string,
   object: QuarantineObjectV1,
@@ -81,7 +81,7 @@ async function quarantineEnds(
   const destination = path.join(bytesRoot, object.objectName);
   return {
     source: await observeObject({
-      namespace,
+      reads,
       file: source,
       expectedDir: path.dirname(source),
       object,
@@ -89,7 +89,7 @@ async function quarantineEnds(
       bounds,
     }),
     destination: await observeObject({
-      namespace,
+      reads,
       file: destination,
       expectedDir: bytesRoot,
       object,
@@ -101,7 +101,7 @@ async function quarantineEnds(
 
 /** Current retention of a receipt whose writer already committed completion. */
 export async function quarantineCompletedCustody(
-  namespace: PreparationLifecycleNamespaceV1,
+  reads: LifecycleLeafReads,
   bytesRoot: string,
   receipt: QuarantineReceiptV1,
   bounds: LifecycleScanBounds,
@@ -110,7 +110,7 @@ export async function quarantineCompletedCustody(
   for (const object of receipt.objects) {
     const destination = path.join(bytesRoot, object.objectName);
     states.push(await observeObject({
-      namespace,
+      reads,
       file: destination,
       expectedDir: bytesRoot,
       object,
@@ -128,6 +128,7 @@ export async function quarantineCompletedCustody(
 
 /** Whether an authenticated incomplete quarantine plan is untouched or applying. */
 export async function quarantineProgress(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   bytesRoot: string,
   receipt: QuarantineReceiptV1,
@@ -135,7 +136,7 @@ export async function quarantineProgress(
 ): Promise<"planned" | "applying"> {
   let changed = false;
   for (const object of receipt.objects) {
-    const ends = await quarantineEnds(namespace, bytesRoot, object, bounds);
+    const ends = await quarantineEnds(reads, namespace, bytesRoot, object, bounds);
     if (ends.source.status === "present" && ends.destination.status === "absent") continue;
     if (ends.source.status === "absent" && ends.destination.status === "present") {
       changed = true;
@@ -157,6 +158,7 @@ export async function quarantineProgress(
 
 /** Observe one prune object's source and durable staging slot. */
 async function pruneEnds(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   unitRoot: string,
   object: PruneReceiptV1["objects"][number],
@@ -167,7 +169,7 @@ async function pruneEnds(
   const staged = path.join(unitRoot, lifecycleStagedDeleteName(index));
   return {
     source: await observeObject({
-      namespace,
+      reads,
       file: source,
       expectedDir: path.dirname(source),
       object,
@@ -175,7 +177,7 @@ async function pruneEnds(
       bounds,
     }),
     staged: await observeObject({
-      namespace,
+      reads,
       file: staged,
       expectedDir: unitRoot,
       object,
@@ -187,6 +189,7 @@ async function pruneEnds(
 
 /** Verify terminal absence, or classify a valid incomplete delete protocol. */
 export async function prunePostcondition(
+  reads: LifecycleLeafReads,
   namespace: PreparationLifecycleNamespaceV1,
   unitRoot: string,
   receipt: PruneReceiptV1,
@@ -195,7 +198,7 @@ export async function prunePostcondition(
 ): Promise<"planned" | "applying" | "completed"> {
   let changed = false;
   for (const [index, object] of receipt.objects.entries()) {
-    const ends = await pruneEnds(namespace, unitRoot, object, index, bounds);
+    const ends = await pruneEnds(reads, namespace, unitRoot, object, index, bounds);
     changed = classifyPruneEnds(ends, completed) || changed;
   }
   return completed ? "completed" : changed ? "applying" : "planned";

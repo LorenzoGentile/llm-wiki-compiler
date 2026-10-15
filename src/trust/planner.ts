@@ -1,9 +1,11 @@
 /**
  * @file src/trust/planner.ts
  * @description The WRITE PLANNER — the single seam through which every proposed
- * mutation passes (CLP Invariant 4). The planner does NOT touch disk: it runs
+ * mutation passes (CLP Invariant 4). The planner does NOT write to disk: it runs
  * the mandatory trust checks, composes the {@link TrustDecision}, and emits a
- * declarative plan of {@link PlannedMutation}s for the executor to apply.
+ * declarative plan of {@link PlannedMutation}s for the executor to apply. It
+ * does READ physical state while doing so: it resolves real paths to confine
+ * the target and probes whether the target already exists.
  *
  * Vocabulary is declared in full for the whole CLP mutation surface
  * (page / relation / artifact / lifecycle-transition / workflow-gate /
@@ -23,12 +25,22 @@
  * The target path is derived lexically as `wiki/<entityType>/<slug>.md` so the
  * mandatory path-confinement check can run BEFORE any slug-safe id is minted —
  * an escaping slug is rejected by the decision, never by an exception.
+ *
+ * STORAGE. Page planning has ONE BODY, {@link planPageMutationFrom}, over the
+ * raw target probes ({@link PageTargetProbes}) its mandatory checks and its
+ * create/update choice ask; {@link planPageMutation} hands it the local disk's.
+ * The executor, page apply, journal and locks are NOT bound here.
  */
 
 import path from "path";
-import { lstat } from "fs/promises";
-import { confineUnderRoot } from "../utils/path-confine.js";
-import { runMandatoryPageChecks, resourceCapForOrigin, type PageWriteContext } from "./checks.js";
+import {
+  diskPageTargetProbes,
+  resourceCapForOrigin,
+  runMandatoryPageChecksFrom,
+  type PageTargetProbes,
+  type PageWriteContext,
+} from "./checks.js";
+import { checkDefaultIdentitySafe } from "./content-floor.js";
 import { composeTrustDecision, type TrustDecision, type TrustCheckResult } from "./decision.js";
 import { entityId, isSlugSafe, isSafeFilenameComponent } from "../profile/identity.js";
 import type { EntityId } from "../profile/types.js";
@@ -234,36 +246,19 @@ function checkIdentitySafe(entityType: string, slug: string): TrustCheckResult {
   return { code, verdict: "block", message: `entity type/slug is not slug-safe: ${entityType}/${slug}` };
 }
 
-/** True when a confinable target already exists on disk under `root`. */
-async function targetAlreadyExists(root: string, targetPath: string): Promise<boolean> {
+/** True when a confinable target already exists under `root`, asked through `probes`; any probe failure reads as absent. */
+async function targetAlreadyExists(probes: PageTargetProbes, root: string, targetPath: string): Promise<boolean> {
   let abs: string;
   try {
-    abs = await confineUnderRoot(targetPath, root, { mustExist: false });
+    abs = await probes.confineTarget(targetPath, root);
   } catch {
     return false;
   }
   try {
-    await lstat(abs);
-    return true;
+    return await probes.leafPresent(path.dirname(abs), path.basename(abs));
   } catch {
     return false;
   }
-}
-
-/**
- * Guard a DEFAULT page's raw identity: a `directory`/`slug` that is not a safe
- * single filename component (path separator, dot-only, leading-dot, NUL, empty)
- * yields a `block`. Like {@link checkIdentitySafe} this runs ahead of the
- * mandatory file checks and composes via the SAME decision path — never a thrown
- * exception — but it uses the Unicode-tolerant {@link isSafeFilenameComponent}
- * floor (NOT the slug-safe grammar), so a non-ASCII default slug is allowed.
- */
-function checkDefaultIdentitySafe(directory: string, slug: string): TrustCheckResult {
-  const code = "invalid-identity";
-  if (isSafeFilenameComponent(directory) && isSafeFilenameComponent(slug)) {
-    return { code, verdict: "pass", message: "directory and slug are safe filename components" };
-  }
-  return { code, verdict: "block", message: `directory/slug is not a safe filename component: ${directory}/${slug}` };
 }
 
 /** The shared inputs to {@link planPageWith}, independent of target identity. */
@@ -287,6 +282,7 @@ interface PageFloorInput {
  * logic (only the identity grammar and target shape differ).
  */
 async function planPageWith(
+  probes: PageTargetProbes,
   input: PageFloorInput,
   identityCheck: TrustCheckResult,
   buildTarget: () => MutationTarget,
@@ -300,12 +296,12 @@ async function planPageWith(
     // pages get the larger GENERATED_PAGE_MAX_CHARS, all others MAX_SOURCE_CHARS.
     maxBodyChars: resourceCapForOrigin(input.origin),
   };
-  const checks = [identityCheck, ...(await runMandatoryPageChecks(ctx))];
+  const checks = [identityCheck, ...(await runMandatoryPageChecksFrom(probes, ctx))];
   const decision = composeTrustDecision(checks, { reviewRouted: input.reviewRouted });
   if (!LIVE_WRITE_DECISIONS.has(decision)) {
     return { planned: [], decision, checks };
   }
-  const exists = await targetAlreadyExists(input.root, input.targetPath);
+  const exists = await targetAlreadyExists(probes, input.root, input.targetPath);
   const mutation: PagePlannedMutation = {
     kind: "page",
     operation: input.deleting === true ? "delete" : exists ? "update" : "create",
@@ -332,10 +328,24 @@ async function planPageWith(
  * @returns The plan, composed decision, and per-check results.
  */
 export async function planPageMutation(input: PlanPageInput): Promise<PlanResult> {
+  return planPageMutationFrom(diskPageTargetProbes, input);
+}
+
+/**
+ * {@link planPageMutation} over `probes`: THE ONE BODY. The identity floor, the
+ * mandatory checks, the decision, and the create/update/delete choice are all
+ * decided here; `probes` only confine the target and report its presence.
+ *
+ * @param probes - The raw target probes; `input.root` is handed to them as data.
+ * @param input - The proposed page mutation with its discriminated target.
+ * @returns The plan, composed decision, and per-check results.
+ */
+export async function planPageMutationFrom(probes: PageTargetProbes, input: PlanPageInput): Promise<PlanResult> {
   const { target } = input;
   if (target.kind === "entity") {
     const targetPath = pageTargetPath(target.entityType, target.slug);
     return planPageWith(
+      probes,
       { ...input, targetPath },
       checkIdentitySafe(target.entityType, target.slug),
       () => ({ entityType: target.entityType, slug: target.slug, id: entityId(target.entityType, target.slug) }),
@@ -343,6 +353,7 @@ export async function planPageMutation(input: PlanPageInput): Promise<PlanResult
   }
   const targetPath = pageTargetPath(target.directory, target.slug);
   return planPageWith(
+    probes,
     { ...input, targetPath },
     checkDefaultIdentitySafe(target.directory, target.slug),
     () => ({ directory: target.directory, slug: target.slug }),

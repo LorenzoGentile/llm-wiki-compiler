@@ -24,7 +24,10 @@ it("refuses an undeclared profile finding instead of dropping it from every tier
   const finding: LintResult = { rule: "future-rule", file: "page.md", severity: "warning", message: "Future" };
   expect(() => groupByDeclaredTier([finding], profileRuleTiers(profile))).toThrow(UnknownLintRuleTierError);
   expect(() => groupByDeclaredTier([finding], [])).toThrow("No declared tier for lint rule: future-rule");
-  vi.spyOn(profileLoader, "loadProfile").mockResolvedValue({ profile, loadedFrom: ".llmwiki/profile.json", digest: "t" });
+  const loaded = { profile, loadedFrom: ".llmwiki/profile.json", digest: "t" };
+  vi.spyOn(profileLoader, "loadProfile").mockResolvedValue(loaded);
+  // The lint run loads the profile through the sources form.
+  vi.spyOn(profileLoader, "loadProfileFrom").mockResolvedValue(loaded);
   vi.spyOn(profileLint, "collectProfileLintFindings").mockResolvedValue({ results: [finding], ruleTiers: [] });
   await expect(lint(env.dir)).rejects.toBeInstanceOf(UnknownLintRuleTierError);
 });

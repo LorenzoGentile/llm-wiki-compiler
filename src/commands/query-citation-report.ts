@@ -14,8 +14,16 @@ import * as output from "../utils/output.js";
  * successful report; generation and saving remain outside this recovery boundary.
  */
 export async function reportQueryAnswerCitations(root: string, body: string): Promise<Pick<QueryResult, "answerCitations">> {
+  return reportQueryAnswerCitationsWith(() => reportAnswerCitations(root, body));
+}
+
+/**
+ * {@link reportQueryAnswerCitations} over any way of taking the report: THE ONE
+ * recovery boundary, shared by the local root route and the query's bound reads.
+ */
+export async function reportQueryAnswerCitationsWith(report: () => Promise<AnswerCitationReport>): Promise<Pick<QueryResult, "answerCitations">> {
   try {
-    return { answerCitations: await reportAnswerCitations(root, body) };
+    return { answerCitations: await report() };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     output.note(`Answer citations: unavailable (${message})`);

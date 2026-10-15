@@ -31,7 +31,7 @@
  * the mutation and the append leaves a missing trailing event — the torn-trailing
  * case the reader tolerates and reports. A crash between the append and the head
  * SEAL leaves one complete, unsealed record AHEAD of the head; the next WRITE
- * recovers it (drops the uncommitted record) — see `prepareEventStoreForAppend`.
+ * recovers it (drops the uncommitted record) — see `prepareEventStoreForAppendFrom`.
  * An interior tear / bad checksum / chain break is fail-closed (corrupt) or
  * surfaced (chain) per the read contract.
  */

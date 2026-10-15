@@ -9,11 +9,18 @@
  * consistent with the overall health score. Lint rules are sourced from
  * the canonical linter orchestrator (lint()) via runAllLintRules() so
  * all rules including freshness checks are included automatically.
+ *
+ * The distribution has ONE body, {@link evaluatePageHealthDistributionFrom},
+ * over the lint run's own {@link LintSources}. It names no project root. A
+ * page's slug is still cut from the path the page is REPORTED under: the last
+ * directory name and the file name. That path is a name here; nothing is opened
+ * from it.
  */
 
 import path from "path";
-import { collectAllPages } from "../linter/rules.js";
-import { runAllLintRules, deductionFor } from "./health.js";
+import { diskLintSources, type LintSources } from "../linter/lint-sources.js";
+import { collectAllPagesFrom } from "../linter/rules-shared.js";
+import { runAllLintRulesFrom, deductionFor } from "./health.js";
 import type { LintResult } from "../linter/types.js";
 import type { PageHealthDistributionResult, PageHealthEntry } from "./types.js";
 
@@ -51,9 +58,22 @@ export async function evaluatePageHealthDistribution(
   root: string,
   worstPageCount = 5,
 ): Promise<PageHealthDistributionResult> {
+  return evaluatePageHealthDistributionFrom(diskLintSources(root), worstPageCount);
+}
+
+/**
+ * {@link evaluatePageHealthDistribution} over {@link LintSources}: THE ONE
+ * BODY. The lint run and one more walk of the generic pages start together;
+ * the walk is separate from the walks the lint rules make and nothing is
+ * shared between them.
+ *
+ * @param sources - The lint run's sources; their `pages` member is also what the extra page walk reads through.
+ * @param worstPageCount - How many worst pages to return (default 5).
+ */
+export async function evaluatePageHealthDistributionFrom(sources: LintSources, worstPageCount = 5): Promise<PageHealthDistributionResult> {
   const [allResults, pages] = await Promise.all([
-    runAllLintRules(root),
-    collectAllPages(root),
+    runAllLintRulesFrom(sources),
+    collectAllPagesFrom(sources.pages),
   ]);
 
   const findingsByPath = new Map<string, LintResult[]>();

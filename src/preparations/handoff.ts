@@ -18,27 +18,38 @@
  * the EXACT same creation from the durable `handoff-started` record or parks — it
  * never duplicates or overwrites, because the reserved identities and the
  * deterministic bundle-manifest digest are fixed before the first Milestone A byte.
+ *
+ * ONE BODY. {@link handoffPreparationWith} owns the whole flow over
+ * {@link HandoffSteps}: the `handoff` lock (a MECHANISM the host supplies), the
+ * preparation run, cancellation and manifest reads, the Milestone A manifest,
+ * key and run reads, the staging transaction (dry run and real), and the two
+ * handoff appends, none of which takes a project root. {@link handoffPreparation}
+ * keeps its signature and passes the local steps, which call the incumbent root
+ * forms when asked; {@link handoffStepsOver} composes each from its own body.
  */
 
 import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
-import { readOperationKey } from "../operation-bundles/key-epoch.js";
-import { readOperationManifest } from "../operation-bundles/manifest-store.js";
+import { readOperationKey, readOperationKeyFrom, type OperationKeyLeafReads } from "../operation-bundles/key-epoch.js";
+import { readOperationManifest, readOperationManifestFrom, type OperationManifestLeafReads } from "../operation-bundles/manifest-store.js";
 import { operationManifestDigest } from "../operation-bundles/manifest-parse.js";
-import { readOperationRun } from "../operation-bundles/run-store.js";
+import { readOperationRun, readOperationRunFrom, type OperationRunLeafReads } from "../operation-bundles/run-store.js";
 import { assertBundleId, assertOperationRunId, mintBundleId, mintOperationRunId, type BundleId, type OperationRunId } from "../operation-bundles/ids.js";
-import { stageOperationBundleLocked, type Clock } from "../operation-bundles/stage.js";
+import { stageOperationBundleLocked, stageOperationBundleWith, type Clock, type OperationStageSteps } from "../operation-bundles/stage.js";
 import { releaseLock } from "../utils/lock.js";
 import { parseSha256Digest } from "../capability-providers/ids.js";
 import type { OperationDigest } from "../operation-bundles/types.js";
 import type { Sha256Digest } from "./types.js";
-import { preparationCancellationRequested } from "./cancellation.js";
+import {
+  preparationCancellationRequested, preparationCancellationRequestedFrom, type PreparationCancelLeaves,
+} from "./cancellation.js";
 import { deriveHandoffId, type HandoffId } from "./ids.js";
-import { readPreparationManifest } from "./manifest-store.js";
+import { readPreparationManifest, readPreparationManifestFrom, type PreparationManifestLeafReads } from "./manifest-store.js";
 import { preparationManifestDigest } from "./manifest-parse.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
 import {
-  appendHandoffStartedTransitionLocked, appendHandoffTransitionLocked,
-  handoffStartBinding, readPreparationRun,
+  appendHandoffStartedTransitionLocked, appendHandoffStartedTransitionWith, appendHandoffTransitionLocked,
+  appendHandoffTransitionWith, handoffStartBinding, readPreparationRun, readPreparationRunFrom,
+  type PreparationRunLeafReads, type PreparationRunWriteSteps,
 } from "./run-store.js";
 import {
   buildHandoffBundle, createdGenesisAuthorityDigest, handoffGenesisAuthorityDigest,
@@ -111,9 +122,64 @@ interface HandoffStartState {
 export const HANDOFF_STARTABLE_RUN_STATES: ReadonlySet<PreparationRunV1["state"]> =
   new Set<PreparationRunV1["state"]>(["handoff-ready", "handoff-started"]);
 
+/** A root-taking reader or writer with its root removed. */
+type Rootless<F> = F extends (root: string, ...args: infer A) => infer R ? (...args: A) => R : never;
+
+/** What one handoff asks of the project and its host, in order. No member takes a project root. */
+export interface HandoffSteps {
+  /** The `handoff` project lock through the shared recovery gate: a MECHANISM. */
+  readonly lock: { acquire(): Promise<void>; release(): Promise<void> };
+  readonly readRun: Rootless<typeof readPreparationRun>;
+  readonly cancellationRequested: Rootless<typeof preparationCancellationRequested>;
+  readonly readPreparationManifest: Rootless<typeof readPreparationManifest>;
+  readonly readOperationManifest: Rootless<typeof readOperationManifest>;
+  readonly readOperationKey: Rootless<typeof readOperationKey>;
+  readonly readOperationRun: Rootless<typeof readOperationRun>;
+  /** The staging transaction, for both the zero-write dry run and the real stage. */
+  readonly stage: Rootless<typeof stageOperationBundleLocked>;
+  readonly appendStarted: Rootless<typeof appendHandoffStartedTransitionLocked>;
+  readonly appendHandoff: Rootless<typeof appendHandoffTransitionLocked>;
+}
+
+/** LOCAL DISK AND HOST. The incumbent root forms for `root`, each called when asked with its old arguments. */
+function diskHandoffSteps(root: string): HandoffSteps {
+  return {
+    lock: { acquire: () => acquireMutationLockBlocking(root, "handoff"), release: () => releaseLock(root) },
+    readRun: (binding) => readPreparationRun(root, binding),
+    cancellationRequested: (workspaceId, runId) => preparationCancellationRequested(root, workspaceId, runId),
+    readPreparationManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    readOperationManifest: (workspaceId, bundleId) => readOperationManifest(root, workspaceId, bundleId),
+    readOperationKey: () => readOperationKey(root),
+    readOperationRun: (binding) => readOperationRun(root, binding),
+    stage: (request) => stageOperationBundleLocked(root, request),
+    appendStarted: (binding, expected, input) => appendHandoffStartedTransitionLocked(root, binding, expected, input),
+    appendHandoff: (binding, expected, input) => appendHandoffTransitionLocked(root, binding, expected, input),
+  };
+}
+
+/** The same steps over each store's own body, with the host's lock as given. Building them does no I/O. */
+export function handoffStepsOver(sources: {
+  prepRuns: PreparationRunLeafReads; cancels: PreparationCancelLeaves; prepManifests: PreparationManifestLeafReads;
+  opManifests: OperationManifestLeafReads; opKey: OperationKeyLeafReads; opRuns: OperationRunLeafReads;
+  staging: OperationStageSteps; prepWrites: PreparationRunWriteSteps;
+}, lock: HandoffSteps["lock"]): HandoffSteps {
+  return {
+    lock,
+    readRun: (binding) => readPreparationRunFrom(sources.prepRuns, binding),
+    cancellationRequested: (workspaceId, runId) => preparationCancellationRequestedFrom(sources.cancels, workspaceId, runId),
+    readPreparationManifest: (workspaceId, preparationId) => readPreparationManifestFrom(sources.prepManifests, workspaceId, preparationId),
+    readOperationManifest: (workspaceId, bundleId) => readOperationManifestFrom(sources.opManifests, workspaceId, bundleId),
+    readOperationKey: () => readOperationKeyFrom(sources.opKey),
+    readOperationRun: (binding) => readOperationRunFrom(sources.opRuns, binding),
+    stage: (request) => stageOperationBundleWith(sources.staging, request),
+    appendStarted: (binding, expected, input) => appendHandoffStartedTransitionWith(sources.prepWrites, binding, expected, input),
+    appendHandoff: (binding, expected, input) => appendHandoffTransitionWith(sources.prepWrites, binding, expected, input),
+  };
+}
+
 /** Read and authenticate the durable run, refusing every non-startable state. */
-async function loadHandoffRun(root: string, binding: PreparationRunBinding): Promise<PreparationRunV1> {
-  const read = await readPreparationRun(root, binding);
+async function loadHandoffRun(steps: HandoffSteps, binding: PreparationRunBinding): Promise<PreparationRunV1> {
+  const read = await steps.readRun(binding);
   if (read.status === "unavailable" && read.code.startsWith("integrity-key")) {
     throw new HandoffError("key-unavailable", "preparation integrity key is unavailable");
   }
@@ -157,17 +223,17 @@ function fixedClock(at: string): Clock {
 
 /** Re-read the created bundle manifest and run, refusing any mismatch or absence. */
 async function verifyCreatedBundle(
-  root: string, workspaceId: string, state: HandoffStartState, expectedDigest: OperationDigest,
+  steps: HandoffSteps, workspaceId: string, state: HandoffStartState, expectedDigest: OperationDigest,
 ): Promise<void> {
-  const manifest = await readOperationManifest(root, workspaceId, state.reservedBundleId);
+  const manifest = await steps.readOperationManifest(workspaceId, state.reservedBundleId);
   if (manifest.status !== "ok") throw new HandoffError("bundle-unverifiable", `created manifest is ${manifest.status}`);
   const digest = operationManifestDigest(manifest.manifest) as OperationDigest;
   if (digest !== expectedDigest || manifest.manifest.runId !== state.reservedOperationRunId) {
     throw new HandoffError("digest-conflict", "created manifest does not match the reserved binding");
   }
-  const key = await readOperationKey(root);
+  const key = await steps.readOperationKey();
   if (key.status !== "ok") throw new HandoffError("bundle-unverifiable", "operation key is unavailable");
-  const run = await readOperationRun(root, {
+  const run = await steps.readOperationRun({
     runId: state.reservedOperationRunId, bundleId: state.reservedBundleId,
     manifestDigest: digest, workspaceId, keyEpochId: key.keyEpochId,
   });
@@ -176,9 +242,9 @@ async function verifyCreatedBundle(
 
 /** Run the complete handoff flow while the caller holds the project lock. */
 async function runHandoffLocked(
-  root: string, request: PreparationHandoffRequestV1,
+  steps: HandoffSteps, request: PreparationHandoffRequestV1,
 ): Promise<PreparationHandoffResultV1> {
-  const run = await loadHandoffRun(root, request.binding);
+  const run = await loadHandoffRun(steps, request.binding);
   // AN ADVISORY BLOCKS A HANDOFF THAT HAS NOT COMMITTED, AND ONLY THAT ONE.
   //
   // Before `handoff-started` nothing is reserved, so honoring the operator's
@@ -202,10 +268,10 @@ async function runHandoffLocked(
   // residue leg consumes the advisory. The cancel arrived after the point of no
   // return, which is exactly the after-completion case the design contemplates.
   if (run.state !== "handoff-started"
-    && await preparationCancellationRequested(root, run.workspaceId, run.runId)) {
+    && await steps.cancellationRequested(run.workspaceId, run.runId)) {
     throw new HandoffError("cancelled", "an advisory cancellation blocks handoff");
   }
-  const manifest = await readPreparationManifest(root, run.workspaceId, run.preparationId);
+  const manifest = await steps.readPreparationManifest(run.workspaceId, run.preparationId);
   if (manifest.status !== "ok") throw new HandoffError("manifest-unavailable", `manifest is ${manifest.status}`);
   if (preparationManifestDigest(manifest.manifest) !== request.binding.manifestDigest) {
     throw new HandoffError("manifest-drift", "durable manifest digest changed");
@@ -235,7 +301,7 @@ async function runHandoffLocked(
   // absent falls through and compiles normally — there is no staged bundle to
   // protect, and the authority check that a fresh compile runs is exactly right.
   if (state.resuming) {
-    const settled = await settleAlreadyCreatedHandoff(root, request, run, state);
+    const settled = await settleAlreadyCreatedHandoff(steps, request, run, state);
     if (settled !== null) return settled;
   }
   const bundle = buildHandoffBundle({
@@ -245,7 +311,7 @@ async function runHandoffLocked(
     preHandoffTransitionHash: state.preHandoffTransitionHash,
     ...(request.supersedesBundleId === undefined ? {} : { supersedesBundleId: request.supersedesBundleId }),
   });
-  return settleHandoff(root, request, run, state, bundle);
+  return settleHandoff(steps, request, run, state, bundle);
 }
 
 /**
@@ -256,19 +322,19 @@ async function runHandoffLocked(
  *   which case the caller compiles and stages normally.
  */
 async function settleAlreadyCreatedHandoff(
-  root: string, request: PreparationHandoffRequestV1, run: PreparationRunV1, state: HandoffStartState,
+  steps: HandoffSteps, request: PreparationHandoffRequestV1, run: PreparationRunV1, state: HandoffStartState,
 ): Promise<PreparationHandoffResultV1 | null> {
   const recorded = handoffStartBinding(run);
   if (recorded === undefined) throw new HandoffError("bundle-unverifiable", "handoff-started record is missing");
-  const manifest = await readOperationManifest(root, run.workspaceId, state.reservedBundleId);
+  const manifest = await steps.readOperationManifest(run.workspaceId, state.reservedBundleId);
   // ABSENT is the only fall-through. An `unavailable` manifest is a read this
   // host could not trust, and treating it as "not created yet" would recompile
   // and re-stage over durable bytes it simply failed to see.
   if (manifest.status === "absent") return null;
   const bundleManifestDigest = recorded.bundleManifestDigest as unknown as OperationDigest;
-  await verifyCreatedBundle(root, run.workspaceId, state, bundleManifestDigest);
-  await assertCreatedGenesisAuthority(root, run, state, recorded.genesisAuthorityDigest);
-  await appendHandoffTransitionLocked(root, request.binding, await currentPredecessor(root, request.binding), {
+  await verifyCreatedBundle(steps, run.workspaceId, state, bundleManifestDigest);
+  await assertCreatedGenesisAuthority(steps, run, state, recorded.genesisAuthorityDigest);
+  await steps.appendHandoff(request.binding, await currentPredecessor(steps, request.binding), {
     actor: request.actor, at: request.at,
   });
   return {
@@ -288,14 +354,14 @@ async function settleAlreadyCreatedHandoff(
  * second copy of the field list.
  */
 async function assertCreatedGenesisAuthority(
-  root: string, run: PreparationRunV1, state: HandoffStartState, expected: Sha256Digest,
+  steps: HandoffSteps, run: PreparationRunV1, state: HandoffStartState, expected: Sha256Digest,
 ): Promise<void> {
-  const manifest = await readOperationManifest(root, run.workspaceId, state.reservedBundleId);
-  const key = await readOperationKey(root);
+  const manifest = await steps.readOperationManifest(run.workspaceId, state.reservedBundleId);
+  const key = await steps.readOperationKey();
   if (manifest.status !== "ok" || key.status !== "ok") {
     throw new HandoffError("bundle-unverifiable", "created bundle authority is unreadable");
   }
-  const opRun = await readOperationRun(root, {
+  const opRun = await steps.readOperationRun({
     runId: state.reservedOperationRunId, bundleId: state.reservedBundleId,
     manifestDigest: operationManifestDigest(manifest.manifest) as OperationDigest,
     workspaceId: run.workspaceId, keyEpochId: key.keyEpochId,
@@ -308,26 +374,26 @@ async function assertCreatedGenesisAuthority(
 
 /** Verify caps, record handoff-started (or re-verify a resume), stage, and settle. */
 async function settleHandoff(
-  root: string, request: PreparationHandoffRequestV1, run: PreparationRunV1,
+  steps: HandoffSteps, request: PreparationHandoffRequestV1, run: PreparationRunV1,
   state: HandoffStartState, bundle: ReturnType<typeof buildHandoffBundle>,
 ): Promise<PreparationHandoffResultV1> {
   const reservedIds = { bundleId: state.reservedBundleId, runId: state.reservedOperationRunId };
   const clock = fixedClock(state.bundleClockAt);
-  const preview = await stageOperationBundleLocked(root, {
+  const preview = await steps.stage({
     draft: bundle.draft, payloads: bundle.payloads, reservedIds, clock, dryRun: true,
   });
   const bundleManifestDigest = preview.manifestDigest as OperationDigest;
-  await recordOrVerifyStart(root, request, run, state, bundle, bundleManifestDigest);
+  await recordOrVerifyStart(steps, request, run, state, bundle, bundleManifestDigest);
   await request.faultsForTest?.afterHandoffStarted?.();
-  const staged = await stageOperationBundleLocked(root, {
+  const staged = await steps.stage({
     draft: bundle.draft, payloads: bundle.payloads, reservedIds, clock,
   });
   if ((staged.manifestDigest as OperationDigest) !== bundleManifestDigest) {
     throw new HandoffError("digest-conflict", "staged manifest digest drifted from the reserved digest");
   }
-  await verifyCreatedBundle(root, run.workspaceId, state, bundleManifestDigest);
+  await verifyCreatedBundle(steps, run.workspaceId, state, bundleManifestDigest);
   await request.faultsForTest?.afterStage?.();
-  await appendHandoffTransitionLocked(root, request.binding, await currentPredecessor(root, request.binding), {
+  await steps.appendHandoff(request.binding, await currentPredecessor(steps, request.binding), {
     actor: request.actor, at: request.at,
   });
   return {
@@ -338,7 +404,7 @@ async function settleHandoff(
 
 /** Durably record handoff-started when fresh; on resume assert the recorded digests. */
 async function recordOrVerifyStart(
-  root: string, request: PreparationHandoffRequestV1, run: PreparationRunV1,
+  steps: HandoffSteps, request: PreparationHandoffRequestV1, run: PreparationRunV1,
   state: HandoffStartState, bundle: ReturnType<typeof buildHandoffBundle>, bundleManifestDigest: OperationDigest,
 ): Promise<void> {
   const genesisAuthorityDigest = parseSha256Digest(handoffGenesisAuthorityDigest(bundle.draft.run));
@@ -350,7 +416,7 @@ async function recordOrVerifyStart(
     evidenceCopyDigest: parseSha256Digest(bundle.evidenceCopyDigest),
   };
   if (!state.resuming) {
-    await appendHandoffStartedTransitionLocked(root, request.binding, preparationRunPredecessor(run), {
+    await steps.appendStarted(request.binding, preparationRunPredecessor(run), {
       actor: request.actor, at: request.at, start,
     });
     return;
@@ -363,8 +429,8 @@ async function recordOrVerifyStart(
 }
 
 /** Read the current authenticated predecessor for an under-lock append. */
-async function currentPredecessor(root: string, binding: PreparationRunBinding) {
-  const read = await readPreparationRun(root, binding);
+async function currentPredecessor(steps: HandoffSteps, binding: PreparationRunBinding) {
+  const read = await steps.readRun(binding);
   if (read.status !== "ok") throw new HandoffError("bundle-unverifiable", `run is ${read.status}`);
   return preparationRunPredecessor(read.run);
 }
@@ -377,10 +443,17 @@ async function currentPredecessor(root: string, binding: PreparationRunBinding) 
 export async function handoffPreparation(
   root: string, request: PreparationHandoffRequestV1,
 ): Promise<PreparationHandoffResultV1> {
-  await acquireMutationLockBlocking(root, "handoff");
+  return handoffPreparationWith(diskHandoffSteps(root), request);
+}
+
+/** {@link handoffPreparation} over {@link HandoffSteps}: THE ONE BODY. The lock is released before returning. */
+export async function handoffPreparationWith(
+  steps: HandoffSteps, request: PreparationHandoffRequestV1,
+): Promise<PreparationHandoffResultV1> {
+  await steps.lock.acquire();
   try {
-    return await runHandoffLocked(root, request);
+    return await runHandoffLocked(steps, request);
   } finally {
-    await releaseLock(root);
+    await steps.lock.release();
   }
 }

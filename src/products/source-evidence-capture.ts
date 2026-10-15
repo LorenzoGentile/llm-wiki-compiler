@@ -13,17 +13,16 @@
  * uses (flat leaves under `sources/`, no separators, no dot-segments), so what
  * the host seals and what the run later re-verifies are reads of the same
  * shape — a path this refuses is a path the run would have refused.
+ *
+ * ONE BODY. {@link captureSourceEvidenceInput} keeps its signature and runs
+ * {@link captureSourceEvidenceInputFrom} over the shared source read
+ * (`diskSourceLeafReads`, the same confined read under `sources/`).
  */
 
-import path from "node:path";
-import { isFlatSourceLeaf as isFlatLeaf } from "../utils/flat-source-leaf.js";
+import { diskSourceLeafReads, isFlatSourceLeaf as isFlatLeaf, type SourceLeafReads } from "../utils/flat-source-leaf.js";
 import { createHash } from "node:crypto";
-import { readConfinedLeafBuffer } from "../utils/confined-read.js";
 import type { PackActionInputValueV2, WorkspaceOperationsPackV2 } from "../operations-packs/types.js";
 import type { SourceEvidenceDescriptorV2 } from "../operations-packs/recipe-types.js";
-
-/** The retention directory paths are relative to; matches the runtime builder. */
-const SOURCES_DIR = "sources";
 
 /** One capture outcome: the input with host-owned columns, or a named refusal. */
 export type SourceEvidenceCaptureV1 =
@@ -85,6 +84,18 @@ export async function captureSourceEvidenceInput(
   root: string, pack: WorkspaceOperationsPackV2, actionId: string,
   input: Readonly<Record<string, PackActionInputValueV2>>,
 ): Promise<SourceEvidenceCaptureV1> {
+  return captureSourceEvidenceInputFrom(diskSourceLeafReads(root), pack, actionId, input);
+}
+
+/**
+ * THE ONE BODY of {@link captureSourceEvidenceInput}: the descriptor, the paths
+ * column and its item cap, then per path IN ORDER the flat-leaf refusal before any
+ * read, the read's verdict, the running byte cap, and the host-computed digest.
+ */
+export async function captureSourceEvidenceInputFrom(
+  reads: SourceLeafReads, pack: WorkspaceOperationsPackV2, actionId: string,
+  input: Readonly<Record<string, PackActionInputValueV2>>,
+): Promise<SourceEvidenceCaptureV1> {
   const descriptor = descriptorFor(pack, actionId);
   if (descriptor === undefined) return { input };
   if ("refused" in descriptor) return descriptor;
@@ -94,14 +105,12 @@ export async function captureSourceEvidenceInput(
   if (paths.length > descriptor.maxItems) {
     return { refused: `${paths.length} source-evidence paths exceed the sealed maxItems of ${descriptor.maxItems}` };
   }
-  const sourcesRoot = path.join(root, SOURCES_DIR);
   const digests: string[] = [];
   const byteCounts: string[] = [];
   let totalBytes = 0;
   for (const relative of paths) {
     if (!isFlatLeaf(relative)) return { refused: `source-evidence path ${JSON.stringify(relative)} is not a flat leaf under sources/` };
-    const read = await readConfinedLeafBuffer(
-      sourcesRoot, path.join(sourcesRoot, relative), sourcesRoot, descriptor.maxBytes);
+    const read = await reads.readSourceLeaf(relative, descriptor.maxBytes);
     if (read.kind !== "ok") return { refused: `source ${relative} is ${read.kind} under sources/` };
     totalBytes += read.body.length;
     if (totalBytes > descriptor.maxBytes) return { refused: `source-evidence bytes exceed the sealed maxBytes of ${descriptor.maxBytes}` };

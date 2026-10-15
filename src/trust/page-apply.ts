@@ -14,23 +14,44 @@
  * executor imports these so it depends on page-apply — NOT the reverse — which
  * keeps the lifecycle handler free to import this primitive without an
  * executor↔lifecycle-apply import cycle.
+ *
+ * STORAGE. The per-page apply has ONE BODY, {@link applyPageMutationLockedFrom},
+ * over the raw page I/O it asks ({@link PageApplyIo}: confine, presence, the
+ * capped confined read for net growth, and the unlink) plus the two
+ * collaborators its caller already owns: the pre-state recorder and the write.
+ * {@link applyPageMutationLocked} hands it the local disk's I/O and the default
+ * writer. What each answer MEANS stays in the body. NOT bound here: the legacy
+ * {@link JournalBatch} recorder still records through `journal.ts` on disk (the
+ * journal, recovery and locks are their own owners), and the probes are not
+ * `ProjectStore`, hosted or access-controlled.
  */
 
 import path from "path";
-import { lstat } from "fs/promises";
-import { atomicWrite } from "../utils/markdown.js";
-import { unlink } from "node:fs/promises";
-import { confineUnderRoot } from "../utils/path-confine.js";
-import { readConfinedLeaf } from "../utils/confined-read.js";
+import { readConfinedLeafText, removeLeaf, writeLeafAtomicUnconfined } from "../storage/disk-guarded-leaves.js";
+import type { CappedLeafRead } from "../utils/confined-read.js";
 import { JOURNAL_PRESTATE_MAX_BYTES } from "../utils/constants.js";
 import { recordPreState, type JournalBatch } from "./journal.js";
+
+/**
+ * Where a page write's pre-state goes before the bytes change.
+ *
+ * The legacy path records it in a pre-state-only journal batch that replay
+ * reverts unconditionally. A portable publication owns its own recovery record
+ * (a durable intent with retained pre-images) and must open NO legacy batch,
+ * or legacy replay would roll it back before that intent was ever examined. So
+ * the recorder is a parameter: a {@link JournalBatch} keeps today's behaviour,
+ * and a caller with its own recovery owner supplies a recorder instead.
+ */
+export type PreStateRecorder = JournalBatch | { recordPreState(absolutePath: string): Promise<void> };
+
+/** Record one target's pre-state with whichever recorder the caller owns. */
+async function recordWith(recorder: PreStateRecorder, abs: string): Promise<void> {
+  if ("recordPreState" in recorder) return recorder.recordPreState(abs);
+  return recordPreState(recorder, abs);
+}
 import { parseEntityId, isSafeFilenameComponent } from "../profile/identity.js";
-import {
-  checkResourceLimit,
-  checkFrontmatter,
-  resourceCapForOrigin,
-  type PageWriteContext,
-} from "./checks.js";
+import { diskPageTargetProbes, resourceCapForOrigin, type PageTargetProbes } from "./checks.js";
+import { runContentChecks } from "./content-floor.js";
 import { composeTrustDecision } from "./decision.js";
 import type { PagePlannedMutation, EntityRef, RawPageRef } from "./planner.js";
 
@@ -39,6 +60,29 @@ const APPLY_ALLOWED_DECISIONS = new Set(["allow", "allow-with-warning"]);
 
 /** A single page write. Injectable so tests can fault-inject a failure. */
 export type WriteOne = (filePath: string, content: string) => Promise<void>;
+
+/**
+ * The raw physical I/O of one page apply, besides the write: the page-target
+ * probes, plus one existing primitive each for the net-growth read and the
+ * delete. No member decides anything; the body decides what each answer means.
+ */
+export interface PageApplyIo extends PageTargetProbes {
+  /**
+   * The capped, confined read of `leaf`: refusals are values (`absent`,
+   * `unavailable`), never a follow through a link. REJECTS raw.
+   * Disk: `readConfinedLeafText(root, leaf, expectedDir, maxBytes)`.
+   */
+  readConfinedLeafText(root: string, leaf: string, expectedDir: string, maxBytes: number): Promise<CappedLeafRead>;
+  /** Unlink `leaf` by path (a link itself, never its target). REJECTS raw. Disk: `removeLeaf(leaf)`. */
+  removeLeaf(leaf: string): Promise<void>;
+}
+
+/** LOCAL DISK. The page-target probes plus the incumbent capped read and unlink; no state, frozen. In no package index. */
+export const diskPageApplyIo: PageApplyIo = Object.freeze({
+  ...diskPageTargetProbes,
+  readConfinedLeafText: (root: string, leaf: string, expectedDir: string, maxBytes: number) => readConfinedLeafText(root, leaf, expectedDir, maxBytes),
+  removeLeaf: (leaf: string) => removeLeaf(leaf),
+});
 
 /**
  * Thrown when a `create` target — free at plan time — has appeared on disk by
@@ -81,11 +125,10 @@ class MutationFloorError extends Error {
   }
 }
 
-/** True when something exists at `abs` (regular file, dir, or symlink). */
-async function targetExists(abs: string): Promise<boolean> {
+/** True when something exists at `abs` (regular file, dir, or symlink), asked through `io`; a probe fault reads as absent. */
+async function targetExists(io: PageApplyIo, abs: string): Promise<boolean> {
   try {
-    await lstat(abs);
-    return true;
+    return await io.leafPresent(path.dirname(abs), path.basename(abs));
   } catch {
     return false;
   }
@@ -155,7 +198,7 @@ function pageRelPath(mutation: PagePlannedMutation): string {
  * character length is read directly; a missing/unreadable file yields 0 (no
  * exemption), keeping the origin cap.
  */
-async function effectiveMaxChars(root: string, mutation: PagePlannedMutation, abs: string): Promise<number> {
+async function effectiveMaxChars(io: PageApplyIo, root: string, mutation: PagePlannedMutation, abs: string): Promise<number> {
   const originCap = resourceCapForOrigin(mutation.provenance.origin);
   if (mutation.operation !== "update") return originCap;
   // Root-anchored, no-follow, capped read (mirrors recordPreState one hop later):
@@ -165,7 +208,7 @@ async function effectiveMaxChars(root: string, mutation: PagePlannedMutation, ab
   // is the LEXICAL in-root parent from `pageRelPath` so it is NOT realpath'd (which
   // would follow the very symlink we must reject).
   const expectedDir = path.join(path.resolve(root), path.dirname(pageRelPath(mutation)));
-  const existing = await readConfinedLeaf(root, abs, expectedDir, JOURNAL_PRESTATE_MAX_BYTES);
+  const existing = await io.readConfinedLeafText(root, abs, expectedDir, JOURNAL_PRESTATE_MAX_BYTES);
   const existingChars = existing.kind === "ok" ? existing.body.length : 0;
   return Math.max(originCap, existingChars);
 }
@@ -181,20 +224,11 @@ async function effectiveMaxChars(root: string, mutation: PagePlannedMutation, ab
  * keeps the absolute origin cap, while an `update` gates on net growth so a
  * no-content-added update of an already-large page is admitted (see that helper).
  */
-async function assertFloorAtApply(root: string, mutation: PagePlannedMutation, abs: string): Promise<void> {
-  const ctx: PageWriteContext = {
-    root,
-    targetPath: abs,
-    body: mutation.body,
-    allowOverwrite: mutation.operation === "update",
-    // SAME origin→cap mapping the planner used, so a compile page allowed at plan
-    // time is not rejected here by a smaller (single-source) cap, and a non-compile
-    // page never sneaks past the single-source floor at apply time. For an update,
-    // raised to the on-disk length so a no-growth rewrite of an over-cap page is
-    // not blocked by a floor sized for NEW content.
-    maxBodyChars: await effectiveMaxChars(root, mutation, abs),
-  };
-  const checks = await Promise.all([checkResourceLimit(ctx), checkFrontmatter(ctx)]);
+async function assertFloorAtApply(io: PageApplyIo, root: string, mutation: PagePlannedMutation, abs: string): Promise<void> {
+  // SAME origin→cap mapping the planner used, raised to the on-disk length for an
+  // update so a no-growth rewrite of an over-cap page is not blocked. The checks
+  // themselves are the shared path-free floor, so a host with no paths runs them too.
+  const checks = await runContentChecks(mutation.body, await effectiveMaxChars(io, root, mutation, abs));
   const decision = composeTrustDecision(checks, { reviewRouted: false });
   if (!APPLY_ALLOWED_DECISIONS.has(decision)) {
     const reason = checks.find((c) => c.verdict === "block")?.message ?? decision;
@@ -216,8 +250,9 @@ async function assertFloorAtApply(root: string, mutation: PagePlannedMutation, a
  *
  * @param root - Absolute project root the write must stay confined to.
  * @param mutation - The approved page mutation to apply.
- * @param batch - The open journal batch the pre-state is recorded into.
- * @param writeOne - Per-target write primitive (defaults to {@link atomicWrite}).
+ * @param batch - The legacy journal batch, or the caller's own pre-state recorder.
+ * @param writeOne - Per-target write primitive (defaults to
+ *   {@link writeLeafAtomicUnconfined}: `atomicWrite` with no confine root).
  */
 /**
  * Remove one confined page, recorded so a crash reverts it.
@@ -236,24 +271,47 @@ async function assertFloorAtApply(root: string, mutation: PagePlannedMutation, a
  * present"; something else reaching it first does not make this batch a
  * failure, and refusing would strand a retry after a partial apply.
  */
-async function deletePageLocked(abs: string, batch: JournalBatch): Promise<void> {
-  if (!(await targetExists(abs))) return;
-  await recordPreState(batch, abs);
-  await unlink(abs);
+async function deletePageLocked(io: PageApplyIo, abs: string, batch: PreStateRecorder): Promise<void> {
+  if (!(await targetExists(io, abs))) return;
+  await recordWith(batch, abs);
+  await io.removeLeaf(abs);
 }
 
 export async function applyPageMutationLocked(
   root: string,
   mutation: PagePlannedMutation,
-  batch: JournalBatch,
-  writeOne: WriteOne = atomicWrite,
+  batch: PreStateRecorder,
+  writeOne: WriteOne = writeLeafAtomicUnconfined,
 ): Promise<void> {
-  const abs = await confineUnderRoot(pageRelPath(mutation), root, { mustExist: false });
-  if (mutation.operation === "delete") return deletePageLocked(abs, batch);
-  if (mutation.operation === "create" && (await targetExists(abs))) {
+  return applyPageMutationLockedFrom(diskPageApplyIo, root, mutation, batch, writeOne);
+}
+
+/**
+ * {@link applyPageMutationLocked} over `io`: THE ONE BODY. The identity floor
+ * (before any I/O), the confinement (a rejection propagates), the delete of an
+ * absent page (a no-op, no floor, no record), the create collision (before the
+ * floor), the net-growth floor (an unreadable page counts as 0 characters), the
+ * pre-state record BEFORE the write, and the write are all decided here.
+ *
+ * @param io - The raw page I/O; `root` is handed to it as data.
+ * @param root - Project root the write must stay confined to.
+ * @param mutation - The approved page mutation to apply.
+ * @param batch - The legacy journal batch, or the caller's own pre-state recorder.
+ * @param writeOne - The per-target write; required here, so the body has no disk default.
+ */
+export async function applyPageMutationLockedFrom(
+  io: PageApplyIo,
+  root: string,
+  mutation: PagePlannedMutation,
+  batch: PreStateRecorder,
+  writeOne: WriteOne,
+): Promise<void> {
+  const abs = await io.confineTarget(pageRelPath(mutation), root);
+  if (mutation.operation === "delete") return deletePageLocked(io, abs, batch);
+  if (mutation.operation === "create" && (await targetExists(io, abs))) {
     throw new CreateCollisionError(abs);
   }
-  await assertFloorAtApply(root, mutation, abs);
-  await recordPreState(batch, abs);
+  await assertFloorAtApply(io, root, mutation, abs);
+  await recordWith(batch, abs);
   await writeOne(abs, mutation.body);
 }

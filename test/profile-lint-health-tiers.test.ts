@@ -39,7 +39,7 @@ it.each([
   [new GraphDirConfinementError("graph"), "event-store-graph-dir"],
   [new PrivateDirConfinementError("private"), "event-store-private-dir"],
 ] as const)("tiers actual event failure %s as %s", async (error, rule) => {
-  vi.spyOn(events, "readEvents").mockRejectedValue(error);
+  vi.spyOn(events, "readEventsFrom").mockRejectedValue(error);
   const found = await checkEventChain(env.dir);
   expectDeterministicFinding(found, rule);
 });
@@ -50,7 +50,7 @@ it.each([
   [new RelationStoreSymlinkError("symlink"), "relation-store-symlink"],
   [new GraphDirConfinementError("graph"), "relation-store-graph-dir"],
 ] as const)("tiers actual relation failure %s as %s", async (error, rule) => {
-  vi.spyOn(relations, "readRelations").mockRejectedValue(error);
+  vi.spyOn(relations, "readRelationsFrom").mockRejectedValue(error);
   const found = await checkRelationStore(env.dir, [], profile);
   expectDeterministicFinding(found, rule);
 });
@@ -62,7 +62,7 @@ it.each([
   await writeProfileFile(env.dir, profile);
   const ref = `experiment-result/probe@sha256:${"a".repeat(64)}`;
   await writeMarkdownPage(env.dir, "wiki/experiments", "exp", `---\ntitle: E\nstage: running\nresult: ${ref}\n---\nBody.\n`);
-  vi.spyOn(artifacts, "resolveArtifactRef").mockResolvedValue({ health });
+  vi.spyOn(artifacts, "resolveArtifactRefFrom").mockResolvedValue({ health });
   const { summary, tiered } = await lintBothViews(env.dir);
   const found = summary.results.filter((r) => r.rule === health);
   expect(found).toHaveLength(1);

@@ -1,6 +1,9 @@
 /**
  * @file test/embeddings-disabled.test.ts
  * @description Environment opt-out coverage for all shared embedding refresh callers.
+ * The refresh calls the core's ONE BODY, `updateEmbeddingsLockedCoreFrom`, with
+ * its bound writer sources, so that is the seam the refresh cases spy; the direct
+ * `query --save` case still calls the root core.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +20,7 @@ import * as output from "../src/utils/output.js";
 import * as provider from "../src/utils/provider.js";
 import type { PageId } from "../src/utils/page-id.js";
 import { EmbeddingAttemptRecorder } from "../src/utils/embedding-attempts.js";
+import { boundWriterSources } from "./fixtures/embedding-success.js";
 
 const PAGE_ID = "concepts/alpha" as PageId;
 const PENDING_CONTENT = '[{"pageId":"concepts/prior","attempts":2}]\n';
@@ -46,7 +50,7 @@ function pendingPath(): string {
 async function expectRefreshRuns(value: string | undefined): Promise<void> {
   if (value === undefined) delete process.env[ENV_EMBEDDINGS];
   else process.env[ENV_EMBEDDINGS] = value;
-  const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore").mockResolvedValue({
+  const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom").mockResolvedValue({
     embedded: [PAGE_ID],
     eligible: [PAGE_ID],
     pruned: [],
@@ -64,7 +68,7 @@ describe("LLMWIKI_EMBEDDINGS", () => {
       await mkdir(path.dirname(pendingPath()), { recursive: true });
       await writeFile(pendingPath(), PENDING_CONTENT, "utf-8");
       process.env[ENV_EMBEDDINGS] = value;
-      const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore");
+      const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom");
 
       await refreshEmbeddingsDrainingPending(root, [PAGE_ID]);
 
@@ -100,7 +104,7 @@ describe("LLMWIKI_EMBEDDINGS", () => {
   });
 
   it("runs store reconciliation without creating an empty pending marker", async () => {
-    const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCore").mockResolvedValue({
+    const provider = vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom").mockResolvedValue({
       embedded: [],
       eligible: [],
       pruned: [],
@@ -108,7 +112,7 @@ describe("LLMWIKI_EMBEDDINGS", () => {
 
     await refreshEmbeddingsDrainingPending(root, []);
 
-    expect(provider).toHaveBeenCalledWith(root, [], expect.any(Function), "drain", expect.any(EmbeddingAttemptRecorder));
+    expect(provider).toHaveBeenCalledWith(boundWriterSources(), [], expect.any(Function), "drain", expect.any(EmbeddingAttemptRecorder));
     expect(existsSync(pendingPath())).toBe(false);
   });
 

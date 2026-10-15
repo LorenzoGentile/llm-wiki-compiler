@@ -25,7 +25,7 @@
 import path from "path";
 import { RELATIONS_FILE, MAX_RELATION_STORE_BYTES } from "../utils/constants.js";
 import { parseEntityId, EntityIdError } from "../profile/identity.js";
-import { readConfinedGraphStore, splitStoreRecords } from "../utils/jsonl-store.js";
+import { diskGraphStoreReads, splitStoreRecords, type GraphStoreReads } from "../utils/jsonl-store.js";
 import { isOperationBinding, type OperationBinding } from "../utils/operation-binding.js";
 import type { RelationRef, RelationRecord } from "./types.js";
 import {
@@ -66,8 +66,8 @@ export interface ReadRelationRecordsResult {
  * {@link MAX_RELATION_STORE_BYTES} before the whole-file read — so an
  * attacker/sync-controlled multi-GB file cannot exhaust memory.
  */
-function readStoreFile(root: string): Promise<string | null> {
-  return readConfinedGraphStore(root, {
+function readStoreFile(graph: GraphStoreReads): Promise<string | null> {
+  return graph.readStore({
     fileName: path.basename(RELATIONS_FILE),
     makeSymlinkError: (reason) => new RelationStoreSymlinkError(reason),
     maxBytes: MAX_RELATION_STORE_BYTES,
@@ -77,13 +77,15 @@ function readStoreFile(root: string): Promise<string | null> {
 }
 
 /**
- * Read the exact raw store bytes (or null when absent) through the same confined,
- * no-follow, capped primitive the parser uses. The store-version upgrade seam
- * consumes these bytes to rewrite only the header while preserving every record
- * byte and its order.
+ * Read the exact raw store bytes (or null when absent) through the graph-store
+ * read it is handed — the same confined, no-follow, capped read the parser uses,
+ * asked with THIS store's configuration. The store-version upgrade body consumes
+ * these bytes to rewrite only the header while preserving every record byte and
+ * its order. (It replaces the root-taking `readRelationStoreRaw`, whose only
+ * caller was that upgrade.)
  */
-export function readRelationStoreRaw(root: string): Promise<string | null> {
-  return readStoreFile(root);
+export function readRelationStoreRawFrom(graph: GraphStoreReads): Promise<string | null> {
+  return readStoreFile(graph);
 }
 
 /** Parse and validate the header line, failing closed on an unknown future version. */
@@ -195,8 +197,17 @@ function parseRecords(lines: string[], problems: string[]): BoundRelationRecord[
  * @param root - Absolute project root.
  * @returns Every valid record in append order and a list of tolerated problems.
  */
-export async function readRelationRecords(root: string): Promise<ReadRelationRecordsResult> {
-  const raw = await readStoreFile(root); // throws on symlink escape
+export function readRelationRecords(root: string): Promise<ReadRelationRecordsResult> {
+  return readRelationRecordsFrom(diskGraphStoreReads(root));
+}
+
+/**
+ * {@link readRelationRecords} over a graph-store read: THE ONE BODY. The read is
+ * asked with THIS store's configuration (file name, cap and both error
+ * factories); nothing is caught, so a rejection leaves as the same error.
+ */
+export async function readRelationRecordsFrom(graph: GraphStoreReads): Promise<ReadRelationRecordsResult> {
+  const raw = await readStoreFile(graph); // throws on symlink escape
   const recordLines = splitStoreRecords(raw, parseHeader);
   if (recordLines === null) return { records: [], problems: [] };
   const problems: string[] = [];
@@ -211,7 +222,12 @@ export async function readRelationRecords(root: string): Promise<ReadRelationRec
  * @param root - Absolute project root.
  * @returns The latest relation per id and a list of tolerated problems.
  */
-export async function readRelations(root: string): Promise<ReadRelationsResult> {
-  const { records, problems } = await readRelationRecords(root);
+export function readRelations(root: string): Promise<ReadRelationsResult> {
+  return readRelationsFrom(diskGraphStoreReads(root));
+}
+
+/** {@link readRelations} over a graph-store read: the latest record per id, in first-seen id order. */
+export async function readRelationsFrom(graph: GraphStoreReads): Promise<ReadRelationsResult> {
+  const { records, problems } = await readRelationRecordsFrom(graph);
   return { relations: latestPerId(records).map((record) => record.ref), problems };
 }

@@ -2,9 +2,15 @@
  * @file src/profile/templates/lock.ts
  * @description Strict, confined reader for advisory template provenance locks.
  * Locks help status/update locate releases but never authorize runtime behavior.
+ *
+ * ONE READ BODY: {@link readTemplateLockFrom} decides absent, unavailable,
+ * malformed and ok over {@link TemplateLockLeafReads} — the resolved private
+ * directory and one capped no-follow read inside it. This is project advisory
+ * state, not operator tap state. The root form keeps its signature and builds the
+ * local reads per call.
  */
 import path from "node:path";
-import { readCappedNoFollow } from "../../utils/confined-read.js";
+import { readCappedNoFollow, type CappedLeafRead } from "../../utils/confined-read.js";
 import { resolveExistingConfinedPrivateDir } from "../../utils/private-dir.js";
 import type {
   RemoteTemplateProvenance,
@@ -30,16 +36,32 @@ const COMMON_KEYS = [
 ] as const;
 const REMOTE_KEYS = ["coordinate", "packageDigest", "tap", "indexSequence", "publisherKeyId", "verifiedAt"] as const;
 
+/** The two looks the lock reader takes. No member takes a project root; `dir` is the handle the first returned. */
+interface TemplateLockLeafReads {
+  /** The confined `.llmwiki` directory, `null` when it is absent; rejects when it is unsafe. */
+  resolvePrivateDir(): Promise<string | null>;
+  /** The lock leaf inside `dir`, capped and no-follow. */
+  readLockLeaf(dir: string, maxBytes: number): Promise<CappedLeafRead>;
+}
+
 /** Read an advisory lock through a resolved, confined `.llmwiki` directory. */
 export async function readTemplateLock(root: string): Promise<TemplateLockRead> {
+  return readTemplateLockFrom({
+    resolvePrivateDir: () => resolveExistingConfinedPrivateDir(root),
+    readLockLeaf: (dir, maxBytes) => readCappedNoFollow(path.join(dir, "template-lock.json"), maxBytes),
+  });
+}
+
+/** {@link readTemplateLock} over {@link TemplateLockLeafReads}: THE ONE BODY. Faults never read as a missing lock. */
+export async function readTemplateLockFrom(reads: TemplateLockLeafReads): Promise<TemplateLockRead> {
   let privateDir: string | null;
   try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
+    privateDir = await reads.resolvePrivateDir();
   } catch {
     return { kind: "unavailable", detail: "private directory is unsafe" };
   }
   if (privateDir === null) return { kind: "absent" };
-  const read = await readCappedNoFollow(path.join(privateDir, "template-lock.json"), MAX_TEMPLATE_LOCK_BYTES);
+  const read = await reads.readLockLeaf(privateDir, MAX_TEMPLATE_LOCK_BYTES);
   if (read.kind === "absent") return { kind: "absent" };
   if (read.kind === "unavailable") return { kind: "unavailable", detail: "lock leaf is unreadable or unsafe" };
   return parseLockText(read.body);

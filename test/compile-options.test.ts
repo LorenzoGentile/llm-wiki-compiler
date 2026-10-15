@@ -40,7 +40,7 @@ describe("compile options", () => {
   ): Promise<{ refreshed: boolean; pages: string[] }> {
     stubCompile();
     const embedSpy = vi
-      .spyOn(embeddings, "updateEmbeddingsLockedCore")
+      .spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
       .mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
     const result = await createWiki({ root: ctx.dir }).compile(options);
     return { refreshed: embedSpy.mock.calls.length > 0, pages: result.pages };

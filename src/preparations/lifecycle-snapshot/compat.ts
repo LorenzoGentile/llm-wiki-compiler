@@ -9,6 +9,7 @@ import { withPreparationLifecycleRead } from "./read.js";
 import type {
   PreparationLifecycleOperationV1,
   PreparationLifecycleProblemV1,
+  PreparationLifecycleReadV1,
   PreparationLifecycleSnapshotV1,
   PreparationLifecycleUnitV1,
 } from "./types.js";
@@ -141,15 +142,28 @@ type LifecyclePendingStateV1 =
  * was deleted as dead. These are not for read composition. A
  * read consumer must compose from one supplied read; see the structural control
  * in test/preparations/lifecycle-model/structural-controls.test.ts.
+ *
+ * What each wrapper DECIDES is a pure function of the one read it was lent
+ * ({@link quarantineUnitListingOf}, {@link quarantineUnitPendingOf}), so the
+ * fail-closed answer to an unavailable read has one home. The capture and the
+ * root stay here: binding them is the 9D/9E custody work, which this does not do.
  */
+
+/** The quarantine listing one lent read supports: an unavailable read lists nothing. */
+export function quarantineUnitListingOf(read: PreparationLifecycleReadV1): QuarantineUnitListingV1 {
+  return read.status === "unavailable" ? { status: "unavailable" } : projectQuarantineUnits(read.snapshot);
+}
+
+/** Whether one lent read leaves `unitId` pending. An unavailable read is pending: absent evidence is not completion. */
+export function quarantineUnitPendingOf(read: PreparationLifecycleReadV1, unitId: string): boolean {
+  return read.status === "unavailable" ? true : projectQuarantineUnitPending(read.snapshot, unitId);
+}
 
 /** Task 9D/9E operation wrapper: quarantine listing through one capture. */
 export async function listQuarantineUnitsFromRoot(
   root: string,
 ): Promise<QuarantineUnitListingV1> {
-  return withPreparationLifecycleRead(root, (read) => (read.status === "unavailable"
-    ? { status: "unavailable" as const }
-    : projectQuarantineUnits(read.snapshot)));
+  return withPreparationLifecycleRead(root, quarantineUnitListingOf);
 }
 
 /** Task 9D/9E operation wrapper: unit pendingness through one capture. */
@@ -157,9 +171,7 @@ export async function quarantineUnitPendingFromRoot(
   root: string,
   unitId: string,
 ): Promise<boolean> {
-  return withPreparationLifecycleRead(root, (read) => (read.status === "unavailable"
-    ? true
-    : projectQuarantineUnitPending(read.snapshot, unitId)));
+  return withPreparationLifecycleRead(root, (read) => quarantineUnitPendingOf(read, unitId));
 }
 
 /**

@@ -31,16 +31,38 @@
  *   - {@link ArtifactPreconditionUnverifiableError} — the required artifact could
  *     not be verified (unreadable / genuine store fault), so the precondition could
  *     not be checked (TRANSIENT: a caller PARKS/retries rather than terminally failing).
+ *
+ * ONE BODY: {@link validateLiveTypedPageFrom} (and {@link assertBodyLifecycleFrom}
+ * inside it) decides over {@link TypedPageValidationReads} — the previous-state
+ * page looks and the gated state-entry seam, the same three members the lifecycle
+ * mutation's sources carry. The root forms keep their signatures and pass
+ * {@link diskTypedPageValidationReads}: `resolveConfinedEntityPage`, `safeReadFile`
+ * and `enforceGatedStateEntry`, each called when asked.
  */
 
-import { parseFrontmatter } from "../utils/markdown.js";
+import { parseFrontmatter, safeReadFile } from "../utils/markdown.js";
 import { assertBodyWithinResourceLimit } from "./checks.js";
 import { EntityFieldContractError } from "../profile/field-contract.js";
 import { entityFieldViolations } from "../profile/artifact-ref-validate.js";
 import { validateLifecycleTransition, LifecycleTransitionError } from "../profile/lifecycle.js";
-import { readPrevLifecycleState } from "../profile/lifecycle-read.js";
-import { enforceGatedStateEntry } from "./gated-state-entry.js";
+import { readPrevLifecycleStateFrom, resolveConfinedEntityPage, type PrevLifecyclePageReads } from "../profile/lifecycle-read.js";
+import { enforceGatedStateEntry, type GatedStateEntryInput } from "./gated-state-entry.js";
 import type { EntityTypeDef, ProfilePack } from "../profile/types.js";
+
+/** What the live typed-page validation asks of the project. No member takes a project root. */
+export interface TypedPageValidationReads extends PrevLifecyclePageReads {
+  /** DOMAIN. The state-entry preconditions (relation-count, then artifact). Local: `enforceGatedStateEntry({ root, ...input })`. */
+  enforceEntry(input: Omit<GatedStateEntryInput, "root">): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent page looks and the gated seam for one root, built per call; each called when asked. */
+export function diskTypedPageValidationReads(root: string): TypedPageValidationReads {
+  return {
+    resolvePage: (def, slug) => resolveConfinedEntityPage(root, def, slug),
+    readPage: (real) => safeReadFile(real),
+    enforceEntry: (input) => enforceGatedStateEntry({ root, ...input }),
+  };
+}
 
 /** Inputs to {@link validateLiveTypedPage}; grouped to keep the arg list small. */
 export interface LiveTypedPageValidationInput {
@@ -103,9 +125,20 @@ export async function assertBodyLifecycle(
   meta: Record<string, unknown>,
   def: EntityTypeDef,
 ): Promise<void> {
+  return assertBodyLifecycleFrom(diskTypedPageValidationReads(root), entityType, slug, meta, def);
+}
+
+/** {@link assertBodyLifecycle} over the previous-state looks: THE ONE BODY. No lifecycle reads nothing. */
+export async function assertBodyLifecycleFrom(
+  reads: PrevLifecyclePageReads,
+  entityType: string,
+  slug: string,
+  meta: Record<string, unknown>,
+  def: EntityTypeDef,
+): Promise<void> {
   const lifecycle = def.lifecycle;
   if (!lifecycle) return;
-  const prev = await readPrevLifecycleState(root, def, slug, lifecycle.field);
+  const prev = await readPrevLifecycleStateFrom(reads, def, slug, lifecycle.field);
   const problems = validateLifecycleTransition(lifecycle, prev, meta[lifecycle.field], meta);
   if (problems.length > 0) throw new LifecycleTransitionError(entityType, slug, problems);
 }
@@ -142,11 +175,23 @@ function enteredLifecycleState(meta: Record<string, unknown>, def: EntityTypeDef
  * @throws {ArtifactPreconditionUnverifiableError} When a required artifact is unverifiable.
  */
 export async function validateLiveTypedPage(input: LiveTypedPageValidationInput): Promise<void> {
-  const { root, profile, entityType, slug, body, def } = input;
+  const { root, ...request } = input;
+  return validateLiveTypedPageFrom(diskTypedPageValidationReads(root), request);
+}
+
+/**
+ * {@link validateLiveTypedPage} over {@link TypedPageValidationReads}: THE ONE BODY.
+ * The contract (cap, then parse), the lifecycle FSM against the previous state,
+ * then — only for a body entering a string lifecycle state — the gated seam.
+ */
+export async function validateLiveTypedPageFrom(
+  reads: TypedPageValidationReads, input: Omit<LiveTypedPageValidationInput, "root">,
+): Promise<void> {
+  const { profile, entityType, slug, body, def } = input;
   const meta = assertBodyFieldContract(profile, entityType, slug, body, def);
-  await assertBodyLifecycle(root, entityType, slug, meta, def);
+  await assertBodyLifecycleFrom(reads, entityType, slug, meta, def);
   const enteredState = enteredLifecycleState(meta, def);
   if (enteredState !== undefined) {
-    await enforceGatedStateEntry({ root, profile, entityType, slug, enteredState, lifecycle: def.lifecycle!, meta });
+    await reads.enforceEntry({ profile, entityType, slug, enteredState, lifecycle: def.lifecycle!, meta });
   }
 }

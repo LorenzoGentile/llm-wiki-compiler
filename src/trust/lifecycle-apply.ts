@@ -29,7 +29,7 @@
  * handler commits the page batch and THEN emits the event, sequentially, with no
  * cross-store journal spanning both. Two checks run BEFORE the page write so a
  * deterministic event failure never lands an unaudited page: the event store is
- * pre-flighted for HEALTH ({@link prepareEventStoreForAppend} — a tampered/
+ * pre-flighted for HEALTH ({@link prepareEventStoreForAppendFrom} — a tampered/
  * symlinked/too-new store fails CLOSED with nothing written) AND the would-be
  * event record's SIZE is pre-flighted ({@link preflightEventAppend}) over the
  * SAME content that will be appended — and that content records ONLY the declared
@@ -41,25 +41,39 @@
  * pre-flights that fails mid-emit AFTER the page mutation lands — e.g. an I/O
  * fault), closed only by the Phase-5 cross-store op-ID journal. Do NOT read this
  * as all-or-none across the two stores.
+ *
+ * ONE BODY. {@link applyLifecycleLocked} runs {@link applyLifecycleLockedWith}
+ * over {@link localLifecycleApplySources}: the incumbent profile load, confined
+ * page resolve, swallowing page read and gated-state seam (each called at call
+ * time with the arguments it always got), the page journal's and page write's
+ * own raw I/O, the default writer, and the audit store's bound-append sources.
+ * The context refusals, the decision, the order (gate → audit health → event
+ * pre-flight → journalled page write → event), the bytes and the residual stay
+ * in this file. The caller still holds the lock; nothing here takes one.
  */
 
 import { loadNonDefaultProfile } from "../profile/block.js";
 import { LockBusyError } from "../utils/lock.js";
 import { parseFrontmatter, safeReadFile } from "../utils/markdown.js";
 import { resolveConfinedEntityPage } from "../profile/lifecycle-read.js";
-import { prepareEventStoreForAppend } from "../events/store-read.js";
-import { appendBoundEventLocked, appendEventLocked, preflightEventAppend, type AppendEventInput } from "../events/store.js";
+import { prepareEventStoreForAppendFrom } from "../events/store-read.js";
+import {
+  appendBoundEventLockedFrom, appendEventLockedFrom, diskEventBoundWriteSources, preflightEventAppendFrom,
+  type AppendEventInput, type EventBoundWriteSources,
+} from "../events/store.js";
+import { writeLeafAtomicUnconfined } from "../storage/disk-guarded-leaves.js";
 import type { OperationBinding } from "../utils/operation-binding.js";
 import { entityId } from "../profile/identity.js";
 import { validateLifecycleTransition, LifecycleTransitionError } from "../profile/lifecycle.js";
 import { entityFieldViolations } from "../profile/artifact-ref-validate.js";
 import { composeTrustDecision, checkFromProblems, type TrustCheckResult, type TrustDecision } from "./decision.js";
-import { applyPageMutationLocked } from "./page-apply.js";
-import { openBatch, commitBatch } from "./journal.js";
+import { applyPageMutationLockedFrom, diskPageApplyIo, type PageApplyIo, type WriteOne } from "./page-apply.js";
+import { commitBatchFrom, openBatchFrom, recordPreStateFrom } from "./journal.js";
+import { diskJournalBatchIo, type JournalBatchIo } from "./journal-io.js";
 import { allowedEvidence } from "./lifecycle-body.js";
 import { rebuildLifecycleFrontmatter } from "./lifecycle-frontmatter.js";
-import { enforceGatedStateEntry } from "./gated-state-entry.js";
-import type { EntityTypeDef, ProfilePack } from "../profile/types.js";
+import { enforceGatedStateEntry, type GatedStateEntryInput } from "./gated-state-entry.js";
+import type { EntityTypeDef, LoadedProfile, ProfilePack } from "../profile/types.js";
 import type { LifecycleTransitionPlannedMutation, PagePlannedMutation } from "./planner.js";
 
 /** The origin a lifecycle page write carries; maps to the single-source floor cap. */
@@ -106,6 +120,48 @@ export class LifecycleTransitionLockError extends LockBusyError {
   }
 }
 
+/**
+ * Everything {@link applyLifecycleLockedWith} asks for. Four lifecycle members
+ * (two DOMAIN, two raw PHYSICAL reads), and the existing raw ports of the page
+ * journal, the page write and the audit store. Not `ProjectStore`, not hosted,
+ * and it selects no backend.
+ */
+export interface LifecycleApplySources {
+  /** The project root, handed to the journal and page bodies as data. */
+  root: string;
+  /** DOMAIN. The active non-default profile, or `undefined`. Local: `loadNonDefaultProfile(root)`. */
+  loadProfile(): Promise<LoadedProfile | undefined>;
+  /** The confined real path of the entity page, or `null`. Local: `resolveConfinedEntityPage(root, def, slug)`. */
+  resolvePage(def: EntityTypeDef, slug: string): Promise<string | null>;
+  /** The page text at `real`; `""` on ANY read failure, as always. Local: `safeReadFile(real)`. */
+  readPage(real: string): Promise<string>;
+  /** DOMAIN. The state-entry preconditions (relation-count, then artifact). Local: `enforceGatedStateEntry({ root, ...input })`. */
+  enforceEntry(input: Omit<GatedStateEntryInput, "root">): Promise<void>;
+  /** The page journal's raw I/O. Local: `diskJournalBatchIo`. */
+  journal: JournalBatchIo;
+  /** The page write's raw I/O. Local: `diskPageApplyIo`. */
+  page: PageApplyIo;
+  /** The per-target write. Local: `writeLeafAtomicUnconfined`, the default the page write always had here. */
+  writeOne: WriteOne;
+  /** The audit store's read, repair, pre-flight, append, seal and durable header. Local: `diskEventBoundWriteSources(root)`. */
+  events: EventBoundWriteSources;
+}
+
+/** LOCAL. The incumbent collaborators for the project at `root`, each called at call time. Building them does no I/O. In no package index. */
+function localLifecycleApplySources(root: string): LifecycleApplySources {
+  return {
+    root,
+    loadProfile: () => loadNonDefaultProfile(root),
+    resolvePage: (def, slug) => resolveConfinedEntityPage(root, def, slug),
+    readPage: (real) => safeReadFile(real),
+    enforceEntry: (input) => enforceGatedStateEntry({ root, ...input }),
+    journal: diskJournalBatchIo,
+    page: diskPageApplyIo,
+    writeOne: (filePath, content) => writeLeafAtomicUnconfined(filePath, content),
+    events: diskEventBoundWriteSources(root),
+  };
+}
+
 /** The resolved page context a transition acts on: its def, real path, prev state, body. */
 interface PageContext {
   def: EntityTypeDef;
@@ -131,21 +187,21 @@ function rawFrontmatterOf(content: string): string {
  * CLOSED via {@link LifecycleTransitionUnavailableError} when no profile declares
  * the type, the type has no lifecycle, or no page exists at its directory/slug.
  */
-async function resolvePageContext(
-  root: string,
+async function resolvePageContextWith(
+  sources: LifecycleApplySources,
   m: LifecycleTransitionPlannedMutation,
 ): Promise<PageContext> {
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await sources.loadProfile();
   if (!loaded) throw new LifecycleTransitionUnavailableError("no-profile", "the project has no non-default profile");
   const def = loaded.profile.entities[m.entityType];
   if (!def?.lifecycle) {
     throw new LifecycleTransitionUnavailableError("no-lifecycle", `entity type "${m.entityType}" has no declared lifecycle`);
   }
-  const real = await resolveConfinedEntityPage(root, def, m.slug);
+  const real = await sources.resolvePage(def, m.slug);
   if (real === null) {
     throw new LifecycleTransitionUnavailableError("no-page", `no page at ${def.directory}/${m.slug}.md to transition`);
   }
-  const content = await safeReadFile(real);
+  const content = await sources.readPage(real);
   const { meta, body } = parseFrontmatter(content);
   return {
     def,
@@ -284,7 +340,7 @@ function refuseNonLiveWrite(
 
 /** Predict the exact lifecycle postimage under the caller's project lock. */
 export async function previewLifecycleLocked(root: string, m: LifecycleTransitionPlannedMutation) {
-  const ctx = await resolvePageContext(root, m);
+  const ctx = await resolvePageContextWith(localLifecycleApplySources(root), m);
   const { nextMeta, accepted, decision } = decideTransition(ctx, m);
   if (!LIVE_WRITE_DECISIONS.has(decision)) refuseNonLiveWrite(ctx, m, nextMeta);
   return { body: buildPageMutation(ctx, m, accepted, decision).body, decision };
@@ -333,7 +389,37 @@ export async function applyLifecycleLocked(
   m: LifecycleTransitionPlannedMutation,
   binding?: OperationBinding,
 ): Promise<TrustDecision> {
-  const ctx = await resolvePageContext(root, m);
+  return applyLifecycleLockedWith(localLifecycleApplySources(root), m, binding);
+}
+
+/**
+ * Write the lifecycle page under ONE journal batch of its own, through the
+ * sources' journal and page I/O: open, the shared page body (its pre-state
+ * recorded through the SAME journal I/O), then commit. A failed write leaves the
+ * batch pending for the next replay, as it always did.
+ */
+async function writeLifecyclePage(sources: LifecycleApplySources, pageMutation: PagePlannedMutation): Promise<void> {
+  const batch = await openBatchFrom(sources.journal, sources.root);
+  const recorder = { recordPreState: (absolutePath: string) => recordPreStateFrom(sources.journal, batch, absolutePath) };
+  await applyPageMutationLockedFrom(sources.page, sources.root, pageMutation, recorder, sources.writeOne);
+  await commitBatchFrom(sources.journal, batch);
+}
+
+/**
+ * {@link applyLifecycleLocked} over {@link LifecycleApplySources}: THE ONE BODY,
+ * in the incumbent order. The caller MUST already hold the project lock.
+ *
+ * @param sources - The lifecycle members and the journal, page and audit ports.
+ * @param m - The planned lifecycle transition (entity/slug/toState/evidence).
+ * @param binding - The operation binding for a bundle-produced transition, if any.
+ * @returns The composed live-write {@link TrustDecision}.
+ */
+export async function applyLifecycleLockedWith(
+  sources: LifecycleApplySources,
+  m: LifecycleTransitionPlannedMutation,
+  binding?: OperationBinding,
+): Promise<TrustDecision> {
+  const ctx = await resolvePageContextWith(sources, m);
   const { nextMeta, accepted, decision } = decideTransition(ctx, m);
   if (!LIVE_WRITE_DECISIONS.has(decision)) refuseNonLiveWrite(ctx, m, nextMeta);
   // State-entry preconditions for the state being ENTERED — relation-count THEN
@@ -343,8 +429,7 @@ export async function applyLifecycleLocked(
   // this path. `nextMeta` carries the post-transition frontmatter (the artifactRef the
   // gate resolves). Each enforcer early-outs when the entered state declares no such
   // requirement; an unmet/unverifiable precondition throws (page unchanged).
-  await enforceGatedStateEntry({
-    root,
+  await sources.enforceEntry({
     profile: ctx.profile,
     entityType: m.entityType,
     slug: m.slug,
@@ -353,19 +438,16 @@ export async function applyLifecycleLocked(
     meta: nextMeta,
   });
   // Audit pre-flight under the held lock: a healthy event store is a PRECONDITION.
-  await prepareEventStoreForAppend(root);
+  await prepareEventStoreForAppendFrom(sources.events);
   const event = buildLifecycleEvent(ctx, m, nextMeta, decision);
   // Size pre-flight BEFORE the page write: an over-cap event fails the transition
   // CLOSED with the page untouched, never page-committed-then-event-threw.
-  await preflightEventAppend(root, event);
-  const pageMutation = buildPageMutation(ctx, m, accepted, decision);
-  const batch = await openBatch(root);
-  await applyPageMutationLocked(root, pageMutation, batch);
-  await commitBatch(batch);
+  await preflightEventAppendFrom(sources.events, event);
+  await writeLifecyclePage(sources, buildPageMutation(ctx, m, accepted, decision));
   // When invoked by an operation bundle, the derived event carries the out-of-band
   // binding (public CLI/SDK callers pass none), so crash replay matches the
   // persisted page transition back to its deterministic mutation.
-  if (binding === undefined) await appendEventLocked(root, event);
-  else await appendBoundEventLocked(root, event, binding);
+  if (binding === undefined) await appendEventLockedFrom(sources.events, event);
+  else await appendBoundEventLockedFrom(sources.events, event, binding);
   return decision;
 }

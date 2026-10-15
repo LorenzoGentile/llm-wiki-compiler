@@ -20,10 +20,10 @@
  * later slices add data.
  */
 
-import { buildViewerSnapshot } from "../viewer/snapshot.js";
 import { narrowSnapshotToContextPool } from "./typed-pages.js";
 import { applyContentTiers } from "./content-tiers.js";
-import { loadNonDefaultProfile, resolveNonDefaultProfile, type PreloadedProfile } from "../profile/block.js";
+import type { PreloadedProfile } from "../profile/block.js";
+import { diskContextPackReads, type ContextPackReads } from "./build-reads.js";
 import {
   appendArtifactWarning,
   appendJournalWarning,
@@ -31,20 +31,15 @@ import {
   appendRelationStoreWarning,
   appendStandingRelationWarnings,
 } from "./pack-warnings.js";
-import { collectProjectState } from "../project/state.js";
 import { recommendNextAction } from "../project/recommendations.js";
 import type { Recommendation, RecommendedAction } from "../project/recommendations.js";
 import type { ProjectState } from "../project/state.js";
 import type { ViewerSnapshot } from "../viewer/types.js";
 import { rankPages } from "./ranking.js";
-import { retrieveSemanticChunks } from "./retrieval.js";
 import type { SemanticRetrievalOutcome, SemanticRetrievalWarning } from "./retrieval.js";
 import { expandGraphNeighborhood } from "./graph.js";
 import type { GraphExpansionOutput } from "./graph.js";
-import {
-  createSourceWindowBudget,
-  materializeSourceWindows,
-} from "./provenance.js";
+import { createSourceWindowBudget } from "./provenance.js";
 import type { GraphData, GraphNodeId, PageId } from "../viewer/types.js";
 import { buildBudget, estimatePackTokens, trimToBudget } from "./budget.js";
 import {
@@ -85,50 +80,59 @@ interface BuildContextPackOptions {
   includeSources?: boolean;
 }
 
+/** The build options without the root: what {@link buildContextPackFrom} is asked. */
+type ContextPackRequest = Omit<BuildContextPackOptions, "root">;
+
 /**
  * Build the v1 context pack. Never throws on read-only filesystem
  * issues — the project-state collector returns conservative defaults
  * (`broken-project` state) which the orchestrator faithfully surfaces.
+ * Delegates to {@link buildContextPackFrom} over the local root readers.
  */
 export async function buildContextPack(options: BuildContextPackOptions): Promise<ContextPack> {
+  return buildContextPackFrom(diskContextPackReads(options.root), options);
+}
+
+/**
+ * {@link buildContextPack} over {@link ContextPackReads}: THE ONE BODY. Nothing
+ * here takes a project root. The reads are made in this order: snapshot,
+ * profile, project state, semantic retrieval, then (with `includeSources`) one
+ * source-window read per primary, serially, then the journal warning.
+ */
+export async function buildContextPackFrom(reads: ContextPackReads, options: ContextPackRequest): Promise<ContextPack> {
   const normalized = normalizeOptions(options);
-  const baseSnapshot = await buildViewerSnapshot(options.root);
+  const baseSnapshot = await reads.snapshot();
   // Resolve the active non-default profile ONCE and thread it through the pool
   // augmentation and tier projection, so a single pack is never assembled against
   // two mid-swapped profiles (and re-loads/re-validates are avoided). `null` marks
   // the built-in default so both steps stay a no-op and the default pack is
   // byte-identical.
-  const preloadedProfile: PreloadedProfile = (await loadNonDefaultProfile(options.root)) ?? null;
+  const preloadedProfile: PreloadedProfile = (await reads.nonDefaultProfile()) ?? null;
   // The snapshot already carries the profile's typed entity pages, so they are
   // lexically rankable + graph-reachable here without further work; this step
   // applies the pool's own `retrieval.includeInContext` policy on top. A DEFAULT
   // project gets the snapshot back unchanged (byte-identical context pack).
-  const snapshot = await narrowSnapshotToContextPool(options.root, baseSnapshot, preloadedProfile);
-  const state = await collectProjectState(options.root);
+  const snapshot = narrowSnapshotToContextPool(baseSnapshot, preloadedProfile);
+  const state = await reads.projectState();
   const recommendation = recommendNextAction(state);
   // Semantic retrieval is opportunistic — failures surface as stable
   // warning codes on the returned outcome rather than thrown errors so
   // lexical-only flows stay the default behaviour for credential-free
   // users.
-  const semantic = await retrieveSemanticChunks(
-    options.root,
-    normalized.rankingPrompt,
-    normalized.topChunks,
-  );
+  const semantic = await reads.semantic(normalized.rankingPrompt, normalized.topChunks);
   // POST-ranking, per-record content-depth projection (CLP 6.2). Reads the same
   // non-default profile the pool augmentation loads; for the built-in default it
   // is a no-op, so the default pack stays byte-identical.
-  const draft = await projectContentTiers(
+  const draft = projectContentTiers(
     assembleDraft({ snapshot, state, recommendation, options: normalized, semantic }),
     snapshot,
-    options.root,
     preloadedProfile,
   );
   // Source windows are materialized AFTER ranking so the per-pack
   // budget sees the final primary list, not every candidate.
   // Skipped entirely when `--include-sources` is off.
   const withSources = normalized.includeSources
-    ? await attachSourceWindows(draft, options.root)
+    ? await attachSourceWindows(draft, reads)
     : draft;
   // Project-state warnings (pending candidates, lint errors,
   // source-window unavailability) need the post-materialization
@@ -159,7 +163,7 @@ export async function buildContextPack(options: BuildContextPackOptions): Promis
   // post-crash or tampered state; surface it as a top-level warning (mirroring
   // appendRelationStoreWarning) so an agent SEES it. A cleanly-compiled project
   // adds nothing, so the pack stays byte-identical.
-  const withJournalWarning = await appendJournalWarning(withStandingWarning, options.root);
+  const withJournalWarning = appendJournalWarning(withStandingWarning, await reads.journalWarning());
   const graph = normalized.neighborsEnabled && normalized.depth >= 1
     ? snapshot.graph
     : null;
@@ -174,14 +178,14 @@ export async function buildContextPack(options: BuildContextPackOptions): Promis
  * return empty windows; the global 20-window cap is enforced as the
  * walk progresses.
  */
-async function attachSourceWindows(pack: ContextPack, root: string): Promise<ContextPack> {
+async function attachSourceWindows(pack: ContextPack, reads: Pick<ContextPackReads, "sourceWindows">): Promise<ContextPack> {
   const budget = createSourceWindowBudget();
   // Serial loop — `budget.remaining` is mutated between awaits inside
-  // `materializeSourceWindows`, so running pages in parallel would
+  // the window read, so running pages in parallel would
   // race on the shared counter and overshoot the 20-window cap.
   const primary: ContextPack["primary"] = [];
   for (const entry of pack.primary) {
-    const windows = await materializeSourceWindows(root, entry.citations, budget);
+    const windows = await reads.sourceWindows(entry.citations, budget);
     primary.push({ ...entry, sourceWindows: windows });
   }
   return { ...pack, primary };
@@ -220,7 +224,7 @@ export interface NormalizedOptions {
 }
 
 /** Apply defaults and clamps so downstream code can trust the field types. */
-function normalizeOptions(options: BuildContextPackOptions): NormalizedOptions {
+function normalizeOptions(options: ContextPackRequest): NormalizedOptions {
   const rankingPrompt = options.prompt ?? "";
   const { display, truncated } = truncatePrompt(rankingPrompt);
   return {
@@ -313,19 +317,17 @@ function assembleDraft(input: AssembleInput): ContextPack {
 
 /**
  * Project each ranked primary's declared per-record content tiers onto the draft
- * (CLP 6.2). Loads the active NON-DEFAULT profile once (the same one the pool
- * augmentation reads); for the built-in default profile it returns the draft
+ * (CLP 6.2), over the NON-DEFAULT profile the pack loaded once (the same one the
+ * pool narrowing reads); for the built-in default (`null`) it returns the draft
  * UNCHANGED so the default pack stays byte-identical. Never reorders `primary[]`.
  */
-async function projectContentTiers(
+function projectContentTiers(
   draft: ContextPack,
   snapshot: ViewerSnapshot,
-  root: string,
   preloaded: PreloadedProfile,
-): Promise<ContextPack> {
-  const loaded = await resolveNonDefaultProfile(root, preloaded);
-  if (loaded === undefined) return draft;
-  return applyContentTiers(draft, snapshot, loaded.profile);
+): ContextPack {
+  if (preloaded === null) return draft;
+  return applyContentTiers(draft, snapshot, preloaded.profile);
 }
 
 /**

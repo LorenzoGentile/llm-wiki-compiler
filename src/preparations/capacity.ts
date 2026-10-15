@@ -14,6 +14,36 @@
  * count every nonterminal, retained-terminal, orphan, recovery-required, and
  * integrity-invalid leaf. The prepared-inputs dimension is accounted against its
  * own ceiling.
+ *
+ * ONE BODY, OVER THE SCAN'S OWN READS. `scanPreparationInventoryFrom` is the
+ * single body; it takes `PreparationInventoryReads` and no project root.
+ * `scanPreparationInventoryFromLifecycle` keeps its signature and delegates to it
+ * over the private local-disk reads, built on each call.
+ *
+ * ONE BORROW, DECIDED IN ONE BODY. `scanPreparationInventoryBorrowingFrom` holds
+ * what the root form used to decide for itself: take the entry limit from the
+ * caller's options, borrow exactly one lifecycle read at that limit, and run the
+ * scan inside the borrow with that read. It takes
+ * `PreparationInventoryLifecycleReads` and no project root. `scanPreparationInventory`
+ * keeps its signature and reaches that body over the private local-disk reads,
+ * whose borrow is the same lifecycle capture as before.
+ *
+ * THE CAPTURE ITSELF IS NOT MOVED AND NOT MADE NEUTRAL. Root identity, scanner
+ * provenance, the lease and every physical lifecycle read stay in
+ * `lifecycle-snapshot/read.ts` and `lifecycle-fs`: ROOT-BOUND LOCAL-DISK
+ * AUTHORITY behind one line here. That is a named deferment, not an accepted
+ * mechanism.
+ *
+ * THE BOUND BODY PROVES NOTHING ABOUT A LIFECYCLE READ. Whether a successful read
+ * is scanner-minted, live, and belongs to this store is decided by
+ * `reads.assertLifecycleRead`, so THE PROOF OBLIGATION LIES WITH WHOEVER SUPPLIES
+ * THE READS. The local-disk reads carry the real check against their root. Reads
+ * whose assertion always resolves would run the whole scan on any snapshot; for
+ * that reason neither the bound body nor the interface is exported from a package
+ * entry. What is bound here is this file's own decisions (problems and their
+ * order, authority, orphans, health, totals). The five reads under it are NOT
+ * made storage-neutral by being named: each decides things of its own and each
+ * still takes a project root. Nothing here selects a backend.
  */
 
 import path from "node:path";
@@ -26,14 +56,15 @@ import {
 } from "./constants.js";
 import type { PreparationId, PreparationRunId } from "./ids.js";
 import type { PreparationEpochInventory, PreparationEpochInventoryEntry } from "./key-epoch.js";
-import { readPreparationKey } from "./key-epoch.js";
+import { readPreparationKeyEpoch } from "./key-epoch.js";
 import { validatePreparationSupersessionSet } from "./manifest-graph.js";
 import { preparationManifestDigest, type PreparationManifestV1 } from "./manifest-parse.js";
 import { readPreparationManifest } from "./manifest-store.js";
+import type { PreparationManifestRead } from "./manifest-store.js";
 import {
   preparationScanEntryLimit, scanActivePreparationStore,
   type PreparationInventoryProblem,
-  type PreparationLeafObservation, type PreparationScanOptions,
+  type PreparationLeafObservation, type PreparationOrphanScan, type PreparationScanOptions,
 } from "./orphan-scan.js";
 import {
   assertPreparationLifecycleRead,
@@ -44,7 +75,8 @@ import type {
   PreparationLifecycleStorageEntryV1,
 } from "./lifecycle-snapshot/types.js";
 import { readPreparationRun } from "./run-store.js";
-import type { PreparationRunState } from "./run-types.js";
+import type { PreparationRunRead } from "./run-store.js";
+import type { PreparationRunBinding, PreparationRunState } from "./run-types.js";
 
 const TERMINAL_STATES = new Set<PreparationRunState>([
   "handed-off", "succeeded", "succeeded-with-warnings", "failed", "cancelled",
@@ -124,14 +156,92 @@ function entry(leaves: readonly PreparationLeafObservation[], unavailable: boole
   return { count: logicalCount(leaves), bytes: uniqueBytes(leaves), health: unavailable ? "unavailable" : "ok" };
 }
 
+/**
+ * What the inventory scan asks of the preparation store. Owned by the scan; no
+ * read takes a project root.
+ */
+export interface PreparationInventoryReads {
+  /**
+   * Prove a successful lifecycle read is genuine, live, and belongs to the store
+   * these reads answer for; reject otherwise. THE SCAN RELIES ON THIS AND CHECKS
+   * NOTHING ITSELF.
+   */
+  assertLifecycleRead(read: PreparationLifecycleReadV1): Promise<void>;
+  /** The active store's leaves, directories, problems and entry use. */
+  scanActiveStore(options: PreparationScanOptions): Promise<PreparationOrphanScan>;
+  /** One manifest by workspace and preparation. */
+  readManifest(workspaceId: string, preparationId: PreparationId): Promise<PreparationManifestRead>;
+  /** Whether the preparation key can be read, and its epoch. NEVER the key bytes. */
+  readKeyEpoch(): Promise<
+    | { status: "ok"; keyEpochId: PreparationRunBinding["keyEpochId"] }
+    | { status: "absent" }
+    | { status: "unavailable" }
+  >;
+  /** One run leaf by its binding, authenticated by whatever answers. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+}
+
+/**
+ * The scan's reads TOGETHER WITH the means to borrow the lifecycle read they
+ * prove. A SEPARATE interface: a caller that already holds a read supplies
+ * {@link PreparationInventoryReads} and never borrows, so it is not made to
+ * implement a borrow it would never be asked for.
+ *
+ * ONE SUPPLIER ACQUIRES AND PROVES. `borrowLifecycleRead` and
+ * `assertLifecycleRead` answer for the same store, so a successful read lent
+ * here is one the proof here accepts while the callback runs. THE INTERFACE
+ * AUTHENTICATES NOTHING. Keeping that relationship is the supplier's
+ * obligation; a borrow from one authority paired with a proof from another is
+ * a defect this type cannot see.
+ */
+export interface PreparationInventoryLifecycleReads extends PreparationInventoryReads {
+  /**
+   * Lend ONE lifecycle read, captured over at most `maxRegistryEntries`
+   * registry entries, for the length of `use`, and settle as `use` settles. A
+   * read that could not be captured is lent as `unavailable`, not rejected. A
+   * successful read stops being valid once `use` has settled.
+   */
+  borrowLifecycleRead<T>(
+    maxRegistryEntries: number, use: (read: PreparationLifecycleReadV1) => Promise<T>,
+  ): Promise<T>;
+}
+
+/**
+ * The local-disk reads for one project root. Private, and built per call: each
+ * closure calls the imported store function when it is asked, never earlier. The
+ * lifecycle proof here is the real one, against this root.
+ */
+function diskPreparationInventoryReads(root: string): PreparationInventoryReads {
+  return {
+    assertLifecycleRead: (read) => assertPreparationLifecycleRead(root, read),
+    scanActiveStore: (options) => scanActivePreparationStore(root, options),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    readKeyEpoch: () => readPreparationKeyEpoch(root),
+    readRun: (binding) => readPreparationRun(root, binding),
+  };
+}
+
+/**
+ * The local-disk reads that can also borrow, for one project root. Private, and
+ * built per call. The borrow is the imported lifecycle capture for this root,
+ * called when it is asked and never earlier, so the read it lends is the one the
+ * proof beside it accepts. ROOT-BOUND LOCAL-DISK AUTHORITY: named, not neutral.
+ */
+function diskPreparationInventoryLifecycleReads(root: string): PreparationInventoryLifecycleReads {
+  return {
+    ...diskPreparationInventoryReads(root),
+    borrowLifecycleRead: (maxRegistryEntries, use) => withPreparationLifecycleRead(root, use, { maxRegistryEntries }),
+  };
+}
+
 /** Read every authoritative manifest and preserve invalid/unavailable state. */
 async function readManifests(
-  root: string, leaves: readonly PreparationLeafObservation[], problems: PreparationInventoryProblem[],
+  reads: PreparationInventoryReads, leaves: readonly PreparationLeafObservation[], problems: PreparationInventoryProblem[],
 ): Promise<Map<string, PreparationManifestV1>> {
   const result = new Map<string, PreparationManifestV1>();
   for (const leaf of authoritativeManifests(leaves)) {
     if (leaf.workspaceId === undefined || leaf.preparationId === undefined) continue;
-    const read = await readPreparationManifest(root, leaf.workspaceId, leaf.preparationId as PreparationId);
+    const read = await reads.readManifest(leaf.workspaceId, leaf.preparationId as PreparationId);
     if (read.status === "ok") result.set(`${leaf.workspaceId}\0${leaf.preparationId}`, read.manifest);
     else problems.push({ dimension: "manifest-state", detail: `preparation manifest is ${read.status}`, path: path.join(".llmwiki", leaf.relativePath) });
   }
@@ -140,7 +250,7 @@ async function readManifests(
 
 /** Verify one manifest's initial evidence, run leaf, and authenticated run. */
 async function preparationState(
-  root: string, manifest: PreparationManifestV1, leaves: readonly PreparationLeafObservation[],
+  reads: PreparationInventoryReads, manifest: PreparationManifestV1, leaves: readonly PreparationLeafObservation[],
   problems: PreparationInventoryProblem[],
 ): Promise<PreparationState> {
   const evidencePresent = manifest.initialEvidence.every((evidence) => leaves.some((leaf) =>
@@ -148,9 +258,9 @@ async function preparationState(
     && leaf.protocolAlias === undefined && path.basename(leaf.logicalRelativePath) === evidence.digest.slice("sha256:".length)));
   const runLeaf = hasAuthoritativeRun(leaves, manifest);
   if (!evidencePresent || !runLeaf) return { manifest, complete: false, nonterminal: false };
-  const key = await readPreparationKey(root);
+  const key = await reads.readKeyEpoch();
   if (key.status !== "ok") { problems.push({ dimension: "run-state", detail: `preparation key is ${key.status}` }); return { manifest, complete: false, nonterminal: false }; }
-  const run = await readPreparationRun(root, {
+  const run = await reads.readRun({
     runId: manifest.runId, preparationId: manifest.preparationId, workspaceId: manifest.workspaceId,
     manifestDigest: preparationManifestDigest(manifest), keyEpochId: key.keyEpochId,
   });
@@ -195,7 +305,7 @@ function workspacePreparationCounts(scan: ActivePreparationScan): Map<string, nu
 
 /** Project physical lifecycle storage without interpreting semantic pendingness. */
 async function lifecycleCapacity(
-  root: string,
+  reads: PreparationInventoryReads,
   read: PreparationLifecycleReadV1,
 ): Promise<LifecycleCapacityObservation> {
   if (read.status === "unavailable") {
@@ -209,7 +319,7 @@ async function lifecycleCapacity(
       }],
     };
   }
-  await assertPreparationLifecycleRead(root, read);
+  await reads.assertLifecycleRead(read);
   const storage = read.snapshot.storage;
   const problems: PreparationInventoryProblem[] = [];
   if (storage.quarantine.health === "unavailable") {
@@ -270,11 +380,11 @@ function noteCombinedEntryBound(
 
 /** Read and validate every manifest-backed active preparation state. */
 async function preparationStates(
-  root: string,
+  reads: PreparationInventoryReads,
   scan: ActivePreparationScan,
   problems: PreparationInventoryProblem[],
 ) {
-  const manifests = await readManifests(root, scan.leaves, problems);
+  const manifests = await readManifests(reads, scan.leaves, problems);
   const manifestList = [...manifests.values()];
   try {
     validatePreparationSupersessionSet(manifestList);
@@ -282,7 +392,7 @@ async function preparationStates(
     problems.push({ dimension: "supersession", detail: error instanceof Error ? error.message : "invalid supersession set" });
   }
   const states: PreparationState[] = [];
-  for (const manifest of manifestList) states.push(await preparationState(root, manifest, scan.leaves, problems));
+  for (const manifest of manifestList) states.push(await preparationState(reads, manifest, scan.leaves, problems));
   return { manifestList, states };
 }
 
@@ -297,13 +407,28 @@ export async function scanPreparationInventoryFromLifecycle(
   read: PreparationLifecycleReadV1,
   options: PreparationScanOptions = {},
 ): Promise<PreparationInventory> {
+  return scanPreparationInventoryFrom(diskPreparationInventoryReads(root), read, options);
+}
+
+/**
+ * {@link scanPreparationInventoryFromLifecycle} over the scan's reads: the one
+ * body. IT PROVES NOTHING ITSELF: a successful `read` is trusted exactly as far
+ * as `reads.assertLifecycleRead` vouches for it, so the caller who supplies the
+ * reads owns that proof. An unavailable read is not asserted and can only
+ * produce a fail-closed problem.
+ */
+export async function scanPreparationInventoryFrom(
+  reads: PreparationInventoryReads,
+  read: PreparationLifecycleReadV1,
+  options: PreparationScanOptions = {},
+): Promise<PreparationInventory> {
   const limit = preparationScanEntryLimit(options);
-  const lifecycle = await lifecycleCapacity(root, read);
-  const scan = await scanActivePreparationStore(root, options);
+  const lifecycle = await lifecycleCapacity(reads, read);
+  const scan = await reads.scanActiveStore(options);
   const activeProblems = [...scan.problems];
   noteCombinedEntryBound(scan, lifecycle, limit, activeProblems);
   const { manifestList, states } = await preparationStates(
-    root, scan, activeProblems,
+    reads, scan, activeProblems,
   );
   const orphans = orphanLeaves(scan, states);
   const problems = [...activeProblems, ...lifecycle.problems];
@@ -326,10 +451,21 @@ export async function scanPreparationInventory(
   root: string,
   options: PreparationScanOptions = {},
 ): Promise<PreparationInventory> {
+  return scanPreparationInventoryBorrowingFrom(diskPreparationInventoryLifecycleReads(root), options);
+}
+
+/**
+ * {@link scanPreparationInventory} over the scan's reads and their borrow: the
+ * one body. The entry limit is taken from `options` FIRST, so an option the
+ * scanner refuses rejects before anything is borrowed. Then exactly one read is
+ * borrowed at that limit, and the whole scan runs inside the borrow with that
+ * read and the SAME `options` object; the scan body derives its own limit from
+ * it again, as it did before. Nothing is caught here.
+ */
+export async function scanPreparationInventoryBorrowingFrom(
+  reads: PreparationInventoryLifecycleReads,
+  options: PreparationScanOptions = {},
+): Promise<PreparationInventory> {
   const limit = preparationScanEntryLimit(options);
-  return withPreparationLifecycleRead(
-    root,
-    (read) => scanPreparationInventoryFromLifecycle(root, read, options),
-    { maxRegistryEntries: limit },
-  );
+  return reads.borrowLifecycleRead(limit, (read) => scanPreparationInventoryFrom(reads, read, options));
 }

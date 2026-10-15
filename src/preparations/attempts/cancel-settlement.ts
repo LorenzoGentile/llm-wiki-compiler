@@ -30,21 +30,31 @@
  * phase. An empty ledger under an effect-CAPABLE plan is absence of evidence and
  * settles nothing: the run is left exactly where it is, recoverable, and is never
  * claimed cleanly cancelled.
+ *
+ * ONE BODY PER DECISION, NO ROOT. Every decision above (the bound-plan read, the
+ * durable `cancelling` capture, the advisory carry, the escape park, the
+ * settlement and the attempt's capture-then-settle orchestration) is a
+ * `…With`/`…From` body over {@link CancelSettlementSources}: the authenticated
+ * run, the immutable manifest, one authenticated append, and the advisory's
+ * presence and removal. Each root entry keeps its signature and passes the inert
+ * per-call local sources, which call the incumbent root forms at call time so
+ * module spies and mocks still intercept. The project lock stays the caller's.
  */
 
 import { preparationCancellationRequested, removePreparationCancelLocked } from "../cancellation.js";
 import { preparationManifestDigest } from "../manifest-parse.js";
-import { readPreparationManifest } from "../manifest-store.js";
+import { readPreparationManifest, type PreparationManifestRead } from "../manifest-store.js";
 import { phaseDeclaresMutatingEffect } from "../plan-graph.js";
 import { preparationRunPredecessor } from "../run-integrity.js";
-import { appendPreparationTransitionLocked, handoffStartBinding, readPreparationRun } from "../run-store.js";
+import { appendPreparationTransitionLocked, handoffStartBinding, readPreparationRun, type PreparationRunRead } from "../run-store.js";
 import {
   LEGAL_EDGES, OWNER_ACTIVE_STATES, runHasAppliedEffect, unresolvedLedgerReason,
 } from "../run-validation.js";
 import { ATTEMPT_STARTABLE_RUN_STATES } from "./types.js";
+import type { PreparationId, PreparationRunId } from "../ids.js";
 import type { NormalizedPreparationPlanV1 } from "../plan-types.js";
 import type {
-  AppendPreparationTransitionInput, PreparationPrincipalV1, PreparationRunBinding,
+  AppendPreparationTransitionInput, PreparationPrincipalV1, PreparationRunBinding, PreparationRunPredecessor,
   PreparationRunState, PreparationRunTransitionV1, PreparationRunV1,
 } from "../run-types.js";
 import type { AttemptExecutionRequestV1, AttemptOutcomeV1 } from "./types.js";
@@ -283,14 +293,49 @@ export interface CancelSettlementInput {
   readonly at: string;
 }
 
+/** What a settlement body needs of one settlement: the run's binding, the settling principal, the instant. Never a root. */
+type CancelSettlementDecisionInput = Omit<CancelSettlementInput, "root">;
+
+/**
+ * What a cancellation settlement asks of the project. Each member is a whole
+ * domain operation of an owned store and none takes a project root: the bodies
+ * below decide, these only answer or write.
+ */
+export interface CancelSettlementSources {
+  /** The authenticated run. Local: `readPreparationRun(root, binding)`. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The immutable manifest. Local: `readPreparationManifest(root, workspaceId, preparationId)`. */
+  readManifest(workspaceId: string, preparationId: PreparationId): Promise<PreparationManifestRead>;
+  /** One authenticated append. Local: `appendPreparationTransitionLocked(root, ...)`. */
+  appendTransition(binding: PreparationRunBinding, expected: PreparationRunPredecessor, input: AppendPreparationTransitionInput): Promise<unknown>;
+  /** Whether a valid advisory is present. Local: `preparationCancellationRequested(root, ...)`. */
+  cancellationRequested(workspaceId: string, runId: PreparationRunId): Promise<boolean>;
+  /** The consumed advisory's removal. Local: `removePreparationCancelLocked(root, ...)`. */
+  removeCancel(workspaceId: string, runId: PreparationRunId): Promise<void>;
+}
+
+/** LOCAL. The incumbent root forms for `root`, built inert per call; each is called at call time. In no package index. */
+function localCancelSettlementSources(root: string): CancelSettlementSources {
+  return {
+    readRun: (binding) => readPreparationRun(root, binding),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    appendTransition: (binding, expected, input) => appendPreparationTransitionLocked(root, binding, expected, input),
+    cancellationRequested: (workspaceId, runId) => preparationCancellationRequested(root, workspaceId, runId),
+    removeCancel: (workspaceId, runId) => removePreparationCancelLocked(root, workspaceId, runId),
+  };
+}
+
+/** The actor recorded for `input`, named field by field so no caller input can be spread into the recorded principal. */
+const actorOf = (input: CancelSettlementDecisionInput) => ({ id: input.principal.id, surface: input.principal.surface });
+
 /**
  * Read the immutable plan the run is BOUND to. The manifest digest must equal the
  * binding's, so the effect-freeness proof is taken from the authenticated plan
  * this run was staged against and never from a manifest swapped underneath it.
  */
-async function readBoundPlan(input: CancelSettlementInput): Promise<NormalizedPreparationPlanV1 | null> {
-  const read = await readPreparationManifest(input.root, input.binding.workspaceId, input.binding.preparationId);
-  if (read.status !== "ok" || preparationManifestDigest(read.manifest) !== input.binding.manifestDigest) return null;
+async function readBoundPlanFrom(sources: CancelSettlementSources, binding: PreparationRunBinding): Promise<NormalizedPreparationPlanV1 | null> {
+  const read = await sources.readManifest(binding.workspaceId, binding.preparationId);
+  if (read.status !== "ok" || preparationManifestDigest(read.manifest) !== binding.manifestDigest) return null;
   return read.manifest.plan;
 }
 
@@ -299,18 +344,13 @@ async function readBoundPlan(input: CancelSettlementInput): Promise<NormalizedPr
  * transition type IS the state: the loader's type-to-target table, legal-edge
  * table, and terminal effect rules all re-run over the signed record before it is
  * written, so the classifier's decision is re-proved by the enforcement it shares
- * rather than merely trusted. The actor is named field by field so no caller
- * input can be spread into the recorded principal.
+ * rather than merely trusted.
  */
-async function appendCancelTerminalLocked(
-  input: CancelSettlementInput, run: PreparationRunV1, state: CancelTerminalState,
+async function appendCancelTerminalWith(
+  sources: CancelSettlementSources, input: CancelSettlementDecisionInput, run: PreparationRunV1, state: CancelTerminalState,
 ): Promise<void> {
-  const transition: AppendPreparationTransitionInput = {
-    type: state, stateAfter: state,
-    actor: { id: input.principal.id, surface: input.principal.surface }, at: input.at,
-    payload: { kind: "none" },
-  };
-  await appendPreparationTransitionLocked(input.root, input.binding, preparationRunPredecessor(run), transition);
+  const transition: AppendPreparationTransitionInput = { type: state, stateAfter: state, actor: actorOf(input), at: input.at, payload: { kind: "none" } };
+  await sources.appendTransition(input.binding, preparationRunPredecessor(run), transition);
 }
 
 /**
@@ -329,20 +369,21 @@ async function appendCancelTerminalLocked(
  * nothing written", which previously looked identical from outside.
  */
 export async function recordDurableCancellingLocked(input: CancelSettlementInput): Promise<boolean> {
-  const read = await readPreparationRun(input.root, input.binding);
+  return recordDurableCancellingWith(localCancelSettlementSources(input.root), input);
+}
+
+/** THE ONE BODY of {@link recordDurableCancellingLocked}: read the run, then append only over `running`. */
+export async function recordDurableCancellingWith(sources: CancelSettlementSources, input: CancelSettlementDecisionInput): Promise<boolean> {
+  const read = await sources.readRun(input.binding);
   if (read.status !== "ok" || read.run.state !== "running") return false;
-  await appendCancellingLocked(input, read.run);
+  await appendCancellingWith(sources, input, read.run);
   return true;
 }
 
 /** The one `cancelling` append, shared by both the states that can produce it. */
-async function appendCancellingLocked(
-  input: CancelSettlementInput, run: PreparationRunV1,
-): Promise<void> {
-  await appendPreparationTransitionLocked(input.root, input.binding, preparationRunPredecessor(run), {
-    type: "cancelling", stateAfter: "cancelling",
-    actor: { id: input.principal.id, surface: input.principal.surface }, at: input.at,
-    payload: { kind: "none" },
+async function appendCancellingWith(sources: CancelSettlementSources, input: CancelSettlementDecisionInput, run: PreparationRunV1): Promise<void> {
+  await sources.appendTransition(input.binding, preparationRunPredecessor(run), {
+    type: "cancelling", stateAfter: "cancelling", actor: actorOf(input), at: input.at, payload: { kind: "none" },
   });
 }
 
@@ -374,7 +415,12 @@ async function appendCancellingLocked(
 export async function carryAdvisoryIntoCancellingLocked(
   input: CancelSettlementInput,
 ): Promise<boolean> {
-  const read = await readPreparationRun(input.root, input.binding);
+  return carryAdvisoryIntoCancellingWith(localCancelSettlementSources(input.root), input);
+}
+
+/** THE ONE BODY of {@link carryAdvisoryIntoCancellingLocked}: the unconsumed state, the handoff guard, the advisory, then the append. */
+export async function carryAdvisoryIntoCancellingWith(sources: CancelSettlementSources, input: CancelSettlementDecisionInput): Promise<boolean> {
+  const read = await sources.readRun(input.binding);
   if (read.status !== "ok" || !ADVISORY_UNCONSUMED_RUN_STATES.has(read.run.state)) return false;
   const run = read.run;
   // THE SIBLING GUARD. Both other cancellation legs apply it; this one omitted
@@ -383,8 +429,8 @@ export async function carryAdvisoryIntoCancellingLocked(
   // lands it where the classifier blocks forever and no writer of
   // `cancelling -> recovery-required` is ever reached.
   if (handoffOwnsRunSettlement(run)) return false;
-  if (!await preparationCancellationRequested(input.root, run.workspaceId, run.runId)) return false;
-  await appendCancellingLocked(input, run);
+  if (!await sources.cancellationRequested(run.workspaceId, run.runId)) return false;
+  await appendCancellingWith(sources, input, run);
   return true;
 }
 
@@ -411,16 +457,15 @@ export async function carryAdvisoryIntoCancellingLocked(
  * evidence can reach the ledger. The park is where the run rests until an
  * operator abandons or supersedes it.
  */
-async function escapeUnsettleableCancelling(
-  input: CancelSettlementInput, run: PreparationRunV1, reason: CancelSettlementBlock,
+async function escapeUnsettleableCancellingWith(
+  sources: CancelSettlementSources, input: CancelSettlementDecisionInput, run: PreparationRunV1, reason: CancelSettlementBlock,
 ): Promise<CancelSettlementOutcomeV1> {
   // A run whose attempt is still IN FLIGHT is not stranded — that attempt holds
   // the lease and will settle it. Parking here would clear nothing and strip the
   // fencing out from under live work, turning a transient block into damage.
   if (run.state !== "cancelling" || run.executionOwner !== undefined) return { status: "blocked", reason };
-  await appendPreparationTransitionLocked(input.root, input.binding, preparationRunPredecessor(run), {
-    type: "recovery-required", stateAfter: "recovery-required",
-    actor: { id: input.principal.id, surface: input.principal.surface }, at: input.at,
+  await sources.appendTransition(input.binding, preparationRunPredecessor(run), {
+    type: "recovery-required", stateAfter: "recovery-required", actor: actorOf(input), at: input.at,
     payload: { kind: "problem", code: CANCEL_PARK_CODE },
   });
   return { status: "blocked", reason };
@@ -444,27 +489,32 @@ async function escapeUnsettleableCancelling(
  * sweeps settleable runs on every gated mutation acquisition.
  */
 export async function settleCancelledRunLocked(input: CancelSettlementInput): Promise<CancelSettlementOutcomeV1> {
-  const read = await readPreparationRun(input.root, input.binding);
+  return settleCancelledRunWith(localCancelSettlementSources(input.root), input);
+}
+
+/** THE ONE BODY of {@link settleCancelledRunLocked}: read, terminal or settleable, the bound plan, classify, then park or append. */
+export async function settleCancelledRunWith(sources: CancelSettlementSources, input: CancelSettlementDecisionInput): Promise<CancelSettlementOutcomeV1> {
+  const read = await sources.readRun(input.binding);
   if (read.status !== "ok") return { status: "unavailable", detail: `run-${read.status}` };
   const state = read.run.state;
   if (CANCEL_TERMINALS.has(state)) return { status: "settled", state: state as CancelTerminalState };
   if (!CANCEL_SETTLEABLE_RUN_STATES.has(state)) return { status: "blocked", reason: `run-not-cancellable-${state}` };
-  const plan = await readBoundPlan(input);
+  const plan = await readBoundPlanFrom(sources, input.binding);
   if (plan === null) return { status: "unavailable", detail: "manifest-unavailable" };
   const classified = classifyCancelSettlement(read.run, plan);
-  if (classified.kind === "blocked") return escapeUnsettleableCancelling(input, read.run, classified.reason);
-  await appendCancelTerminalLocked(input, read.run, classified.state);
+  if (classified.kind === "blocked") return escapeUnsettleableCancellingWith(sources, input, read.run, classified.reason);
+  await appendCancelTerminalWith(sources, input, read.run, classified.state);
   return { status: "settled", state: classified.state };
 }
 
 // --- The attempt-executor entry point -----------------------------------
 
-/** The under-lock settlement inputs for one attempt's run and operator actor. */
-function attemptSettlementInput(request: AttemptExecutionRequestV1): CancelSettlementInput {
-  return {
-    root: request.root, binding: request.binding,
-    principal: { id: request.principal.id, surface: request.principal.surface }, at: request.clock.now(),
-  };
+/** What the attempt's settlement needs of its request: never its root. */
+type AttemptCancellationRequest = Pick<AttemptExecutionRequestV1, "binding" | "principal" | "clock">;
+
+/** The settlement inputs for one attempt's run and operator actor; each call reads the attempt's clock once. */
+function attemptSettlementInput(request: AttemptCancellationRequest): CancelSettlementDecisionInput {
+  return { binding: request.binding, principal: { id: request.principal.id, surface: request.principal.surface }, at: request.clock.now() };
 }
 
 /**
@@ -497,9 +547,20 @@ function attemptSettlementInput(request: AttemptExecutionRequestV1): CancelSettl
 export async function settleAttemptCancellationLocked(
   request: AttemptExecutionRequestV1, deliveredCancellation: boolean,
 ): Promise<void> {
-  const { root, binding } = request;
+  return settleAttemptCancellationWith(localCancelSettlementSources(request.root), request, deliveredCancellation);
+}
+
+/**
+ * THE ONE BODY of {@link settleAttemptCancellationLocked}: the requested union,
+ * then the capture and the settlement (each reading the clock once, in that
+ * order), then the advisory's removal only on an append that happened.
+ */
+export async function settleAttemptCancellationWith(
+  sources: CancelSettlementSources, request: AttemptCancellationRequest, deliveredCancellation: boolean,
+): Promise<void> {
+  const { binding } = request;
   const requested = deliveredCancellation
-    || await preparationCancellationRequested(root, binding.workspaceId, binding.runId);
+    || await sources.cancellationRequested(binding.workspaceId, binding.runId);
   if (!requested) return;
   // Capture keys on the REQUEST, never on how the phase happened to settle. It
   // used to require a `cancelled` phase state, so every other way a leg can end
@@ -508,13 +569,13 @@ export async function settleAttemptCancellationLocked(
   // the advisory file surviving. That is the assumption this whole path exists to
   // remove. What the phase settled as is preserved either way: this records the
   // RUN-level `cancelling`, and no phase summary is touched.
-  const captured = await recordDurableCancellingLocked(attemptSettlementInput(request));
-  const settled = await settleCancelledRunLocked(attemptSettlementInput(request));
+  const captured = await recordDurableCancellingWith(sources, attemptSettlementInput(request));
+  const settled = await settleCancelledRunWith(sources, attemptSettlementInput(request));
   // Drop the advisory only on the append that actually happened. Keying on the
   // ATTEMPT to record `cancelling` consumed the request even when the record was
   // never written — a read failure looked exactly like a capture — leaving the
   // operator's intent held nowhere at all.
   if (captured || settled.status === "settled") {
-    await removePreparationCancelLocked(root, binding.workspaceId, binding.runId);
+    await sources.removeCancel(binding.workspaceId, binding.runId);
   }
 }

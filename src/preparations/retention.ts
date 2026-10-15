@@ -12,22 +12,19 @@
  */
 
 import type { LifecycleAuthorizationV1 } from "../operation-bundles/lock-gate.js";
-import { createHash } from "node:crypto";
-import { readOperationManifest } from "../operation-bundles/manifest-store.js";
-import { assertBundleId } from "../operation-bundles/ids.js";
-import { readPreparationKey } from "./key-epoch.js";
-import { readPreparationManifest } from "./manifest-store.js";
+import { readOperationManifest, type OperationManifestRead } from "../operation-bundles/manifest-store.js";
+import { assertBundleId, type BundleId } from "../operation-bundles/ids.js";
+import { readPreparationKey, type PreparationKeyRead } from "./key-epoch.js";
+import { readPreparationManifest, type PreparationManifestRead } from "./manifest-store.js";
 import { preparationManifestDigest } from "./manifest-parse.js";
+import { verifiedPruneReceipt } from "./lifecycle-fs/prune-protocol.js";
 import {
-  assertConfinedPruneUnit, readVerifiedPruneReceipt,
-} from "./lifecycle-fs/prune-protocol.js";
-import {
-  pruneUnitIdFor, sweepUnitIdFor,
-  type DeleteFaultsForTest,
+  diskPruneUnitLeaves, pruneUnitIdFor, sweepUnitIdFor,
+  type DeleteFaultsForTest, type PruneUnitLeaves,
 } from "./prune-delete.js";
 import {
   runLifecycleCustodyOperation,
-  type LifecycleCustodyAdapter, type LifecycleGoverningKey,
+  type LifecycleCustodyAdapter, type LifecycleCustodyAssessment, type LifecycleGoverningKey,
 } from "./lifecycle-driver.js";
 import type { PreparationLifecycleReadV1 } from "./lifecycle-snapshot/read.js";
 import type { PreparationLifecycleSnapshotV1 } from "./lifecycle-snapshot/types.js";
@@ -35,11 +32,12 @@ import {
   projectPendingUnits, projectPruneRegistryHealth,
 } from "./lifecycle-snapshot/compat.js";
 import { selectSweepTargetUnit } from "./lifecycle-snapshot/sweep-target.js";
-import { readPreparationRun } from "./run-store.js";
+import { readPreparationRun, type PreparationRunRead } from "./run-store.js";
 import { enumerateRunScope, scanForDestructivePlan, scopedLeafObject } from "./quarantine.js";
 
 import type { PruneReceiptContentV1, PruneReceiptV1 } from "./receipts.js";
 import type { ScopedQuarantineObject } from "./quarantine-move.js";
+import type { PreparationOrphanScan } from "./orphan-scan.js";
 import type { PreparationPrincipalV1, PreparationRunBinding, PreparationRunState } from "./run-types.js";
 
 /** The default terminal retention floor: 30 days measured by an injected clock. */
@@ -53,6 +51,38 @@ const TERMINAL_STATES = new Set<PreparationRunState>([
   "cancelled-with-effects", "superseded", "abandoned",
 ]);
 
+/**
+ * What the prune and sweep assessments read. Each member is a whole domain read
+ * (or, for `pruneUnitStarted`, the confined signed-plan check); none takes a
+ * project root. All run inside the driver's read lease, as before.
+ */
+export interface PruneAssessmentReads {
+  /** The preparation key WITH ITS BYTES. Local: `readPreparationKey(root)`. */
+  readKey(): Promise<PreparationKeyRead>;
+  /** The authenticated run. Local: `readPreparationRun(root, binding)`. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The handed-off Milestone A manifest. Local: `readOperationManifest(root, ...)`. */
+  readBundleManifest(workspaceId: string, bundleId: BundleId): Promise<OperationManifestRead>;
+  /** Whether a confined unit already has a signed plan verifying under `key`. Local: this module's check. */
+  pruneUnitStarted(unitId: string, key: Buffer, operation: PruneReceiptContentV1["operation"]): Promise<boolean>;
+  /** The run's owned leaves from the driver's capture. Local: `enumerateRunScope(root, ...)`. */
+  enumerateRunScope(binding: PreparationRunBinding, read: PreparationLifecycleReadV1): Promise<ScopedQuarantineObject[]>;
+  /** Orphans with a readable manifest and a provably absent run, from the driver's capture. Local: this module's walk. */
+  enumerateSweepableOrphans(keyEpochId: PreparationRunBinding["keyEpochId"], read: PreparationLifecycleReadV1 & { status: "ok" }): Promise<ScopedQuarantineObject[]>;
+}
+
+/** The local assessment reads for one root, built per call. In no package index. */
+function localPruneAssessmentReads(root: string): PruneAssessmentReads {
+  return {
+    readKey: () => readPreparationKey(root),
+    readRun: (binding) => readPreparationRun(root, binding),
+    readBundleManifest: (workspaceId, bundleId) => readOperationManifest(root, workspaceId, bundleId),
+    pruneUnitStarted: (unitId, key, operation) => pruneUnitStarted(root, unitId, key, operation),
+    enumerateRunScope: (binding, read) => enumerateRunScope(root, binding, read),
+    enumerateSweepableOrphans: (keyEpochId, read) => enumerateSweepableOrphansFrom(localSweepOrphanReads(root), keyEpochId, read),
+  };
+}
+
 /** The complete prune-eligibility decision with its fail-closed reason. */
 export interface PruneEligibility { eligible: boolean; reason: string }
 
@@ -63,13 +93,20 @@ export interface PruneEligibility { eligible: boolean; reason: string }
  * still owns is never reclaimed.
  */
 export async function pruneEligibility(root: string, binding: PreparationRunBinding, clock: LifecycleClock): Promise<PruneEligibility> {
-  const read = await readPreparationRun(root, binding);
+  return pruneEligibilityFrom(localPruneAssessmentReads(root), binding, clock);
+}
+
+/** {@link pruneEligibility} over the assessment reads: the one eligibility decision. */
+async function pruneEligibilityFrom(
+  reads: Pick<PruneAssessmentReads, "readRun" | "readBundleManifest">, binding: PreparationRunBinding, clock: LifecycleClock,
+): Promise<PruneEligibility> {
+  const read = await reads.readRun(binding);
   if (read.status !== "ok") return { eligible: false, reason: `run-${read.status === "unavailable" ? read.code : read.status}` };
   if (!TERMINAL_STATES.has(read.run.state)) return { eligible: false, reason: "not-terminal" };
   const ageMs = clock.now().getTime() - Date.parse(read.run.updatedAt);
   if (!Number.isFinite(ageMs) || ageMs < PREPARATION_RETENTION_FLOOR_MS) return { eligible: false, reason: "retention-floor" };
   if (read.run.handoff !== undefined) {
-    const manifest = await readOperationManifest(root, binding.workspaceId, assertBundleId(read.run.handoff.bundleId));
+    const manifest = await reads.readBundleManifest(binding.workspaceId, assertBundleId(read.run.handoff.bundleId));
     if (manifest.status !== "ok") return { eligible: false, reason: "handoff-bundle-unavailable" };
   }
   return { eligible: true, reason: "eligible" };
@@ -121,6 +158,64 @@ export interface PrunePreparationInput {
 }
 
 /**
+ * The prune assessment: a healthy key, the one unit id for both shapes, a resume
+ * only on a signed plan, otherwise eligibility (waived only for a started unit)
+ * and the run's object set. Read-only; runs inside the driver lease.
+ */
+export async function assessPrune(
+  reads: PruneAssessmentReads, input: PrunePreparationInput, read: PreparationLifecycleReadV1,
+): Promise<LifecycleCustodyAssessment<"verified-delete">> {
+  const key = await reads.readKey();
+  if (key.status !== "ok") {
+    throw new PreparationPruneError("key-unavailable", `key-${key.status}`);
+  }
+  // ONE DERIVATION OF THE UNIT ID, from the run id alone, for both shapes —
+  // and the same pure function the service calls to build the gate's ticket.
+  // Check and executor share the primitive rather than each deriving one.
+  const runId = input.target.kind === "run" ? input.target.binding.runId : input.target.runId;
+  const unitId = pruneUnitIdFor(runId);
+  const started = await reads.pruneUnitStarted(unitId, key.key, "prune");
+  if (input.target.kind === "unfinished") {
+    // POSITIVE EVIDENCE ONLY. A resume is authorized by a signed plan that
+    // verifies under the current key, never by the run being unreadable.
+    //
+    // A BACKSTOP THE GATE PRE-EMPTS, and that is measured rather than assumed:
+    // a prune unit that has lost its planned receipt classifies with
+    // `operation: null`, so the gate's owner rule refuses it as escalate-only
+    // and no ticket is ever issued for it. This line is therefore UNREACHABLE
+    // through the service today and is deliberately not cited as a control —
+    // it exists so that a second caller of this entry point cannot resume on
+    // an unauthenticated plan, and it is uncovered for exactly that reason.
+    if (!started) throw new PreparationPruneError("not-eligible", "no-signed-plan-to-resume");
+    // NO OBJECT ENUMERATION. The engine reuses the SIGNED plan whenever one
+    // exists, so a freshly enumerated set is discarded; enumerating one here
+    // would be a second observation with no consumer.
+    return {
+      draft: { kind: "verified-delete" as const, unitId, operation: "prune" as const, runId, objects: [] },
+      key: { key: key.key, keyEpochId: key.keyEpochId },
+    };
+  }
+  const eligibility = await pruneEligibilityFrom(reads, input.target.binding, input.clock);
+  // The eligibility waiver on resume, preserved exactly: a unit with a signed
+  // plan continues on that plan's authority even once it would no longer be
+  // eligible, because the plan is the authority and abandoning a started delete
+  // strands staged bytes. Recorded as a known relaxation in PLA-MAP-PRN03.
+  if (!eligibility.eligible && !started) {
+    throw new PreparationPruneError("not-eligible", eligibility.reason);
+  }
+  return {
+    draft: {
+      kind: "verified-delete" as const,
+      unitId,
+      operation: "prune" as const,
+      runId,
+      objects: await reads.enumerateRunScope(input.target.binding, read),
+    },
+    key: { key: key.key, keyEpochId: key.keyEpochId },
+  };
+}
+
+/**
  * Prune as a driver adapter.
  *
  * What is NOT here is the point: no plan/apply/verify/complete sequence, no
@@ -132,56 +227,7 @@ const pruneAdapter: LifecycleCustodyAdapter<PrunePreparationInput, "verified-del
   operation: "prune",
   planKind: "verified-delete",
 
-  async assess(root, input, read) {
-    const key = await readPreparationKey(root);
-    if (key.status !== "ok") {
-      throw new PreparationPruneError("key-unavailable", `key-${key.status}`);
-    }
-    // ONE DERIVATION OF THE UNIT ID, from the run id alone, for both shapes —
-    // and the same pure function the service calls to build the gate's ticket.
-    // Check and executor share the primitive rather than each deriving one.
-    const runId = input.target.kind === "run" ? input.target.binding.runId : input.target.runId;
-    const unitId = pruneUnitIdFor(runId);
-    const started = await pruneUnitStarted(root, unitId, key.key, "prune");
-    if (input.target.kind === "unfinished") {
-      // POSITIVE EVIDENCE ONLY. A resume is authorized by a signed plan that
-      // verifies under the current key, never by the run being unreadable.
-      //
-      // A BACKSTOP THE GATE PRE-EMPTS, and that is measured rather than assumed:
-      // a prune unit that has lost its planned receipt classifies with
-      // `operation: null`, so the gate's owner rule refuses it as escalate-only
-      // and no ticket is ever issued for it. This line is therefore UNREACHABLE
-      // through the service today and is deliberately not cited as a control —
-      // it exists so that a second caller of this entry point cannot resume on
-      // an unauthenticated plan, and it is uncovered for exactly that reason.
-      if (!started) throw new PreparationPruneError("not-eligible", "no-signed-plan-to-resume");
-      // NO OBJECT ENUMERATION. The engine reuses the SIGNED plan whenever one
-      // exists, so a freshly enumerated set is discarded; enumerating one here
-      // would be a second observation with no consumer.
-      return {
-        draft: { kind: "verified-delete" as const, unitId, operation: "prune" as const, runId, objects: [] },
-        key: { key: key.key, keyEpochId: key.keyEpochId },
-      };
-    }
-    const eligibility = await pruneEligibility(root, input.target.binding, input.clock);
-    // The eligibility waiver on resume, preserved exactly: a unit with a signed
-    // plan continues on that plan's authority even once it would no longer be
-    // eligible, because the plan is the authority and abandoning a started delete
-    // strands staged bytes. Recorded as a known relaxation in PLA-MAP-PRN03.
-    if (!eligibility.eligible && !started) {
-      throw new PreparationPruneError("not-eligible", eligibility.reason);
-    }
-    return {
-      draft: {
-        kind: "verified-delete" as const,
-        unitId,
-        operation: "prune" as const,
-        runId,
-        objects: await enumerateRunScope(root, input.target.binding, read),
-      },
-      key: { key: key.key, keyEpochId: key.keyEpochId },
-    };
-  },
+  assess: (root, input, read) => assessPrune(localPruneAssessmentReads(root), input, read),
 
   // Nothing to materialize: prune governs under the key that already exists.
   materialize: async (_root, _input, assessment) => assessment.key as LifecycleGoverningKey,
@@ -325,6 +371,60 @@ export class SweepUnobservableError extends Error {
   }
 }
 
+/**
+ * The sweep assessment over the driver's ONE capture: registry health, the pending
+ * sweep unit to resume or else the orphans to collect, under a healthy key.
+ * Read-only; runs inside the driver lease. Exported for its memory witness and
+ * in no package index.
+ */
+export async function assessSweep(
+  reads: PruneAssessmentReads, _input: SweepPreparationInput, read: PreparationLifecycleReadV1,
+): Promise<LifecycleCustodyAssessment<"verified-delete">> {
+  if (read.status === "unavailable") {
+    throw new Error("prune registry cannot be enumerated");
+  }
+  // THE SUBSET COMPARISON IS GONE, AND SO IS ITS REPLACEMENT HERE. It
+  // compared only the sweep unit id, so a pending quarantine or reset unit
+  // appearing after the gate authorized moved nothing it looked at and it
+  // passed. The driver now re-runs the GATE'S OWN predicate over this same
+  // capture before any adapter is asked to assess, which subsumes this
+  // comparison and every arm the gate applies.
+  //
+  // MEASURED, NOT ASSUMED, because "looks subsumed" is the class of claim this
+  // surface keeps falsifying. With the driver's re-evaluation neutered both
+  // divergence cases went GREEN here -- so this was a working control, not
+  // dead for some other reason -- and with it restored they refuse one layer
+  // earlier through the gate's own predicate. Two derivations of one quantity
+  // from one snapshot is the agreeing-by-coincidence shape; keeping the
+  // narrower one leaves a second projection to drift against the first.
+  //
+  // THE PROJECTION ITSELF STAYS: it is what the plan is built from below --
+  // a resume targets the pending unit, a fresh sweep enumerates orphans. Only
+  // the COMPARISON was removed, not the observation.
+  const pending = pendingSweepUnitOf(read.snapshot);
+  // The key read moved HERE from the public entry. Awaiting it before invoking
+  // the driver put a mutation window in front of the driver's synchronous seal,
+  // and review reproduced the consequence: mutate `actor.id` right after the
+  // call and the signed receipt attests the mutated identity. Quarantine, reset
+  // and prune each closed this window already; sweep was the fourth sibling.
+  const key = await reads.readKey();
+  if (key.status !== "ok") throw new SweepKeyUnavailable();
+  const governing: LifecycleGoverningKey = { key: key.key, keyEpochId: key.keyEpochId };
+  const objects = pending === null
+    ? await reads.enumerateSweepableOrphans(governing.keyEpochId as PreparationRunBinding["keyEpochId"], read)
+    : [];
+  if (pending === null && objects.length === 0) throw new NothingToSweep();
+  return {
+    draft: {
+      kind: "verified-delete" as const,
+      unitId: pending ?? sweepUnitIdFor(objects),
+      operation: "sweep" as const,
+      objects,
+    },
+    key: governing,
+  };
+}
+
 /** Sweep as a driver adapter, sharing the engine, permit, lease and in-flight guard. */
 const sweepAdapter: LifecycleCustodyAdapter<SweepPreparationInput, "verified-delete"> = {
   operation: "sweep",
@@ -340,52 +440,7 @@ const sweepAdapter: LifecycleCustodyAdapter<SweepPreparationInput, "verified-del
    * removed sibling enumeration -- trading an uncaptured walk for an extra
    * capture is not what PLA-INV-03 asks for.
    */
-  async assess(root, input, read) {
-    if (read.status === "unavailable") {
-      throw new Error("prune registry cannot be enumerated");
-    }
-    // THE SUBSET COMPARISON IS GONE, AND SO IS ITS REPLACEMENT HERE. It
-    // compared only the sweep unit id, so a pending quarantine or reset unit
-    // appearing after the gate authorized moved nothing it looked at and it
-    // passed. The driver now re-runs the GATE'S OWN predicate over this same
-    // capture before any adapter is asked to assess, which subsumes this
-    // comparison and every arm the gate applies.
-    //
-    // MEASURED, NOT ASSUMED, because "looks subsumed" is the class of claim this
-    // surface keeps falsifying. With the driver's re-evaluation neutered both
-    // divergence cases went GREEN here -- so this was a working control, not
-    // dead for some other reason -- and with it restored they refuse one layer
-    // earlier through the gate's own predicate. Two derivations of one quantity
-    // from one snapshot is the agreeing-by-coincidence shape; keeping the
-    // narrower one leaves a second projection to drift against the first.
-    //
-    // THE PROJECTION ITSELF STAYS: it is what the plan is built from below --
-    // a resume targets the pending unit, a fresh sweep enumerates orphans. Only
-    // the COMPARISON was removed, not the observation.
-    const pending = pendingSweepUnitOf(read.snapshot);
-    // The key read moved HERE from the public entry. Awaiting it before invoking
-    // the driver put a mutation window in front of the driver's synchronous seal,
-    // and review reproduced the consequence: mutate `actor.id` right after the
-    // call and the signed receipt attests the mutated identity. Quarantine, reset
-    // and prune each closed this window already; sweep was the fourth sibling.
-    const key = await readPreparationKey(root);
-    if (key.status !== "ok") throw new SweepKeyUnavailable();
-    const governing: LifecycleGoverningKey = { key: key.key, keyEpochId: key.keyEpochId };
-    const objects = pending === null
-      ? await enumerateSweepableOrphans(
-          root, governing.keyEpochId as PreparationRunBinding["keyEpochId"], read)
-      : [];
-    if (pending === null && objects.length === 0) throw new NothingToSweep();
-    return {
-      draft: {
-        kind: "verified-delete" as const,
-        unitId: pending ?? sweepUnitIdFor(objects),
-        operation: "sweep" as const,
-        objects,
-      },
-      key: governing,
-    };
-  },
+  assess: (root, input, read) => assessSweep(localPruneAssessmentReads(root), input, read),
 
   // Nothing to materialize: sweep governs under the key `assess` already read.
   materialize: async (_root, _input, assessment) => assessment.key as LifecycleGoverningKey,
@@ -449,27 +504,55 @@ function pendingSweepUnitOf(snapshot: PreparationLifecycleSnapshotV1): string | 
   return selected.unitId;
 }
 
-/** Collect the leaves of every preparation whose manifest reads but whose run is absent. */
-async function enumerateSweepableOrphans(
-  root: string,
+/** What the sweep-orphan enumeration reads. No member takes a project root. */
+export interface SweepOrphanReads {
+  /** The gated destructive scan from the CALLER'S capture. Local: `scanForDestructivePlan(root, read)`. */
+  scanForPlan(read: PreparationLifecycleReadV1): Promise<PreparationOrphanScan>;
+  /** One preparation's manifest. Local: `readPreparationManifest(root, ...)`. */
+  readManifest(workspaceId: string, preparationId: PreparationRunBinding["preparationId"]): Promise<PreparationManifestRead>;
+  /** The authenticated run under an exact binding. Local: `readPreparationRun(root, binding)`. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** The confined capture of one leaf, failures mapped to `unit-unavailable`. Local: `scopedLeafObject(root, ...)`. */
+  scopedLeafObject(relativePath: string, byteCount: number): Promise<ScopedQuarantineObject>;
+}
+
+/** The local sweep-orphan reads for one root, built per call. In no package index. */
+function localSweepOrphanReads(root: string): SweepOrphanReads {
+  return {
+    scanForPlan: (read) => scanForDestructivePlan(root, read),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    readRun: (binding) => readPreparationRun(root, binding),
+    scopedLeafObject: (relativePath, byteCount) => scopedLeafObject(root, relativePath, byteCount),
+  };
+}
+
+/**
+ * Collect the leaves of every preparation whose manifest reads but whose run is
+ * provably absent: ONE scan from the caller's capture, then per directory the
+ * manifest first (unreadable is skipped, never absent), the run under the binding
+ * the manifest authenticates, and only a provably absent run contributes its leaves,
+ * in scan order.
+ */
+export async function enumerateSweepableOrphansFrom(
+  reads: SweepOrphanReads,
   keyEpochId: PreparationRunBinding["keyEpochId"],
   read: PreparationLifecycleReadV1 & { status: "ok" },
 ): Promise<ScopedQuarantineObject[]> {
   // The CALLER'S capture, not one of its own. Safe to plan from because a
   // destructive plan's object set provably never reaches the quarantine registry
   // -- pinned by `destructive-object-scope.test.ts`.
-  const scan = await scanForDestructivePlan(root, read);
+  const scan = await reads.scanForPlan(read);
   const objects: ScopedQuarantineObject[] = [];
   for (const directory of scan.preparationDirectories) {
-    const manifest = await readPreparationManifest(root, directory.workspaceId, directory.preparationId as PreparationRunBinding["preparationId"]);
+    const manifest = await reads.readManifest(directory.workspaceId, directory.preparationId as PreparationRunBinding["preparationId"]);
     if (manifest.status !== "ok") continue; // unreadable owner is unavailable, never absent
-    const run = await readPreparationRun(root, {
+    const run = await reads.readRun({
       runId: manifest.manifest.runId, preparationId: manifest.manifest.preparationId, workspaceId: manifest.manifest.workspaceId,
       manifestDigest: preparationManifestDigest(manifest.manifest), keyEpochId,
     });
     if (run.status !== "absent") continue; // only a provably absent run is an orphan
     for (const leaf of scan.leaves.filter((entry) => entry.workspaceId === directory.workspaceId && entry.preparationId === directory.preparationId)) {
-      objects.push(await scopedLeafObject(root, leaf.relativePath, leaf.bytes));
+      objects.push(await reads.scopedLeafObject(leaf.relativePath, leaf.bytes));
     }
   }
   return objects;
@@ -477,12 +560,14 @@ async function enumerateSweepableOrphans(
 
 /** Whether a prune/sweep unit already has a signed planned receipt (a resume). */
 async function pruneUnitStarted(root: string, unitId: string, key: Buffer, operation: PruneReceiptContentV1["operation"]): Promise<boolean> {
-  await assertConfinedPruneUnit(root, unitId);
-  return (await readVerifiedPruneReceipt(
-    root,
-    unitId,
-    key,
-    "prune-planned",
-    operation,
-  )) !== null;
+  return pruneUnitStartedFrom(diskPruneUnitLeaves(root), unitId, key, operation);
+}
+
+/** {@link pruneUnitStarted} over the prune unit leaves: confinement first, then the planned-receipt verdict. */
+async function pruneUnitStartedFrom(
+  leaves: Pick<PruneUnitLeaves, "assertConfinedUnit" | "readReceiptLeaf">, unitId: string, key: Buffer,
+  operation: PruneReceiptContentV1["operation"],
+): Promise<boolean> {
+  await leaves.assertConfinedUnit(unitId);
+  return verifiedPruneReceipt(await leaves.readReceiptLeaf(unitId, "prune-planned"), key, "prune-planned", unitId, operation) !== null;
 }

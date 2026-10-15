@@ -6,12 +6,14 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { MAX_WORKFLOW_RUN_BYTES } from "../utils/constants.js";
 import { safeRealpath, isInsideDir } from "../utils/path-confine.js";
-import { readCappedNoFollow } from "../utils/confined-read.js";
+import { readCappedNoFollow, type CappedLeafRead } from "../utils/confined-read.js";
 import { isSlugSafe } from "../profile/identity.js";
 import { resolveExistingConfinedPrivateDir } from "../utils/private-dir.js";
 import { migrateRun } from "./run-migrate.js";
 import { hasValidRunShape, hasMonotonicVersionChain } from "./run-validate.js";
-import { loadRunKey, runIntegrity, integrityMatches } from "./integrity.js";
+import {
+  loadRunKey, integrityMatches, canonicalRunContent, runIntegrityComputation, type RunIntegrityComputation,
+} from "./integrity.js";
 import { isValidRunId, runsDirFor } from "./paths.js";
 import { WORKFLOW_RUN_SCHEMA_VERSION, RUN_INTEGRITY_MIN_SCHEMA_VERSION, type WorkflowRun } from "./types.js";
 /** The trust-aware result of reading a single run record. */
@@ -43,6 +45,48 @@ async function existingRunsDir(privateDir: string): Promise<RunsDirResolution> {
   if (realRuns === null) return { kind: "absent" }; // dir does not exist yet
   if (!isInsideDir(realRuns, privateDir)) return { kind: "escape" };
   return { kind: "ok", dir: realRuns };
+}
+
+
+/**
+ * What the passive run-history readers ask of a run store. Each member reports
+ * ONE fact; the readers own the order, every reason and every catch.
+ */
+export interface WorkflowRunReads {
+  /** The existing private directory, resolved WITHOUT creating it, or `null` when there is none. REJECTS on a confinement fault. */
+  resolvePrivateDir(): Promise<string | null>;
+  /** The runs directory under a resolved private directory: `ok` with its location, `absent`, or `escape` when it resolves outside. */
+  resolveRunsDir(privateDir: string): Promise<RunsDirResolution>;
+  /** Every entry name of a resolved runs directory, in the store's own order. REJECTS raw. */
+  listRunNames(runsDir: string): Promise<string[]>;
+  /** One leaf of a resolved runs directory, read WITHOUT following a link and only within `maxBytes`. */
+  readRunLeaf(runsDir: string, name: string, maxBytes: number): Promise<CappedLeafRead>;
+  /**
+   * The store's integrity computation, or `null` when it has none it can vouch
+   * for. A MECHANISM, not a grant: canonical content text in, MAC out. The
+   * secret stays behind this member and no reader holds it.
+   */
+  loadIntegrity(): Promise<RunIntegrityComputation | null>;
+}
+
+
+/**
+ * LOCAL DISK. The run reads for the project at `root`. Building them does no
+ * I/O and nothing is remembered between calls. `loadIntegrity` is the passive
+ * {@link loadRunKey}, which resolves the private directory a second time.
+ * In no package index.
+ */
+export function diskWorkflowRunReads(root: string): WorkflowRunReads {
+  return {
+    resolvePrivateDir: () => resolveExistingConfinedPrivateDir(root),
+    resolveRunsDir: existingRunsDir,
+    listRunNames: (runsDir) => readdir(runsDir),
+    readRunLeaf: (runsDir, name, maxBytes) => readCappedNoFollow(path.join(runsDir, name), maxBytes),
+    loadIntegrity: async () => {
+      const key = await loadRunKey(root);
+      return key === null ? null : runIntegrityComputation(key);
+    },
+  };
 }
 
 
@@ -132,7 +176,8 @@ function runRejectionDetail(
  * successfully-migrated older record is returned `ok` (re-stamped to the current
  * version).
  *
- * The HMAC is recomputed over the AS-READ on-disk record (with `integrity` omitted),
+ * The HMAC is recomputed HERE, through the store's computation, over the canonical
+ * text of the AS-READ on-disk record (with `integrity` omitted),
  * NOT the migrated form — that is the object the writer signed. A MISSING or
  * MISMATCHED stamp → `unavailable:"integrity"`: a hand-edited / synced / restored /
  * foreign-key / keyless record is rejected even when its shape is impeccable.
@@ -143,7 +188,7 @@ function runRejectionDetail(
  * surfaced as `unavailable:"legacy-unsigned"` — a DISTINCT reason from a tampered v2
  * `integrity` — never silently trusted, never silently bricked-without-reason.
  */
-function parseRun(raw: string, expectedId: string, key: Buffer | null): WorkflowRunRead {
+function parseRun(raw: string, expectedId: string, integrity: RunIntegrityComputation | null): WorkflowRunRead {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -157,7 +202,7 @@ function parseRun(raw: string, expectedId: string, key: Buffer | null): Workflow
     return { status: "unavailable", detail: "legacy-unsigned" }; // pre-HMAC: never auto-trusted
   }
   const onDisk = parsed as WorkflowRun;
-  if (key === null || !integrityMatches(onDisk.integrity, runIntegrity(key, onDisk))) {
+  if (integrity === null || !integrityMatches(onDisk.integrity, integrity(canonicalRunContent(onDisk)))) {
     return { status: "unavailable", detail: "integrity" };
   }
   return { status: "ok", run: verdict.record as unknown as WorkflowRun };
@@ -177,21 +222,32 @@ function parseRun(raw: string, expectedId: string, key: Buffer | null): Workflow
  * @param runId - The slug-safe run id (also the filename stem).
  */
 export async function readRun(root: string, runId: string): Promise<WorkflowRunRead> {
+  return readRunFrom(diskWorkflowRunReads(root), runId);
+}
+
+
+/**
+ * {@link readRun} over {@link WorkflowRunReads}: THE ONE BODY. An invalid id asks
+ * the sources nothing. The integrity computation is loaded after a successful
+ * leaf read and BEFORE the text is parsed, so a malformed or legacy-unsigned
+ * leaf loads it too.
+ */
+export async function readRunFrom(sources: WorkflowRunReads, runId: string): Promise<WorkflowRunRead> {
   if (!isValidRunId(runId)) return { status: "unavailable", detail: "bad-id" };
   let privateDir: string | null;
   try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
+    privateDir = await sources.resolvePrivateDir();
   } catch {
     return { status: "unavailable", detail: "escape" };
   }
   if (privateDir === null) return { status: "absent" };
-  const runsDir = await existingRunsDir(privateDir);
+  const runsDir = await sources.resolveRunsDir(privateDir);
   if (runsDir.kind === "absent") return { status: "absent" };
   if (runsDir.kind === "escape") return { status: "unavailable", detail: "escape" };
-  const read = await readCappedNoFollow(path.join(runsDir.dir, `${runId}.json`), MAX_WORKFLOW_RUN_BYTES);
+  const read = await sources.readRunLeaf(runsDir.dir, `${runId}.json`, MAX_WORKFLOW_RUN_BYTES);
   if (read.kind === "absent") return { status: "absent" };
   if (read.kind === "unavailable") return { status: "unavailable", detail: "leaf" };
-  return parseRun(read.body, runId, await loadRunKey(root));
+  return parseRun(read.body, runId, await sources.loadIntegrity());
 }
 
 
@@ -221,19 +277,25 @@ export type WorkflowRunList =
  * @returns A structured {@link WorkflowRunList}: `ok` with stems, or `unavailable`.
  */
 export async function listRuns(root: string): Promise<WorkflowRunList> {
+  return listRunsFrom(diskWorkflowRunReads(root));
+}
+
+
+/** {@link listRuns} over {@link WorkflowRunReads}: THE ONE BODY. The names keep the order the store gave them. */
+export async function listRunsFrom(sources: WorkflowRunReads): Promise<WorkflowRunList> {
   let privateDir: string | null;
   try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
+    privateDir = await sources.resolvePrivateDir();
   } catch {
     return { status: "unavailable", detail: "escape" };
   }
   if (privateDir === null) return { status: "ok", runIds: [] };
-  const runsDir = await existingRunsDir(privateDir);
+  const runsDir = await sources.resolveRunsDir(privateDir);
   if (runsDir.kind === "absent") return { status: "ok", runIds: [] };
   if (runsDir.kind === "escape") return { status: "unavailable", detail: "escape" };
   let entries: string[];
   try {
-    entries = await readdir(runsDir.dir);
+    entries = await sources.listRunNames(runsDir.dir);
   } catch {
     return { status: "unavailable", detail: "readdir-failed" };
   }
@@ -264,8 +326,14 @@ export type RunIdResolution =
  *   invalid; `unavailable` (with detail) when the store could not be enumerated.
  */
 export async function resolveRunId(root: string, rawId: string): Promise<RunIdResolution> {
+  return resolveRunIdFrom(diskWorkflowRunReads(root), rawId);
+}
+
+
+/** {@link resolveRunId} over {@link WorkflowRunReads}: THE ONE BODY. An invalid id asks the sources nothing. */
+export async function resolveRunIdFrom(sources: WorkflowRunReads, rawId: string): Promise<RunIdResolution> {
   if (!isValidRunId(rawId)) return { status: "not-found" };
-  const list = await listRuns(root);
+  const list = await listRunsFrom(sources);
   if (list.status === "unavailable") return { status: "unavailable", detail: list.detail };
   return list.runIds.includes(rawId) ? { status: "resolved", runId: rawId } : { status: "not-found" };
 }

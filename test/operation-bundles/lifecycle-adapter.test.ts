@@ -12,27 +12,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { lifecycleAdapter } from "../../src/operation-bundles/adapters/lifecycle.js";
 import { appendBoundEventLocked } from "../../src/events/store.js";
 import { writeProfileFile } from "../fixtures/profile-fixtures.js";
-import type { ProfilePack } from "../../src/profile/types.js";
-import type { LifecycleOperationMutation, OperationDigest } from "../../src/operation-bundles/types.js";
-import { digestOf, makeBinding, makeContext, type BindingSet } from "./adapter-fixtures.js";
-
-const PROFILE: ProfilePack = {
-  schemaVersion: 1, profileId: "research",
-  entities: { docs: { directory: "wiki/docs", lifecycle: { field: "status", initial: "draft", terminal: ["published"], transitions: { draft: ["published"], published: [] } } } },
-};
-
-const PRE = Buffer.from("---\nstatus: draft\n---\nbody\n");
-const POST = Buffer.from("---\nstatus: published\n---\nbody\n");
-const OTHER = Buffer.from("---\nstatus: archived\n---\nbody\n");
-
-function lifecycleMutation(set: BindingSet): LifecycleOperationMutation {
-  return {
-    kind: "lifecycle-transition", index: 0, mutationId: set.onDisk.mutationId, dependsOn: [], reconciliationRefs: [],
-    operation: "transition", target: { entityType: "docs", slug: "a" },
-    precondition: { kind: "state", state: "draft", pageDigest: digestOf(PRE) },
-    postcondition: { state: "published", pageDigest: digestOf(POST), eventDigest: `sha256:${"2".repeat(64)}` as OperationDigest },
-  };
-}
+import {
+  LIFECYCLE_OTHER as OTHER, LIFECYCLE_POST as POST, LIFECYCLE_PRE as PRE, LIFECYCLE_PROFILE as PROFILE, lifecycleMutation, makeBinding, makeContext,
+  type BindingSet,
+} from "./adapter-fixtures.js";
 
 let root = "";
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "lc-adapter-")); await writeProfileFile(root, PROFILE); await mkdir(path.join(root, "wiki", "docs"), { recursive: true }); });

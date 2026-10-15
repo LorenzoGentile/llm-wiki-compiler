@@ -18,7 +18,7 @@
 
 import { ungated, type UngatedInput } from "./lifecycle-driver.js";
 import { randomBytes } from "node:crypto";
-import { readPreparationKey } from "./key-epoch.js";
+import { readPreparationKey, type PreparationKeyRead } from "./key-epoch.js";
 import { preparationKeyEpochId } from "./run-integrity.js";
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { enumerateProjectScope } from "./quarantine.js";
@@ -29,10 +29,11 @@ import {
   removeResetCrashLeaves,
   resetIntentLeafPresence,
   writeResetUnitLeaf,
+  type ResetUnitLeaf, type ResetUnitLeafRead,
 } from "./lifecycle-fs/reset-operations.js";
 import {
   listQuarantineUnits, readSettledQuarantineReceipt, retirableUnitsFrom, type RetirementSet,
-  type QuarantineMoveFaultsForTest,
+  type QuarantineMoveFaultsForTest, type ScopedQuarantineObject,
 } from "./quarantine-move.js";
 import {
   buildResetIntent, matchesContinuationDigest, parseResetIntent, requiredResetConfirmation,
@@ -43,11 +44,12 @@ import {
 import { supersedeIntentOnlyUnitsLocked } from "./reset-intent-supersession.js";
 import {
   completeLifecycleCustodyOperation, runLifecycleCustodyOperation, type LifecycleCustodyAdapter,
+  type LifecycleCustodyAssessment,
 } from "./lifecycle-driver.js";
 import type { LifecycleMutationPermitV1 } from "./lifecycle-mutation-permit.js";
 import type { PreparationLifecycleReadV1 } from "./lifecycle-snapshot/read.js";
 import { projectQuarantineUnits } from "./lifecycle-snapshot/compat.js";
-import type { QuarantineReason, RetiredQuarantineUnitV1 } from "./receipts.js";
+import type { QuarantineReason } from "./receipts.js";
 import { mintPreparationRunId } from "./ids.js";
 import type { PreparationPrincipalV1 } from "./run-types.js";
 import type { Sha256Digest } from "./types.js";
@@ -56,6 +58,67 @@ const PREPARATION_KEY_BYTES = 32;
 
 /** The freshly minted reset key and its epoch id, in memory. */
 interface ResetKeyMaterial { key: Buffer; keyEpochId: Sha256Digest }
+
+/**
+ * What the project-reset assessment and key materialization ask of the project.
+ * Each member is a whole domain read or one permit-bound mutation; none takes a
+ * project root. The bodies own every refusal and the materialization ORDER
+ * (old-key custody, staged-key checks, create-only staging, publication).
+ */
+export interface ProjectResetSteps {
+  /** The active preparation key WITH ITS BYTES. Local: `readPreparationKey(root)`. */
+  readActiveKey(): Promise<PreparationKeyRead>;
+  /** This unit's staged key, authenticated by the continuation secret. Local: this module's reader. */
+  readPendingKey(unitId: string, secret: Buffer): Promise<PendingKeyRead>;
+  /** The retirement set over already-captured unit ids. Local: `retirableUnitsFrom(root, ...)`. */
+  retirableUnits(unitIds: readonly string[], excludeUnitId: string): Promise<RetirementSet>;
+  /** Every project-scoped leaf to take into custody, from the driver's capture. Local: `enumerateProjectScope(root, read)`. */
+  enumerateProjectScope(read: PreparationLifecycleReadV1): Promise<ScopedQuarantineObject[]>;
+  /** Move the unreadable old key into the unit under the permit, refusing in the reset's own words. */
+  moveOldKeyIntoUnit(unitId: string, permit: LifecycleMutationPermitV1): Promise<void>;
+  /** Mint and stage a fresh key create-only under the unit, under the permit. */
+  stagePendingKey(unitId: string, secret: Buffer, permit: LifecycleMutationPermitV1): Promise<ResetKeyMaterial>;
+  /** Publish the staged key as the active key, under the permit. */
+  publishActiveKey(unitId: string, material: ResetKeyMaterial, permit: LifecycleMutationPermitV1): Promise<void>;
+}
+
+/** The local reset steps for one root, built per call. In no package index. */
+function localProjectResetSteps(root: string): ProjectResetSteps {
+  const keys = diskResetKeyLeaves(root);
+  return {
+    readActiveKey: () => keys.readActiveKey(),
+    readPendingKey: (unitId, secret) => readAuthenticatedPendingKeyFrom(keys, unitId, secret),
+    retirableUnits: (unitIds, excludeUnitId) => retirableUnitsFrom(root, unitIds, excludeUnitId),
+    enumerateProjectScope: (read) => enumerateProjectScope(root, read),
+    moveOldKeyIntoUnit: (unitId, permit) => moveOldKeyIntoUnitWith(keys, unitId, permit),
+    stagePendingKey: (unitId, secret, permit) => stagePendingResetKeyWith(keys, unitId, secret, permit),
+    publishActiveKey: (unitId, material, permit) => publishActiveResetKeyWith(keys, unitId, material, permit),
+  };
+}
+
+/**
+ * The reset's PHYSICAL key leaves: the active key read, one unit leaf's read and
+ * write (the staged key's write is permit-checked inside), the create-only active-key
+ * publication and the old-key move. No member decides anything; the reset bodies do.
+ */
+export interface ResetKeyLeaves {
+  readActiveKey(): Promise<PreparationKeyRead>;
+  readUnitLeaf(unitId: string, leaf: ResetUnitLeaf): Promise<ResetUnitLeafRead>;
+  writeUnitLeaf(unitId: string, leaf: ResetUnitLeaf, bytes: Buffer, permit?: LifecycleMutationPermitV1): Promise<void>;
+  publishActiveKey(keyBase64: string, unitId: string, permit: LifecycleMutationPermitV1): Promise<"created" | "exists">;
+  moveOldKey(unitId: string, permit: LifecycleMutationPermitV1): Promise<"absent" | "moved">;
+}
+
+/** The local reset key leaves for one root, built per call. In no package index. */
+function diskResetKeyLeaves(root: string): ResetKeyLeaves {
+  return {
+    readActiveKey: () => readPreparationKey(root),
+    readUnitLeaf: (unitId, leaf) => readResetUnitLeaf(root, unitId, leaf),
+    writeUnitLeaf: (unitId, leaf, bytes, permit) => writeResetUnitLeaf(root, unitId, leaf, bytes, permit),
+    publishActiveKey: (keyBase64, unitId, permit) => publishActivePreparationKey(root, keyBase64, unitId, permit),
+    moveOldKey: (unitId, permit) => moveOldPreparationKey(root, unitId, permit),
+  };
+}
 
 /** The distinct confirmation flag each reset reason demands (design section 25.3). */
 // Re-exported, not redefined: the parser owns the reason/confirmation pairing so a
@@ -110,14 +173,57 @@ export class PreparationResetError extends Error {
  * secret. A healthy key is refused: there is nothing to reset.
  */
 export async function resetPreparationKeyEpochLocked(root: string, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
+  return resetPreparationKeyEpochWith(localResetFlowSteps(root), input);
+}
+
+/**
+ * What both reset invocations ask of the project. Each member is a whole domain
+ * operation, a physical leaf, or the lifecycle driver's own lease/permit boundary,
+ * which stays physical; none takes a project root.
+ */
+export interface ResetFlowSteps {
+  /** The reset key leaves (active key, unit leaves, publication, old-key move). */
+  readonly keys: ResetKeyLeaves;
+  /** The explicit intent-only supersession exit. Local: `supersedeIntentOnlyUnitsLocked(root, ...)`. */
+  supersedeIntentOnly(confirmation: string, requiredFor: (reason: ResetReason) => string): Promise<string[]>;
+  /** Every quarantine-unit id. Local: `listQuarantineUnits(root)`. */
+  listUnits(): ReturnType<typeof listQuarantineUnits>;
+  /** Whether one unit still holds its intent marker. Local: `resetIntentLeafPresence(root, unitId)`. */
+  intentPresence(unitId: string): Promise<"present" | "absent" | "unavailable">;
+  /** A semantically settled completed receipt, or null. Local: `readSettledQuarantineReceipt(root, ...)`. */
+  readSettledReceipt(unitId: string, key: Buffer, expect: Parameters<typeof readSettledQuarantineReceipt>[3]): Promise<QuarantineReceiptV1 | null>;
+  /** The driver's custody run (lease, permit, engine). Local: `runLifecycleCustodyOperation(root, ...)`. */
+  runCustody(adapter: LifecycleCustodyAdapter<UngatedInput<ResetKeyEpochInput>>, input: UngatedInput<ResetKeyEpochInput>): Promise<QuarantineReceiptV1>;
+  /** The driver's permitted completion of an already-durable custody. Local: `completeLifecycleCustodyOperation(root, ...)`. */
+  completeCustody(adapter: LifecycleCustodyAdapter<UngatedInput<ResetKeyEpochInput>>, input: UngatedInput<ResetKeyEpochInput>, receipt: QuarantineReceiptV1, unitId: string): Promise<unknown>;
+}
+
+/** The local reset flow steps for one root, built per call; each calls the incumbent when asked. In no package index. */
+function localResetFlowSteps(root: string): ResetFlowSteps {
+  return {
+    keys: diskResetKeyLeaves(root),
+    supersedeIntentOnly: (confirmation, requiredFor) => supersedeIntentOnlyUnitsLocked(root, confirmation, requiredFor),
+    listUnits: () => listQuarantineUnits(root),
+    intentPresence: (unitId) => resetIntentLeafPresence(root, unitId),
+    readSettledReceipt: (unitId, key, expect) => readSettledQuarantineReceipt(root, unitId, key, expect),
+    runCustody: (adapter, input) => runLifecycleCustodyOperation(root, adapter, input),
+    completeCustody: (adapter, input, receipt, unitId) => completeLifecycleCustodyOperation(root, adapter, input, receipt, unitId),
+  };
+}
+
+/**
+ * {@link resetPreparationKeyEpochLocked} over {@link ResetFlowSteps}: the one body
+ * for both invocations. The capture is SYNCHRONOUS and first, before any await.
+ */
+export async function resetPreparationKeyEpochWith(steps: ResetFlowSteps, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
   // BEFORE the continuation read. The driver seals what reaches it, but this
   // entry awaits `openContinuation` first, so everything between here and the
   // driver was a mutation window: review changed `actor.id` immediately after
   // calling this and the completed receipt was signed as the changed actor.
   const captured = captureResetInput(input);
-  if (captured.continuation === undefined) return recordResetIntent(root, captured);
-  const { unitId, reason, secret } = await openContinuation(root, captured.continuation);
-  return executeReset(root, unitId, reason, secret, captured);
+  if (captured.continuation === undefined) return recordResetIntent(steps, captured);
+  const { unitId, reason, secret } = await openContinuation(steps.keys, captured.continuation);
+  return executeReset(steps, unitId, reason, secret, captured);
 }
 
 /**
@@ -162,9 +268,9 @@ function decodeContinuationSecret(token: string): Buffer {
  * capture the same token. The intent must also self-bind to the directory it was read
  * from, so a marker copied under a different unit id is refused.
  */
-async function openContinuation(root: string, continuation: { unitId: string; token: string }): Promise<{ unitId: string; reason: ResetReason; secret: Buffer }> {
+async function openContinuation(keys: ResetKeyLeaves, continuation: { unitId: string; token: string }): Promise<{ unitId: string; reason: ResetReason; secret: Buffer }> {
   const secret = decodeContinuationSecret(continuation.token);
-  const read = await readResetUnitLeaf(root, continuation.unitId, "intent");
+  const read = await keys.readUnitLeaf(continuation.unitId, "intent");
   // THREE-way, for the same reason `completedReceiptDigest` is. Collapsing
   // `unavailable` into `absent` here told the operator "no pending intent" about
   // a marker that IS there and merely cannot be read — a false statement, and
@@ -195,14 +301,14 @@ async function openContinuation(root: string, continuation: { unitId: string; to
  * longer holds a pending unit's token supersedes it explicitly, which is safe because
  * a pending intent can only exist while no fresh key has been published.
  */
-async function recordResetIntent(root: string, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
+async function recordResetIntent(steps: ResetFlowSteps, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
   // Supersession runs BEFORE eligibility: a healthy key makes a NEW reset ineligible,
   // so checking it first left a stale intent-only unit permanently blocking lifecycle
   // work with no supported exit. Clearing a pre-plan marker authorises nothing.
   const superseded = input.supersedePendingReset === true
-    ? await supersedeIntentOnlyUnitsLocked(root, input.confirmation, requiredResetConfirmation)
+    ? await steps.supersedeIntentOnly(input.confirmation, requiredResetConfirmation)
     : [];
-  const key = await readPreparationKey(root);
+  const key = await steps.keys.readActiveKey();
   if (key.status === "ok") {
     if (superseded.length > 0) return { status: "pending-intent-superseded", unitIds: superseded };
     throw new PreparationResetError("key-healthy", "reset requires a missing or unreadable preparation key");
@@ -211,14 +317,14 @@ async function recordResetIntent(root: string, input: ResetKeyEpochInput): Promi
   if (input.confirmation !== requiredResetConfirmation(reason)) {
     throw new PreparationResetError("confirmation-mismatch", `reset of a ${reason} key requires its distinct confirmation`);
   }
-  await settlePendingIntents(root, input.supersedePendingReset === true, superseded);
+  await settlePendingIntents(steps, input.supersedePendingReset === true, superseded);
   const secret = randomBytes(PREPARATION_KEY_BYTES);
   const unitId = `rst-${mintPreparationRunId().slice("prr_".length)}`;
   const intent = buildResetIntent({
     unitId, reason, confirmation: input.confirmation,
     continuationDigest: resetContinuationDigest(secret), actor: input.actor, at: input.at,
   });
-  await writeResetUnitLeaf(root, unitId, "intent", canonicalBytes(intent));
+  await steps.keys.writeUnitLeaf(unitId, "intent", canonicalBytes(intent));
   return { status: "intent-recorded", unitId, reason, continuationToken: secret.toString("base64") };
 }
 
@@ -228,15 +334,15 @@ async function recordResetIntent(root: string, input: ResetKeyEpochInput): Promi
  * intent-only, so anything still here is either continuation-materialized or
  * unclassifiable — exactly the state whose crash material must stay recoverable.
  */
-async function settlePendingIntents(root: string, _supersede: boolean, alreadySuperseded: readonly string[]): Promise<void> {
-  const listing = await listQuarantineUnits(root);
+async function settlePendingIntents(steps: ResetFlowSteps, _supersede: boolean, alreadySuperseded: readonly string[]): Promise<void> {
+  const listing = await steps.listUnits();
   if (listing.status !== "ok") {
     throw new PreparationResetError("reset-already-pending",
       "the quarantine registry is unreadable; a concurrent pending reset cannot be ruled out");
   }
   for (const unitId of listing.unitIds) {
     if (alreadySuperseded.includes(unitId)) continue; // cleared above by the explicit exit
-    const intent = await resetIntentLeafPresence(root, unitId);
+    const intent = await steps.intentPresence(unitId);
     if (intent === "unavailable") {
       throw new PreparationResetError("reset-already-pending",
         `reset unit ${unitId} is unreadable; a pending reset there cannot be ruled out`);
@@ -248,21 +354,21 @@ async function settlePendingIntents(root: string, _supersede: boolean, alreadySu
 }
 
 /** Second pass: resolve the fresh key, quarantine authority, then remove crash material. */
-async function executeReset(root: string, unitId: string, reason: ResetReason, secret: Buffer, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
+async function executeReset(steps: ResetFlowSteps, unitId: string, reason: ResetReason, secret: Buffer, input: ResetKeyEpochInput): Promise<ResetKeyEpochResult> {
   if (input.confirmation !== requiredResetConfirmation(reason)) {
     throw new PreparationResetError("confirmation-mismatch", `reset rerun of a ${reason} key requires its distinct confirmation`);
   }
   const adapter = projectResetAdapter(unitId, reason, secret);
-  const done = await readCompletedReset(root, unitId, reason);
+  const done = await readCompletedReset(steps, unitId, reason);
   if (done !== null) {
     // Already durable, so there is no sequence left to run — but the cleanup is
     // still a permitted mutation, and the driver still mints for it.
-    await completeLifecycleCustodyOperation(root, adapter, ungated(input), done.receipt, unitId);
+    await steps.completeCustody(adapter, ungated(input), done.receipt, unitId);
     return done;
   }
   // Crash-material removal is now the driver's `complete` phase, under the same
   // permit, rather than something this function does afterwards.
-  const receipt = await runLifecycleCustodyOperation(root, adapter, ungated(input));
+  const receipt = await steps.runCustody(adapter, ungated(input));
   return { status: "completed", unitId, keyEpochId: receipt.keyEpochId as Sha256Digest, receipt };
 }
 
@@ -288,20 +394,7 @@ function projectResetAdapter(
     // be materialized, and builds the plan draft from the one driver-owned
     // capture. The retirement set takes its unit ids from that capture rather
     // than re-enumerating the registry.
-    async assess(root, _input, read) {
-      const resolved = await assessResetKey(root, unitId, secret);
-      const retirement = await retirableUnitsFromRead(root, read, unitId);
-      return {
-        ...(resolved === null ? {} : { key: resolved }),
-        draft: {
-          kind: "custody-move" as const,
-          unitId, scope: "project-reset", reason,
-          objects: await enumerateProjectScope(root, read),
-          residualObligations: residualObligationsFor(reason, retirement.unreadable),
-          retiredUnits: retirement.retired,
-        },
-      };
-    },
+    assess: (root, _input, read) => assessProjectReset(localProjectResetSteps(root), unitId, reason, secret, read),
 
     // MUTATES, under the permit. Old-key custody, staging, and publication are
     // each permit-protected mutations in their own right (design V2 §9.2), not
@@ -314,7 +407,29 @@ function projectResetAdapter(
 
     async materialize(root, input, assessment, permit) {
       if (assessment.key !== undefined) return assessment.key;
-      return materializeResetKey(root, unitId, reason, secret, input, permit);
+      return materializeResetKeyWith(localProjectResetSteps(root), unitId, reason, secret, input, permit);
+    },
+  };
+}
+
+/**
+ * The project-reset assessment over the driver's capture: the governing key when
+ * one already exists (or null to materialize), the retirement set from the captured
+ * unit ids, and the project scope. Read-only; runs inside the driver lease.
+ */
+export async function assessProjectReset(
+  steps: ProjectResetSteps, unitId: string, reason: ResetReason, secret: Buffer, read: PreparationLifecycleReadV1,
+): Promise<LifecycleCustodyAssessment<"custody-move">> {
+  const resolved = await assessResetKey(steps, unitId, secret);
+  const retirement = await retirableUnitsFromRead(steps, read, unitId);
+  return {
+    ...(resolved === null ? {} : { key: resolved }),
+    draft: {
+      kind: "custody-move" as const,
+      unitId, scope: "project-reset", reason,
+      objects: await steps.enumerateProjectScope(read),
+      residualObligations: residualObligationsFor(reason, retirement.unreadable),
+      retiredUnits: retirement.retired,
     },
   };
 }
@@ -341,7 +456,7 @@ function residualObligationsFor(
  * enumeration of the quarantine registry.
  */
 async function retirableUnitsFromRead(
-  root: string, read: PreparationLifecycleReadV1, excludeUnitId: string,
+  steps: ProjectResetSteps, read: PreparationLifecycleReadV1, excludeUnitId: string,
 ): Promise<RetirementSet> {
   // Distinct from the projection refusal below. Review found three legs sharing
   // one message, which let a test that had lost its subject keep matching.
@@ -353,7 +468,7 @@ async function retirableUnitsFromRead(
   // and attesting a retirement set from it would under-retire silently.
   const listing = projectQuarantineUnits(read.snapshot);
   if (listing.status !== "ok") throw new Error("quarantine registry listing is incomplete; refusing to attest a retirement set");
-  return retirableUnitsFrom(root, listing.unitIds, excludeUnitId);
+  return steps.retirableUnits(listing.unitIds, excludeUnitId);
 }
 
 /**
@@ -364,15 +479,15 @@ async function retirableUnitsFromRead(
  * driving a reset over live authority.
  */
 async function assessResetKey(
-  root: string, unitId: string, secret: Buffer,
+  steps: ProjectResetSteps, unitId: string, secret: Buffer,
 ): Promise<ResetKeyMaterial | null> {
-  const active = await readPreparationKey(root);
+  const active = await steps.readActiveKey();
   if (active.status !== "ok") return null;
   // Post-publication, `unreadable` and `absent` deliberately behave the SAME —
   // both refuse as a healthy foreign key. That equivalence is PLA-MAP-R12's
   // dated, accepted known gap, and review confirmed the two refusals are
   // byte-identical, so this leg is left exactly as decided.
-  const pending = await readAuthenticatedPendingKey(root, unitId, secret);
+  const pending = await steps.readPendingKey(unitId, secret);
   if (pending.kind !== "ok" || !active.key.equals(pending.material.key)) {
     throw new PreparationResetError(
       "key-healthy",
@@ -387,15 +502,15 @@ async function assessResetKey(
  * unchanged and load-bearing: old-key custody first so a forced reset never mints
  * over an unquarantined key, then staging create-only, then publication.
  */
-async function materializeResetKey(
-  root: string, unitId: string, reason: ResetReason, secret: Buffer,
+export async function materializeResetKeyWith(
+  steps: ProjectResetSteps, unitId: string, reason: ResetReason, secret: Buffer,
   input: ResetKeyEpochInput, permit: LifecycleMutationPermitV1,
 ): Promise<ResetKeyMaterial> {
   if (reason === "unreadable-key-forced") {
-    await moveOldKeyIntoUnit(root, unitId, permit);
+    await steps.moveOldKeyIntoUnit(unitId, permit);
     await input.faults?.afterOldKeyMoved?.();
   }
-  const pending = await readAuthenticatedPendingKey(root, unitId, secret);
+  const pending = await steps.readPendingKey(unitId, secret);
   // An unreadable staged key cannot be resumed AND cannot be replaced:
   // `stagePendingResetKey` writes create-only, so falling through to it collides
   // with the very file we could not read. Review measured that: the collision
@@ -430,9 +545,9 @@ async function materializeResetKey(
   }
   const material = pending.kind === "ok"
     ? pending.material
-    : await stagePendingResetKey(root, unitId, secret, permit);
+    : await steps.stagePendingKey(unitId, secret, permit);
   await input.faults?.afterPendingKeyStaged?.();
-  await publishActiveResetKey(root, unitId, material, permit);
+  await steps.publishActiveKey(unitId, material, permit);
   await input.faults?.afterKeyMint?.();
   return material;
 }
@@ -445,11 +560,11 @@ async function materializeResetKey(
  * makes the reset crash-resumable; the HMAC binding means only a holder of the secret
  * can stage a key this unit will accept.
  */
-async function stagePendingResetKey(root: string, unitId: string, secret: Buffer, permit: LifecycleMutationPermitV1): Promise<ResetKeyMaterial> {
+export async function stagePendingResetKeyWith(keys: ResetKeyLeaves, unitId: string, secret: Buffer, permit: LifecycleMutationPermitV1): Promise<ResetKeyMaterial> {
   const key = randomBytes(PREPARATION_KEY_BYTES);
   const keyEpochId = preparationKeyEpochId(key);
   const record = signPendingResetKey(secret, { unitId, keyEpochId, key: key.toString("base64") });
-  await writeResetUnitLeaf(root, unitId, "pending-key", canonicalBytes(record), permit);
+  await keys.writeUnitLeaf(unitId, "pending-key", canonicalBytes(record), permit);
   return { key, keyEpochId };
 }
 
@@ -459,10 +574,10 @@ async function stagePendingResetKey(root: string, unitId: string, secret: Buffer
  * exact staged key (an idempotent resume or a concurrent reset of the same unit);
  * any other installed key is a genuine single-epoch race.
  */
-async function publishActiveResetKey(root: string, unitId: string, material: ResetKeyMaterial, permit: LifecycleMutationPermitV1): Promise<void> {
-  const result = await publishActivePreparationKey(root, material.key.toString("base64"), unitId, permit);
+export async function publishActiveResetKeyWith(keys: ResetKeyLeaves, unitId: string, material: ResetKeyMaterial, permit: LifecycleMutationPermitV1): Promise<void> {
+  const result = await keys.publishActiveKey(material.key.toString("base64"), unitId, permit);
   if (result === "created") return;
-  const active = await readPreparationKey(root);
+  const active = await keys.readActiveKey();
   if (active.status === "ok" && active.key.equals(material.key)) return;
   throw new Error("preparation reset key already exists (single-epoch race)");
 }
@@ -491,8 +606,8 @@ type PendingKeyRead =
   | { readonly kind: "invalid" }
   | { readonly kind: "unreadable" };
 
-async function readAuthenticatedPendingKey(root: string, unitId: string, secret: Buffer): Promise<PendingKeyRead> {
-  const read = await readResetUnitLeaf(root, unitId, "pending-key");
+export async function readAuthenticatedPendingKeyFrom(keys: ResetKeyLeaves, unitId: string, secret: Buffer): Promise<PendingKeyRead> {
+  const read = await keys.readUnitLeaf(unitId, "pending-key");
   if (read.status === "unavailable") return { kind: "unreadable" };
   if (read.status !== "ok") return { kind: "absent" };
   try {
@@ -515,10 +630,10 @@ async function readAuthenticatedPendingKey(root: string, unitId: string, secret:
  * active key actually holds. A merely present or planned-but-signed receipt is not a
  * completion and must never short-circuit the destructive work.
  */
-async function readCompletedReset(root: string, unitId: string, reason: ResetReason): Promise<CompletedReset | null> {
-  const active = await readPreparationKey(root);
+async function readCompletedReset(steps: ResetFlowSteps, unitId: string, reason: ResetReason): Promise<CompletedReset | null> {
+  const active = await steps.keys.readActiveKey();
   if (active.status !== "ok") return null;
-  const receipt = await readSettledQuarantineReceipt(root, unitId, active.key, {
+  const receipt = await steps.readSettledReceipt(unitId, active.key, {
     keyEpochId: active.keyEpochId, scope: "project-reset", reason,
   });
   if (receipt === null) return null;
@@ -538,9 +653,9 @@ async function readCompletedReset(root: string, unitId: string, reason: ResetRea
  * merely cannot stat must never be skipped, or the reset would mint a fresh epoch
  * while the old key material stayed in place unquarantined.
  */
-async function moveOldKeyIntoUnit(root: string, unitId: string, permit: LifecycleMutationPermitV1): Promise<void> {
+export async function moveOldKeyIntoUnitWith(keys: ResetKeyLeaves, unitId: string, permit: LifecycleMutationPermitV1): Promise<void> {
   try {
-    await moveOldPreparationKey(root, unitId, permit);
+    await keys.moveOldKey(unitId, permit);
   } catch (error) {
     const message = (error as Error).message;
     if (message.includes("cannot be examined")) {

@@ -51,6 +51,7 @@ export const LIFECYCLE_MODULE_OWNERSHIP: readonly LifecycleModuleOwnershipV1[] =
   { path: "src/preparations/attempts/cancel-settlement.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/attempts/checkpoint.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/attempts/custody.ts", role: "unrelated-preparation", rawFilesystemAccess: true },
+  { path: "src/preparations/attempts/execute-policy.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/attempts/execute.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/attempts/host-handler.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/attempts/lease.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
@@ -154,6 +155,7 @@ export const LIFECYCLE_MODULE_OWNERSHIP: readonly LifecycleModuleOwnershipV1[] =
   { path: "src/preparations/run-types.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/run-validation.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/runner-reconstruct.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
+  { path: "src/preparations/runner-steps.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/runner.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/schedule.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/selection.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
@@ -214,6 +216,15 @@ export const LIFECYCLE_MODULE_OWNERSHIP: readonly LifecycleModuleOwnershipV1[] =
   { path: "src/preparations/service-sweep.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/service.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/stage.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
+  // Composes the store's raw-leaf read bodies (walk, manifest, key, run, evidence)
+  // into the run lookup's reads, AND borrows and authenticates one lifecycle read
+  // for the inventory scan (its disk builder calls `withPreparationLifecycleRead`
+  // once). That makes it a reader of lifecycle state, like `capacity.ts` and
+  // `lifecycle-snapshot/read.ts`, so it is a read-consumer and stays under the
+  // per-reader capture and root-taking-reach controls. It imports no `node:fs`.
+  // Its lifecycle authority is ROOT-BOUND local-disk authority, carried and named
+  // in the module itself as a deferment, not made storage-neutral.
+  { path: "src/preparations/store-leaf-reads.ts", role: "read-consumer", rawFilesystemAccess: false },
   { path: "src/preparations/types.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/preparations/workflow-parent.ts", role: "unrelated-preparation", rawFilesystemAccess: false },
   { path: "src/utils/advisory-file.ts", role: "shared-primitive", rawFilesystemAccess: true },
@@ -227,6 +238,8 @@ export const LIFECYCLE_MODULE_OWNERSHIP: readonly LifecycleModuleOwnershipV1[] =
   { path: "src/utils/fs-presence.ts", role: "shared-primitive", rawFilesystemAccess: true },
   { path: "src/utils/hmac-equal.ts", role: "shared-primitive", rawFilesystemAccess: false },
   { path: "src/utils/inventory-arithmetic.ts", role: "shared-primitive", rawFilesystemAccess: false },
+  // The local-disk walk reads both orphan scans hand their scan body; path joins only, the I/O stays in inventory-scan.
+  { path: "src/utils/inventory-disk-walk.ts", role: "shared-primitive", rawFilesystemAccess: false },
   // The no-follow I/O moved here; store classification remains in orphan-scan.
   { path: "src/utils/inventory-scan.ts", role: "shared-primitive", rawFilesystemAccess: true },
   // Key-leaf mode, ownership and link-count health shared by both key epochs.
@@ -266,6 +279,7 @@ export const EXPECTED_MODULE_ROLES = [
   "src/preparations/attempts/cancel-settlement.ts :: unrelated-preparation",
   "src/preparations/attempts/checkpoint.ts :: unrelated-preparation",
   "src/preparations/attempts/custody.ts :: unrelated-preparation",
+  "src/preparations/attempts/execute-policy.ts :: unrelated-preparation",
   "src/preparations/attempts/execute.ts :: unrelated-preparation",
   "src/preparations/attempts/host-handler.ts :: unrelated-preparation",
   "src/preparations/attempts/lease.ts :: unrelated-preparation",
@@ -359,6 +373,7 @@ export const EXPECTED_MODULE_ROLES = [
   "src/preparations/run-types.ts :: unrelated-preparation",
   "src/preparations/run-validation.ts :: unrelated-preparation",
   "src/preparations/runner-reconstruct.ts :: unrelated-preparation",
+  "src/preparations/runner-steps.ts :: unrelated-preparation",
   "src/preparations/runner.ts :: unrelated-preparation",
   "src/preparations/schedule.ts :: unrelated-preparation",
   "src/preparations/selection.ts :: unrelated-preparation",
@@ -382,6 +397,7 @@ export const EXPECTED_MODULE_ROLES = [
   "src/preparations/service-sweep.ts :: unrelated-preparation",
   "src/preparations/service.ts :: unrelated-preparation",
   "src/preparations/stage.ts :: unrelated-preparation",
+  "src/preparations/store-leaf-reads.ts :: read-consumer",
   "src/preparations/types.ts :: unrelated-preparation",
   "src/preparations/workflow-parent.ts :: unrelated-preparation",
   "src/utils/advisory-file.ts :: shared-primitive",
@@ -395,6 +411,7 @@ export const EXPECTED_MODULE_ROLES = [
   "src/utils/fs-presence.ts :: shared-primitive",
   "src/utils/hmac-equal.ts :: shared-primitive",
   "src/utils/inventory-arithmetic.ts :: shared-primitive",
+  "src/utils/inventory-disk-walk.ts :: shared-primitive",
   "src/utils/inventory-scan.ts :: shared-primitive",
   "src/utils/key-leaf-health.ts :: shared-primitive",
   "src/utils/keyed-fifo.ts :: shared-primitive",

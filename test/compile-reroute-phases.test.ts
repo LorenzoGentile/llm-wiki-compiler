@@ -135,7 +135,7 @@ describe("no-source-changes branch routes through executor", () => {
 
     // Second compile: no source changed, but the schema still declares the seed.
     stubProvider("Overview body content here.");
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
     const result = await compileAndReport(ctx.dir);
 
     expect(result.compiled).toBe(0);

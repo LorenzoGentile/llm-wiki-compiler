@@ -32,7 +32,7 @@ async function seedConfidence(overlap = false): Promise<ProfilePack> {
 
 it("collects entity pages once per view and files declared confidence as a judgement", async () => {
   await seedConfidence();
-  const spy = vi.spyOn(collection, "collectEntityPages");
+  const spy = vi.spyOn(collection, "collectEntityPagesFrom");
   const tiered = await lintByTier(env.dir);
   expect(spy).toHaveBeenCalledTimes(1);
   spy.mockClear();
@@ -47,7 +47,7 @@ it("collects entity pages once per view and files declared confidence as a judge
 
 it("serves both views from one run with shared finding references and flat order", async () => {
   await seedConfidence();
-  const spy = vi.spyOn(collection, "collectEntityPages");
+  const spy = vi.spyOn(collection, "collectEntityPagesFrom");
   const { summary, tiered } = await lintBothViews(env.dir);
   expect(spy).toHaveBeenCalledTimes(1);
   const regrouped = [...tiered.deterministic, ...tiered.providerJudgement, ...tiered.derivedView];
@@ -73,7 +73,10 @@ it("adds confidence in the per-page pass for two pages sharing a slug", async ()
 it("deduplicates defensive internal-only overlap and keeps default shape", async () => {
   const profile = await seedConfidence(true);
   // Public profile validation rejects overlap; inject only that internal input.
-  vi.spyOn(profileLoader, "loadProfile").mockResolvedValue({ profile, loadedFrom: ".llmwiki/profile.json", digest: "test" });
+  const loaded = { profile, loadedFrom: ".llmwiki/profile.json", digest: "test" };
+  vi.spyOn(profileLoader, "loadProfile").mockResolvedValue(loaded);
+  // The workflow-run rule loads the profile through the sources form.
+  vi.spyOn(profileLoader, "loadProfileFrom").mockResolvedValue(loaded);
   const { results } = await lint(await realpath(env.dir));
   const confidence = results.filter((r) => r.rule === "low-confidence");
   expect(confidence).toHaveLength(2);

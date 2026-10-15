@@ -9,23 +9,48 @@
  * `pendingChanges` is derived directly from the freshness snapshot (which
  * already has per-source currentHash/recordedHash/exists) plus a cheap
  * selected-file listing — no second hash pass. `detectChanges` is NOT called.
+ *
+ * `collectStatusFrom` is THE ONE BODY and holds no project root: it reaches the
+ * project only through {@link StatusReads}, eleven reads it names itself.
+ *
+ * THOSE READS ARE COMPOSED, NOT ROOT CLOSURES. {@link statusReadsOver} answers
+ * each one with its reader's own one body over the existing raw seams in
+ * {@link StatusSources}: the state record, the source freshness locations, the
+ * two page directories, the candidate records, the source listing, the
+ * profile summary's sources, the journal and the embedding markers.
+ * `collectStatus(root)` hands it the local disk's sources, built per call from
+ * the same disk builders the root-taking readers used, and each member still
+ * runs only when asked. Naming the sources selects no backend and rules on no
+ * mechanism; every disk member is still local disk. The profile summary's
+ * lifecycle read and proof stay root-bound disk authority, unchanged.
  */
 
 import path from "path";
-import { listSelectedSourceFiles } from "../sources/scan.js";
-import { collectPageSummaries, scanWikiPages } from "../compiler/indexgen.js";
-import { countCandidates } from "../compiler/candidates.js";
-import { readStateClassified, isPlainObject } from "../utils/state.js";
-import type { StateStatus } from "../utils/state.js";
-import { buildFreshnessSnapshot, computeFreshness } from "../freshness/index.js";
+import { listSelectedSourceFilesFrom } from "../sources/scan.js";
+import { collectPageSummariesFrom, diskWikiPageScanReads, scanWikiPagesFrom, type WikiPageScanReads } from "../compiler/indexgen.js";
+import type { ScannedPage } from "../compiler/indexgen.js";
+import { countCandidatesFrom } from "../compiler/candidate-read.js";
+import { readStateClassifiedFrom, isPlainObject } from "../utils/state.js";
+import type { ClassifiedState, StateStatus } from "../utils/state.js";
+import { buildFreshnessSnapshotFrom, computeFreshness, diskSourceFreshnessSources, type SourceFreshnessSources } from "../freshness/index.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
-import { collectProfileSummary } from "../profile/block.js";
-import { journalHealthWarning } from "../trust/journal-health-warning.js";
+import { collectProfileSummaryFrom, diskProfileSummarySources, type ProfileSummarySources } from "../profile/block.js";
+import type { ProfileSummaryBlock } from "../profile/block.js";
+import { journalHealthWarningFrom } from "../trust/journal-health-warning.js";
 import type { ReadSurfaceWarning } from "../trust/journal-health-warning.js";
-import { pendingEmbeddingsWarning } from "../trust/pending-embeddings-warning.js";
-import { quarantinedEmbeddingsWarning } from "../trust/quarantined-embeddings-warning.js";
+import { diskJournalReadSources, type JournalReadSources } from "../trust/journal-classify.js";
+import { pendingEmbeddingsWarningFrom } from "../trust/pending-embeddings-warning.js";
+import { quarantinedEmbeddingsWarningFrom } from "../trust/quarantined-embeddings-warning.js";
+import { diskEmbeddingMarkerReads, type EmbeddingMarkerReads } from "../utils/pending-embeddings.js";
+import { diskLocalRecords } from "../storage/disk-local-records.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
+import { diskLocalRecordDirs } from "../storage/disk-local-record-dirs.js";
+import type { LegacyLocalRecordDirs } from "../storage/legacy-local-record-dirs.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
 import type { EntityProblemView } from "../profile/types.js";
+import type { PageSummary } from "../utils/types.js";
 
 /**
  * Maximum number of items returned in each agent-facing list (stalePages,
@@ -181,30 +206,128 @@ function capPendingChanges(
   return changes.slice().sort((a, b) => a.file.localeCompare(b.file)).slice(0, MAX_STATUS_LIST);
 }
 
+/**
+ * Every read one status snapshot makes, in the order {@link collectStatusFrom}
+ * makes them. Each member is asked exactly ONCE per snapshot. A member that
+ * rejects rejects the snapshot with the same error.
+ */
+export interface StatusReads {
+  /** FIRST, alone. The classified compile state; never a recovering read. */
+  readState(): Promise<ClassifiedState>;
+  /** SECOND, alone. The freshness snapshot for that classified state. */
+  buildFreshness(classified: ClassifiedState): Promise<FreshnessSnapshot>;
+  /** Started together with the next four, in this order. The concept index rows. */
+  conceptSummaries(): Promise<PageSummary[]>;
+  /** The saved-query index rows. */
+  querySummaries(): Promise<PageSummary[]>;
+  /** The concept pages with their frontmatter: a SECOND scan of the concept directory. */
+  scanConcepts(): Promise<ScannedPage[]>;
+  /** How many candidates await review. */
+  countCandidates(): Promise<number>;
+  /** The selected Markdown sources present now. */
+  listSourceFiles(): Promise<string[]>;
+  /** Alone, after those five. The non-default profile's summary; `undefined` for the built-in default. */
+  profileSummary(): Promise<ProfileSummaryBlock | undefined>;
+  /** Started together with the next two, in this order. The journal health warning. */
+  journalWarning(): Promise<ReadSurfaceWarning | null>;
+  /** The pending-embeddings warning. */
+  pendingWarning(): Promise<ReadSurfaceWarning | null>;
+  /** The quarantined-embeddings warning. */
+  quarantineWarning(): Promise<ReadSurfaceWarning | null>;
+}
+
+/**
+ * The raw seams the status reads are answered from: each the existing seam of
+ * the reader that answers it. NOTHING TIES THEM TO ONE PROJECT, and nothing
+ * makes two reads agree. Not in a package index.
+ */
+export interface StatusSources {
+  /** The compile state record. */
+  records: LegacyLocalRecords;
+  /** The sources the state names, for the freshness snapshot. */
+  freshness: SourceFreshnessSources;
+  /** The concept page directory: its summaries, and the second scan. */
+  concepts: WikiPageScanReads;
+  /** The saved-query page directory. */
+  queries: WikiPageScanReads;
+  /** The pending candidate records. */
+  candidates: LegacyLocalRecordDirs;
+  /** The source selection and the sources directory. */
+  sourceFiles: LegacyLocalReads;
+  /** The profile summary's sources. */
+  profile: ProfileSummarySources;
+  /** The journal. */
+  journal: JournalReadSources;
+  /** The pending and quarantined embedding markers. */
+  markers: EmbeddingMarkerReads;
+}
+
+/**
+ * The status reads over {@link StatusSources}: THE ONE COMPOSITION. Each
+ * member runs its reader's one body over its seam when it is asked, never
+ * earlier; building them does no I/O.
+ *
+ * @param sources - The raw seams of the status readers.
+ * @returns The eleven reads {@link collectStatusFrom} makes.
+ */
+export function statusReadsOver(sources: StatusSources): StatusReads {
+  return {
+    readState: () => readStateClassifiedFrom(sources.records),
+    buildFreshness: (classified) => buildFreshnessSnapshotFrom(sources.freshness, classified),
+    conceptSummaries: () => collectPageSummariesFrom(sources.concepts),
+    querySummaries: () => collectPageSummariesFrom(sources.queries),
+    scanConcepts: () => scanWikiPagesFrom(sources.concepts),
+    countCandidates: () => countCandidatesFrom(sources.candidates),
+    listSourceFiles: () => listSelectedSourceFilesFrom(sources.sourceFiles),
+    profileSummary: () => collectProfileSummaryFrom(sources.profile),
+    journalWarning: () => journalHealthWarningFrom(sources.journal),
+    pendingWarning: () => pendingEmbeddingsWarningFrom(sources.markers),
+    quarantineWarning: () => quarantinedEmbeddingsWarningFrom(sources.markers),
+  };
+}
+
+/**
+ * LOCAL DISK. The status sources for the project at `root`, built per call and
+ * private to this module: the disk builders each root-taking reader used.
+ * Building them does no I/O.
+ */
+function diskStatusSources(root: string): StatusSources {
+  return {
+    records: diskLocalRecords(root), freshness: diskSourceFreshnessSources(root),
+    concepts: diskWikiPageScanReads(path.join(root, CONCEPTS_DIR)), queries: diskWikiPageScanReads(path.join(root, QUERIES_DIR)),
+    candidates: diskLocalRecordDirs(root), sourceFiles: diskLocalReads(root),
+    profile: diskProfileSummarySources(root), journal: diskJournalReadSources(root), markers: diskEmbeddingMarkerReads(root),
+  };
+}
+
 /** Build a read-only status snapshot used by the `wiki_status` MCP tool. */
 export async function collectStatus(root: string): Promise<WikiStatus> {
-  const classified = await readStateClassified(root);
-  const snapshot = await buildFreshnessSnapshot(root, classified);
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return collectStatusFrom(statusReadsOver(diskStatusSources(root)));
+}
+
+/** {@link collectStatus} through `reads`: THE ONE BODY. See {@link StatusReads} for the order of the reads. */
+export async function collectStatusFrom(reads: StatusReads): Promise<WikiStatus> {
+  const classified = await reads.readState();
+  const snapshot = await reads.buildFreshness(classified);
 
   const [conceptSummaries, queries, scannedConcepts, pendingCandidates, sourceFilesOnDisk] = await Promise.all([
-    collectPageSummaries(path.join(root, CONCEPTS_DIR)),
-    collectPageSummaries(path.join(root, QUERIES_DIR)),
-    scanWikiPages(path.join(root, CONCEPTS_DIR)),
-    countCandidates(root),
-    listSelectedSourceFiles(root),
+    reads.conceptSummaries(),
+    reads.querySummaries(),
+    reads.scanConcepts(),
+    reads.countCandidates(),
+    reads.listSourceFiles(),
   ]);
 
   const { stalePages, orphanedPages } = classifyConceptPages(scannedConcepts, snapshot);
-  const profileBlock = await collectProfileSummary(root);
+  const profileBlock = await reads.profileSummary();
   // Surface read-surface health signals so an agent never reads a degraded status
   // as silently healthy: a pending/unavailable journal (unfinished or tampered
   // compile) AND a pending embeddings refresh (a compile that skipped/failed the
   // embeddings update). Each mapper returns null when healthy, so the combined
   // array is empty for a clean project and the field stays absent (parity-safe).
   const [journalWarning, pendingWarning, quarantineWarning] = await Promise.all([
-    journalHealthWarning(root),
-    pendingEmbeddingsWarning(root),
-    quarantinedEmbeddingsWarning(root),
+    reads.journalWarning(), reads.pendingWarning(), reads.quarantineWarning(),
   ]);
   const warnings = [journalWarning, pendingWarning, quarantineWarning].filter(
     (w): w is ReadSurfaceWarning => w !== null,

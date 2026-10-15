@@ -20,38 +20,117 @@
  * the durable writes. A refused first-ever staging therefore leaves the project
  * byte-identical, whether it refused on the run budget, on capacity, or on an
  * unresolvable supersession edge.
+ *
+ * ONE BODY, {@link stagePreparationLockedWith}, over {@link StageLockedSteps}: the
+ * parent, inventory, key, evidence, manifest and run reads, the key-epoch mint
+ * (a MECHANISM returning the id and a deferred publication), and the three
+ * writes, none of which takes a project root. Every park, refusal, reuse and
+ * dry-run decision is in the body, in the incumbent's order, so a dry run still
+ * reaches no mint, publication or write. The root form keeps its signature and
+ * passes the local steps, which call the incumbents when asked;
+ * {@link stageLockedStepsOver} composes the reads from each store's own body and
+ * takes the caller's mint and writes.
  */
 
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { inventoryHasRetainedState } from "../utils/inventory-arithmetic.js";
 import {
-  assertStageCapacity, scanPreparationInventory,
-  type PreparationInventory, type StageCapacityProjection,
+  assertStageCapacity, scanPreparationInventory, scanPreparationInventoryBorrowingFrom,
+  type PreparationInventory, type PreparationInventoryLifecycleReads, type StageCapacityProjection,
 } from "./capacity.js";
 import type { PreparationScanOptions } from "./orphan-scan.js";
 import { mintPreparationId, mintPreparationRunId, type PreparationId, type PreparationRunId } from "./ids.js";
 import {
-  prepareKeyForEmptyEpochLocked, readPreparationKey, type PreparationKeyRead,
+  prepareKeyForEmptyEpochLocked, readPreparationKey, readPreparationKeyFrom,
+  type PreparationKeyLeafReads, type PreparationKeyRead,
 } from "./key-epoch.js";
 import {
   materializePlannedInitialInputs, planInitialInputs,
-  type PlannedInitialInputSetV1, type PreparationInitialInputV1,
+  type MaterializeInitialInputsOutcome, type PlannedInitialInputSetV1, type PreparationInitialInputV1,
 } from "./initial-inputs.js";
 import { validatePreparationSupersessionSet } from "./manifest-graph.js";
 import { parsePreparationManifest, preparationManifestDigest, type PreparationManifestV1 } from "./manifest-parse.js";
 import { preparationPlanDigest } from "./plan-parse.js";
-import { readPreparationManifest, writePreparationManifestCreateOnly } from "./manifest-store.js";
-import { readPreparationEvidence } from "./evidence-store.js";
+import {
+  readPreparationManifest, readPreparationManifestFrom, writePreparationManifestCreateOnly,
+  type PreparationManifestLeafReads, type PreparationManifestRead,
+} from "./manifest-store.js";
+import {
+  readPreparationEvidence, readPreparationEvidenceFrom,
+  type PreparationEvidenceLeafReads, type PreparationEvidenceLocation, type PreparationEvidenceRead,
+} from "./evidence-store.js";
 import { projectPreparationRunBudget, type RunBudget, type RunBudgetInput } from "./run-budget.js";
-import { createPreparationRunLocked, readPreparationRun } from "./run-store.js";
-import { verifyWorkflowParent } from "./workflow-parent.js";
+import {
+  createPreparationRunLocked, readPreparationRun, readPreparationRunFrom, type PreparationRunLeafReads, type PreparationRunRead,
+} from "./run-store.js";
+import { verifyWorkflowParent, verifyWorkflowParentFrom, type WorkflowParentVerification } from "./workflow-parent.js";
+import type { WorkflowRunReads } from "../workflow-history/store.js";
 import type { WorkflowParentRefV1 } from "./types.js";
 import type { NormalizedPreparationPlanV1 } from "./plan-types.js";
-import type { InitialPreparationRunInput, PreparationPrincipalV1 } from "./run-types.js";
+import type { InitialPreparationRunInput, PreparationPrincipalV1, PreparationRunBinding } from "./run-types.js";
 import type { EvidenceRefV1, Sha256Digest } from "./types.js";
 
 /** Synchronous wall clock used to bind manifest and genesis timestamps. */
 interface Clock { now(): Date }
+
+/** What one locked staging asks for, in order. No member takes a project root. */
+export interface StageLockedSteps {
+  /** The workflow parent's verification, raw: the park ladder over it is the body's. */
+  verifyParent(ref: WorkflowParentRefV1): Promise<WorkflowParentVerification>;
+  /** The preparation inventory under the scan options. */
+  scanInventory(options?: PreparationScanOptions): Promise<PreparationInventory>;
+  /** The current integrity key. */
+  readKey(): Promise<PreparationKeyRead>;
+  /** MECHANISM: mint a key for an empty epoch, returning its id and the deferred durable publication. */
+  mintEmptyEpochKey(epoch: PreparationInventory["epoch"]): Promise<ResolvedKeyEpoch>;
+  /** One evidence object's presence. */
+  readEvidence(location: PreparationEvidenceLocation, digest: string): Promise<PreparationEvidenceRead>;
+  /** The preparation's manifest. */
+  readManifest(workspaceId: string, preparationId: PreparationId): Promise<PreparationManifestRead>;
+  /** The run at `binding`, authenticated. */
+  readRun(binding: PreparationRunBinding): Promise<PreparationRunRead>;
+  /** Materialize the missing initial inputs. */
+  materializeInputs(location: PreparationEvidenceLocation, set: PlannedInitialInputSetV1, missing: ReadonlySet<string>): Promise<MaterializeInitialInputsOutcome>;
+  /** Create the immutable manifest, or prove its exact replay. */
+  writeManifest(manifest: PreparationManifestV1): Promise<unknown>;
+  /** Create the run's genesis. */
+  createRun(input: InitialPreparationRunInput, budgetInput: RunBudgetInput): Promise<unknown>;
+}
+
+/** LOCAL DISK. The incumbent readers, mint and writers for `root`, each called when asked. */
+function diskStageLockedSteps(root: string): StageLockedSteps {
+  return {
+    verifyParent: (ref) => verifyWorkflowParent(root, ref),
+    scanInventory: (options) => scanPreparationInventory(root, options),
+    readKey: () => readPreparationKey(root),
+    mintEmptyEpochKey: async (epoch) => {
+      const minted = await prepareKeyForEmptyEpochLocked(root, epoch);
+      return { keyEpochId: minted.keyEpochId, publish: minted.publish };
+    },
+    readEvidence: (location, digest) => readPreparationEvidence(root, location, digest),
+    readManifest: (workspaceId, preparationId) => readPreparationManifest(root, workspaceId, preparationId),
+    readRun: (binding) => readPreparationRun(root, binding),
+    materializeInputs: (location, set, missing) => materializePlannedInitialInputs(root, location, set, missing),
+    writeManifest: (manifest) => writePreparationManifestCreateOnly(root, manifest),
+    createRun: (input, budgetInput) => createPreparationRunLocked(root, input, budgetInput),
+  };
+}
+
+/** The same reads over each store's own body, with the caller's mint and writes. Building it does no I/O. */
+export function stageLockedStepsOver(sources: {
+  parents: WorkflowRunReads; lifecycle: PreparationInventoryLifecycleReads; keys: PreparationKeyLeafReads;
+  evidence: PreparationEvidenceLeafReads; manifests: PreparationManifestLeafReads; runs: PreparationRunLeafReads;
+}, writes: Pick<StageLockedSteps, "mintEmptyEpochKey" | "materializeInputs" | "writeManifest" | "createRun">): StageLockedSteps {
+  return {
+    ...writes,
+    verifyParent: (ref) => verifyWorkflowParentFrom(sources.parents, ref),
+    scanInventory: (options) => scanPreparationInventoryBorrowingFrom(sources.lifecycle, options),
+    readKey: () => readPreparationKeyFrom(sources.keys),
+    readEvidence: (location, digest) => readPreparationEvidenceFrom(sources.evidence, location, digest),
+    readManifest: (workspaceId, preparationId) => readPreparationManifestFrom(sources.manifests, workspaceId, preparationId),
+    readRun: (binding) => readPreparationRunFrom(sources.runs, binding),
+  };
+}
 
 /** Deterministic crash seams placed immediately after durable boundaries. */
 export interface StageFaultsForTest {
@@ -175,22 +254,22 @@ function prepareStage(
 interface Materialization { missingEvidence: Set<string>; missingManifest: boolean; missingRun: boolean; complete: boolean }
 
 /** Inspect what a fixed-id replay still needs, distinguishing an exact replay. */
-async function inspectMaterialization(root: string, prepared: PreparedStage, keyEpochId: Sha256Digest): Promise<Materialization> {
+async function inspectMaterialization(steps: StageLockedSteps, prepared: PreparedStage, keyEpochId: Sha256Digest): Promise<Materialization> {
   const location = { workspaceId: prepared.manifest.workspaceId, preparationId: prepared.manifest.preparationId };
   const missingEvidence = new Set<string>();
   for (const object of prepared.inputs.objects) {
-    const read = await readPreparationEvidence(root, location, object.digest);
+    const read = await steps.readEvidence(location, object.digest);
     if (read.status === "absent") missingEvidence.add(object.digest);
     else if (read.status !== "ok") throw new Error(`preparation evidence target is ${read.status}`);
   }
-  const missingManifest = await manifestMissing(root, prepared);
-  const missingRun = await runMissing(root, prepared, keyEpochId);
+  const missingManifest = await manifestMissing(steps, prepared);
+  const missingRun = await runMissing(steps, prepared, keyEpochId);
   return { missingEvidence, missingManifest, missingRun, complete: missingEvidence.size === 0 && !missingManifest && !missingRun };
 }
 
 /** Distinguish an absent manifest from an exact immutable replay or a conflict. */
-async function manifestMissing(root: string, prepared: PreparedStage): Promise<boolean> {
-  const read = await readPreparationManifest(root, prepared.manifest.workspaceId, prepared.manifest.preparationId);
+async function manifestMissing(steps: StageLockedSteps, prepared: PreparedStage): Promise<boolean> {
+  const read = await steps.readManifest(prepared.manifest.workspaceId, prepared.manifest.preparationId);
   if (read.status === "absent") return true;
   if (read.status !== "ok") throw new Error(`preparation manifest target is ${read.status}`);
   if (!canonicalBytes(read.manifest).equals(prepared.manifestBytes)) throw new Error("preparation manifest replay conflict");
@@ -198,8 +277,8 @@ async function manifestMissing(root: string, prepared: PreparedStage): Promise<b
 }
 
 /** Distinguish an absent run from an exact genesis replay or a conflict. */
-async function runMissing(root: string, prepared: PreparedStage, keyEpochId: Sha256Digest): Promise<boolean> {
-  const read = await readPreparationRun(root, {
+async function runMissing(steps: StageLockedSteps, prepared: PreparedStage, keyEpochId: Sha256Digest): Promise<boolean> {
+  const read = await steps.readRun({
     runId: prepared.manifest.runId, preparationId: prepared.manifest.preparationId, workspaceId: prepared.manifest.workspaceId,
     manifestDigest: prepared.manifestDigest, keyEpochId,
   });
@@ -248,7 +327,7 @@ function assertSupersession(prepared: PreparedStage, inventory: PreparationInven
 type PublishOutcome = { status: "ok" } | { status: "parked"; reason: string };
 
 /** Publish one completely preflighted preparation in the required durable order. */
-async function publishStage(root: string, prepared: PreparedStage, keyEpoch: ResolvedKeyEpoch, materialization: Materialization): Promise<PublishOutcome> {
+async function publishStage(steps: StageLockedSteps, prepared: PreparedStage, keyEpoch: ResolvedKeyEpoch, materialization: Materialization): Promise<PublishOutcome> {
   // A freshly minted key epoch is published FIRST, ahead of every other durable
   // write. The order is not arbitrary: `assertKeyCompatible` refuses a missing
   // key whenever the epoch holds anything, so evidence or a manifest landing
@@ -262,24 +341,24 @@ async function publishStage(root: string, prepared: PreparedStage, keyEpoch: Res
   await prepared.faults.beforeEvidenceSync?.();
   const keyEpochId = keyEpoch.keyEpochId;
   const location = { workspaceId: prepared.manifest.workspaceId, preparationId: prepared.manifest.preparationId };
-  const materialized = await materializePlannedInitialInputs(root, location, prepared.inputs, materialization.missingEvidence);
+  const materialized = await steps.materializeInputs(location, prepared.inputs, materialization.missingEvidence);
   if (materialized.status === "unavailable") return { status: "parked", reason: `initial-input-${materialized.code}` };
   await prepared.faults.afterEvidenceSync?.();
-  await publishManifestAndRun(root, prepared, keyEpochId, materialization);
+  await publishManifestAndRun(steps, prepared, keyEpochId, materialization);
   return { status: "ok" };
 }
 
 /** Write the canonical manifest and the HMAC genesis run, in that exact order. */
 async function publishManifestAndRun(
-  root: string, prepared: PreparedStage, keyEpochId: Sha256Digest, materialization: Materialization,
+  steps: StageLockedSteps, prepared: PreparedStage, keyEpochId: Sha256Digest, materialization: Materialization,
 ): Promise<void> {
   if (materialization.missingManifest) {
-    await writePreparationManifestCreateOnly(root, prepared.manifest);
+    await steps.writeManifest(prepared.manifest);
     await prepared.faults.afterManifestSync?.();
   }
   if (materialization.missingRun) {
     await prepared.faults.beforeInitialRunSync?.();
-    await createPreparationRunLocked(root, genesisInput(prepared, keyEpochId), prepared.budgetInput);
+    await steps.createRun(genesisInput(prepared, keyEpochId), prepared.budgetInput);
     await prepared.faults.afterInitialRunSync?.();
   }
 }
@@ -294,10 +373,10 @@ function genesisInput(prepared: PreparedStage, keyEpochId: Sha256Digest): Initia
 }
 
 /** Verify the optional workflow parent, parking on any non-verified outcome. */
-async function verifyParent(root: string, plan: NormalizedPreparationPlanV1): Promise<StagePreparationResult | null> {
+async function verifyParent(steps: StageLockedSteps, plan: NormalizedPreparationPlanV1): Promise<StagePreparationResult | null> {
   const ref = plan.workflowParent;
   if (ref === undefined) return null;
-  const verification = await verifyWorkflowParent(root, ref);
+  const verification = await steps.verifyParent(ref);
   if (verification.status !== "verified") {
     return { status: "parked", reason: `workflow-parent-${verification.status}` };
   }
@@ -378,10 +457,9 @@ interface ResolvedKeyEpoch {
  * and the materialization inspection, all of which need the epoch id because the
  * manifest binds it — refuses without having written to the project at all.
  */
-async function resolveKeyEpoch(root: string, inventory: PreparationInventory, currentKey: PreparationKeyRead): Promise<ResolvedKeyEpoch> {
+async function resolveKeyEpoch(steps: StageLockedSteps, inventory: PreparationInventory, currentKey: PreparationKeyRead): Promise<ResolvedKeyEpoch> {
   if (currentKey.status === "ok") return { keyEpochId: currentKey.keyEpochId, publish: null };
-  const minted = await prepareKeyForEmptyEpochLocked(root, inventory.epoch);
-  return { keyEpochId: minted.keyEpochId, publish: minted.publish };
+  return steps.mintEmptyEpochKey(inventory.epoch);
 }
 
 /**
@@ -394,11 +472,16 @@ async function resolveKeyEpoch(root: string, inventory: PreparationInventory, cu
  * a write above the dry-run return breaks that caller silently.
  */
 export async function stagePreparationLocked(root: string, request: StagePreparationRequest): Promise<StagePreparationResult> {
-  const parked = await verifyParent(root, request.plan);
+  return stagePreparationLockedWith(diskStageLockedSteps(root), request);
+}
+
+/** {@link stagePreparationLocked} over {@link StageLockedSteps}: THE ONE BODY. */
+export async function stagePreparationLockedWith(steps: StageLockedSteps, request: StagePreparationRequest): Promise<StagePreparationResult> {
+  const parked = await verifyParent(steps, request.plan);
   if (parked !== null) return parked;
-  const inventory = await scanPreparationInventory(root, request.capacityOptionsForTest);
+  const inventory = await steps.scanInventory(request.capacityOptionsForTest);
   if (inventory.problems.length > 0) throw new Error(`preparation inventory unavailable: ${inventory.problems[0]!.dimension}`);
-  const currentKey = await readPreparationKey(root);
+  const currentKey = await steps.readKey();
   assertKeyCompatible(currentKey, inventory);
   if (currentKey.status !== "ok" && request.dryRun === true) {
     // A fresh-project dry run has no key epoch to bind the immutable manifest to;
@@ -417,9 +500,9 @@ export async function stagePreparationLocked(root: string, request: StagePrepara
   const planned = await planInitialInputs(request.initialInputs);
   if (planned.status === "unavailable") return { status: "parked", reason: `initial-input-${planned.code}` };
   const stage = planStage(request, planned.set);
-  const keyEpoch = await resolveKeyEpoch(root, inventory, currentKey);
+  const keyEpoch = await resolveKeyEpoch(steps, inventory, currentKey);
   const prepared = prepareStage(request, stage, keyEpoch.keyEpochId, reuse);
-  const materialization = await inspectMaterialization(root, prepared, keyEpoch.keyEpochId);
+  const materialization = await inspectMaterialization(steps, prepared, keyEpoch.keyEpochId);
   assertSupersession(prepared, inventory);
   assertStageCapacity(projectCapacity(prepared, inventory, materialization));
   const result = { manifest: prepared.manifest, manifestDigest: prepared.manifestDigest, projectedRunBudget: prepared.projectedRunBudget };
@@ -427,7 +510,7 @@ export async function stagePreparationLocked(root: string, request: StagePrepara
   // its dry runs above, and an epoch minted here was proven empty, so nothing it
   // could replay against exists and `complete` is necessarily false.
   if (prepared.dryRun || materialization.complete) return { status: "staged", ...result, wrote: false };
-  const published = await publishStage(root, prepared, keyEpoch, materialization);
+  const published = await publishStage(steps, prepared, keyEpoch, materialization);
   if (published.status === "parked") return published;
   return { status: "staged", ...result, wrote: true };
 }

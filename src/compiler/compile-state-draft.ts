@@ -16,17 +16,27 @@
  * {@link writeState}, inheriting its v2 typed-mirror re-sync — the persisted
  * `entities` / `frozenEntities` are re-derived from the draft's
  * `concepts` / `frozenSlugs`, never serialised stale.
+ *
+ * STORAGE. {@link CompileStateDraft.loadFrom} and {@link CompileStateDraft.flushTo}
+ * are the same load and the same single write over an explicit
+ * {@link LegacyLocalRecords} binding, through the accepted `readStateFrom` and
+ * `writeStateTo` bodies that `readState`/`writeState` themselves delegate to.
+ * The root `load(root)`/`flush(root)` are unchanged and still call
+ * `readState`/`writeState`, so module mocks and spies of those still intercept.
  */
 
 import {
   readState,
+  readStateFrom,
   writeState,
+  writeStateTo,
   applySourceState,
   removeSourceFrom,
   applyFrozenSlugs,
   applyPromptModifiers,
 } from "../utils/state.js";
 import type { SourceState, WikiState } from "../utils/types.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
 
 /**
  * A buffered, single-flush view of the compile incremental state. Construct via
@@ -40,6 +50,11 @@ export class CompileStateDraft {
   /** Seed a draft from the current on-disk state. */
   static async load(root: string): Promise<CompileStateDraft> {
     return new CompileStateDraft(await readState(root));
+  }
+
+  /** {@link CompileStateDraft.load} over `records`: the same draft, seeded through `readStateFrom`. */
+  static async loadFrom(records: LegacyLocalRecords): Promise<CompileStateDraft> {
+    return new CompileStateDraft(await readStateFrom(records));
   }
 
   /**
@@ -87,5 +102,10 @@ export class CompileStateDraft {
    */
   async flush(root: string): Promise<void> {
     await writeState(root, this.state);
+  }
+
+  /** {@link CompileStateDraft.flush} over `records`: the same single write, through `writeStateTo`. */
+  async flushTo(records: LegacyLocalRecords): Promise<void> {
+    await writeStateTo(records, this.state);
   }
 }

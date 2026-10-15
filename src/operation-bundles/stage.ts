@@ -4,6 +4,12 @@
  * bundles. It snapshots all caller memory, completes every read-only preflight,
  * then durably publishes payloads, canonical manifest, and HMAC genesis run in
  * that exact order. It intentionally exposes no CLI, SDK, or MCP surface.
+ *
+ * ONE STAGING BODY. `stageOperationBundleWith` owns the snapshot, every preflight,
+ * the payload-then-manifest-then-genesis order, the fault seams and replay over
+ * {@link OperationStageSteps}, which take no project root. The root form keeps its
+ * signature and passes {@link diskOperationStageSteps}, whose closures call the
+ * incumbent root-taking stores (each of which now reaches its own bound body).
  */
 
 import { captureCandidateCustody } from "../compiler/candidate-custody.js";
@@ -14,6 +20,7 @@ import {
   StageCapacityError, type OperationInventory,
 } from "./capacity.js";
 import { MAX_MUTATIONS_PER_BUNDLE } from "./constants.js";
+import type { OperationEpochInventory } from "./key-epoch.js";
 import {
   assertBundleId, assertOperationRunId, catalogRecordId, mintBundleId,
   mintOperationRunId, mutationId, type BundleId,
@@ -26,7 +33,7 @@ import {
 import { validateBundleGraphSet } from "./manifest-graph.js";
 import { operationManifestDigest, parseOperationManifest } from "./manifest-parse.js";
 import { writeOperationManifestCreateOnly } from "./manifest-store.js";
-import { operationPaths } from "./paths.js";
+import { assertWorkspaceId } from "./paths.js";
 import { writePayloadCreateOnly } from "./payload-store.js";
 import { OPERATION_GRANTS, OPERATION_PRINCIPAL_SURFACES } from "./principal.js";
 import { projectRunBudget, type RunBudget } from "./run-budget.js";
@@ -35,13 +42,13 @@ import {
   signOperationRun,
 } from "./run-integrity.js";
 import { parseOperationRun } from "./run-parse.js";
-import { createOperationRunLocked, readOperationRun } from "./run-store.js";
+import { createOperationRunLocked, readOperationRun, type OperationRunRead } from "./run-store.js";
 import { projectStageCapacity } from "./stage-capacity.js";
 import { assertStageIntent } from "./stage-intent.js";
 import {
   inspectStageMaterialization, type StageMaterialization,
 } from "./stage-materialization.js";
-import type { InitialOperationRunInput, OperationRun } from "./run-types.js";
+import type { InitialOperationRunInput, OperationRun, OperationRunBinding } from "./run-types.js";
 import type {
   CatalogOperationMutation, OperationBundleManifest, OperationDigest,
   OperationMutation,
@@ -106,6 +113,51 @@ export interface StageOperationBundleResult {
   manifestDigest: OperationDigest;
   projectedRunBudget: RunBudget;
   wrote: boolean;
+}
+
+/**
+ * What staging asks of the project. Every member is a whole domain operation of
+ * an owned store; no member takes a project root.
+ */
+export interface OperationStageSteps {
+  /** The complete operation inventory. Local: `scanOperationInventory(root)`. */
+  scanInventory(): Promise<OperationInventory>;
+  /** The current key WITH ITS BYTES. Local: `readOperationKey(root)`. */
+  readKey(): Promise<OperationKeyRead>;
+  /** Classify existing candidate material. Local: `inspectStageMaterialization(root, ...)`. */
+  inspectMaterialization(...args: StageMaterializationArgs): Promise<StageMaterialization>;
+  /** Refuse a legacy review record in the bundle namespace. Local: {@link assertReviewIdentityAvailable}. */
+  assertReviewIdentityAvailable(bundleId: BundleId): Promise<void>;
+  /** Create the key for a provably empty epoch. Local: `createOperationKeyForEmptyEpochLocked(root, epoch)`. */
+  createKeyForEmptyEpoch(epoch: OperationEpochInventory): Promise<{ key: Buffer; keyEpochId: OperationDigest }>;
+  /** Create-only durable payload. Local: `writePayloadCreateOnly(root, ...)`. */
+  writePayload(location: { workspaceId: string; bundleId: BundleId; digest: string }, bytes: Buffer): Promise<unknown>;
+  /** Create-only durable manifest. Local: `writeOperationManifestCreateOnly(root, manifest)`. */
+  writeManifest(manifest: OperationBundleManifest): Promise<unknown>;
+  /** Authenticated exact-binding run read. Local: `readOperationRun(root, binding)`. */
+  readRun(binding: OperationRunBinding): Promise<OperationRunRead>;
+  /** Create-only genesis. Local: `createOperationRunLocked(root, input)`. */
+  createRun(input: InitialOperationRunInput): Promise<OperationRun>;
+}
+
+type StageMaterializationArgs = [
+  manifest: OperationBundleManifest, manifestBytes: Buffer, payloads: ReadonlyMap<string, Buffer>,
+  inventory: OperationInventory, runBytes: Buffer | undefined,
+];
+
+/** The local-disk staging steps for one root, built per call; each closure calls the incumbent when asked. In no package index. */
+function diskOperationStageSteps(root: string): OperationStageSteps {
+  return {
+    scanInventory: () => scanOperationInventory(root),
+    readKey: () => readOperationKey(root),
+    inspectMaterialization: (...args) => inspectStageMaterialization(root, ...args),
+    assertReviewIdentityAvailable: (bundleId) => assertReviewIdentityAvailable(root, bundleId),
+    createKeyForEmptyEpoch: (epoch) => createOperationKeyForEmptyEpochLocked(root, epoch),
+    writePayload: (location, bytes) => writePayloadCreateOnly(root, location, bytes),
+    writeManifest: (manifest) => writeOperationManifestCreateOnly(root, manifest),
+    readRun: (binding) => readOperationRun(root, binding),
+    createRun: (input) => createOperationRunLocked(root, input),
+  };
 }
 
 interface PreparedStage {
@@ -275,13 +327,13 @@ function expectedGenesisBytes(
 
 /** Accept an exact fully-staged replay before invoking create-only run genesis. */
 async function createOrReplayRun(
-  root: string,
+  steps: OperationStageSteps,
   input: InitialOperationRunInput,
   key: Buffer,
 ): Promise<OperationRun> {
   const expected = signOperationRun(key, createInitialOperationRun(input));
   const binding = operationRunBinding(expected);
-  const existing = await readOperationRun(root, binding);
+  const existing = await steps.readRun(binding);
   if (existing.status === "ok") {
     if (!canonicalBytes(existing.run).equals(canonicalBytes(expected))) {
       throw new Error("operation run genesis replay conflict");
@@ -289,12 +341,12 @@ async function createOrReplayRun(
     return existing.run;
   }
   if (existing.status === "unavailable") throw new Error("operation run target is unavailable");
-  return createOperationRunLocked(root, input);
+  return steps.createRun(input);
 }
 
 /** Publish one completely preflighted bundle in the required durable order. */
 async function publishStage(
-  root: string,
+  steps: OperationStageSteps,
   prepared: PreparedStage,
   key: { key: Buffer; keyEpochId: OperationDigest },
   materialization: StageMaterialization,
@@ -303,19 +355,19 @@ async function publishStage(
   for (let index = 0; index < payloads.length; index++) {
     const [digest, bytes] = payloads[index]!;
     if (!materialization.missingPayloads.has(digest)) continue;
-    await writePayloadCreateOnly(root, {
+    await steps.writePayload({
       workspaceId: prepared.manifest.workspaceId,
       bundleId: prepared.manifest.bundleId, digest,
     }, bytes);
     await prepared.faults.afterPayloadSync?.(index);
   }
   if (materialization.missingManifest) {
-    await writeOperationManifestCreateOnly(root, prepared.manifest);
+    await steps.writeManifest(prepared.manifest);
     await prepared.faults.afterManifestSync?.();
   }
   if (materialization.missingRun) {
     await prepared.faults.beforeInitialRunSync?.();
-    await createOrReplayRun(root, genesisInput(prepared, key.keyEpochId), key.key);
+    await createOrReplayRun(steps, genesisInput(prepared, key.keyEpochId), key.key);
     await prepared.faults.afterInitialRunSync?.();
   }
 }
@@ -325,20 +377,30 @@ export async function stageOperationBundleLocked(
   root: string,
   request: StageOperationBundleRequest,
 ): Promise<StageOperationBundleResult> {
+  return stageOperationBundleWith(diskOperationStageSteps(root), request);
+}
+
+/** {@link stageOperationBundleLocked} over the staging steps: the one body. */
+export async function stageOperationBundleWith(
+  steps: OperationStageSteps,
+  request: StageOperationBundleRequest,
+): Promise<StageOperationBundleResult> {
   const prepared = prepareStage(request);
   assertStageIntent(prepared.manifest, prepared.payloads);
-  operationPaths(root, prepared.manifest.workspaceId).bundleRoot(prepared.manifest.bundleId);
-  const inventory = await scanOperationInventory(root);
+  // The incumbent derived the bundle root here; the same two validators refuse the same identities.
+  assertWorkspaceId(prepared.manifest.workspaceId);
+  assertBundleId(prepared.manifest.bundleId);
+  const inventory = await steps.scanInventory();
   if (inventory.problems.length > 0) {
     throw new Error(`operation inventory unavailable: ${inventory.problems[0]!.dimension}`);
   }
-  const currentKey = await readOperationKey(root);
+  const currentKey = await steps.readKey();
   assertKeyCompatible(currentKey, inventory);
-  const materialization = await inspectStageMaterialization(
-    root, prepared.manifest, prepared.manifestBytes, prepared.payloads, inventory,
+  const materialization = await steps.inspectMaterialization(
+    prepared.manifest, prepared.manifestBytes, prepared.payloads, inventory,
     expectedGenesisBytes(prepared, currentKey),
   );
-  await assertReviewIdentityAvailable(root, prepared.manifest.bundleId);
+  await steps.assertReviewIdentityAvailable(prepared.manifest.bundleId);
   assertGraph(prepared, inventory);
   assertStageCapacity(projectStageCapacity(prepared, inventory, materialization));
   const result = {
@@ -349,7 +411,7 @@ export async function stageOperationBundleLocked(
     return { ...result, wrote: false };
   }
   const key = currentKey.status === "ok" ? currentKey
-    : await createOperationKeyForEmptyEpochLocked(root, inventory.epoch);
-  await publishStage(root, prepared, key, materialization);
+    : await steps.createKeyForEmptyEpoch(inventory.epoch);
+  await publishStage(steps, prepared, key, materialization);
   return { ...result, wrote: true };
 }

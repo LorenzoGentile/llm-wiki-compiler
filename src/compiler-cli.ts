@@ -89,6 +89,7 @@ export { loadPreviousReport, loadHistory } from "./eval/stats.js";
 export { runOkfExport } from "./export/okf/run.js";
 export { runOkfImport } from "./import/run.js";
 export { lint } from "./linter/index.js";
+export { listPageFileNames } from "./pages/file-names.js";
 export { readPageContent, readPageRecord } from "./pages/read.js";
 export { loadNonDefaultProfile } from "./profile/block.js";
 export { isSlugSafe } from "./profile/identity.js";

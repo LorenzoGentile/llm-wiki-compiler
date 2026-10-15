@@ -19,14 +19,24 @@
  * EXIT 0 WHEN A CAPABILITY IS MISSING. An unconfigured optional capability is
  * not an error: it is the product working as declared, with less. Only a review
  * that could not be produced at all is a non-zero exit.
+ *
+ * ONE BODY. {@link productStatusCommandWith} decides over
+ * {@link ProductStatusSteps}, none of which takes a project root: the contract
+ * refusal, the skip decision (an undeclared dimension or an unreadable record is
+ * refused), the zero-dimension short cut that never resolves provider paths, and
+ * the report. Resolving provider paths (a host write) is a MECHANISM step.
  */
 
 import { withQuietJson } from "../../cli/shared.js";
-import { resolveActiveWorkspaceContract } from "../../products/action-resolve.js";
-import { reviewProductReadiness, type ReadinessReportItemV1 } from "../../products/readiness.js";
-import { resolveAuthorizedProviderPaths } from "../../capability-providers/packages/paths.js";
+import {
+  resolveActiveWorkspaceContract, resolveActiveWorkspaceContractWith, type ActiveWorkspaceContractV1, type ProductActionSteps,
+} from "../../products/action-resolve.js";
+import { reviewProductReadiness, type ReadinessReportItemV1, type ReadinessReportV1 } from "../../products/readiness.js";
+import { resolveAuthorizedProviderPaths, type AuthorizedProviderPaths } from "../../capability-providers/packages/paths.js";
 import { emitProduct, refusalPresentation, type ProductPresentationV1 } from "./render.js";
-import { readRecordedSkips, recordSkip } from "../../products/readiness-skips.js";
+import {
+  readRecordedSkips, readRecordedSkipsFrom, recordSkip, recordSkipFrom, type ReadinessSkipLeaves, type RecordedSkipsV1,
+} from "../../products/readiness-skips.js";
 import * as output from "../../utils/output.js";
 
 /** CLI options for `llmwiki product status`. */
@@ -86,6 +96,47 @@ function itemLines(item: ReadinessReportItemV1): string[] {
   return lines;
 }
 
+/** The review's dimensions and provider requirements, as the readiness review takes them. */
+type ReviewDimensions = Parameters<typeof reviewProductReadiness>[1];
+type ReviewRequirements = Parameters<typeof reviewProductReadiness>[3];
+
+/** What `product status` asks of the project and host. No member takes a project root. */
+export interface ProductStatusSteps {
+  /** The active product's workspace contract, or why there is none. */
+  resolveContract(): Promise<ActiveWorkspaceContractV1>;
+  /** The recorded skips; null when the record is unreadable. */
+  readSkips(): Promise<RecordedSkipsV1>;
+  /** Record or clear one skip; the record afterwards, or null when unreadable. */
+  recordSkip(dimensionId: string, skipped: boolean): Promise<RecordedSkipsV1>;
+  /** MECHANISM: resolve the authorized provider paths, creating the operator config and cache roots. */
+  providerPaths(): Promise<AuthorizedProviderPaths>;
+  /** The readiness review of `dimensions` for this project. */
+  review(paths: AuthorizedProviderPaths, dimensions: ReviewDimensions, skipped: RecordedSkipsV1, requirements: ReviewRequirements): Promise<ReadinessReportV1>;
+}
+
+/** LOCAL DISK. The incumbent contract, skip record, provider paths and review for `root`, each called when asked. */
+function diskProductStatusSteps(root: string): ProductStatusSteps {
+  return {
+    resolveContract: () => resolveActiveWorkspaceContract(root),
+    readSkips: () => readRecordedSkips(root),
+    recordSkip: (dimensionId, skipped) => recordSkip(root, dimensionId, skipped),
+    providerPaths: () => resolveAuthorizedProviderPaths(),
+    review: (paths, dimensions, skipped, requirements) => reviewProductReadiness(paths, dimensions, skipped, requirements, root),
+  };
+}
+
+/** The contract and skip record over their own bodies, with the caller's provider paths and review. Building it does no I/O. */
+export function productStatusStepsOver(
+  seams: { action: ProductActionSteps; skips: ReadinessSkipLeaves }, host: Pick<ProductStatusSteps, "providerPaths" | "review">,
+): ProductStatusSteps {
+  return {
+    ...host,
+    resolveContract: () => resolveActiveWorkspaceContractWith(seams.action),
+    readSkips: () => readRecordedSkipsFrom(seams.skips),
+    recordSkip: (dimensionId, skipped) => recordSkipFrom(seams.skips, dimensionId, skipped),
+  };
+}
+
 /**
  * Apply a `--skip`/`--unskip` decision, then read back what is recorded.
  *
@@ -94,16 +145,16 @@ function itemLines(item: ReadinessReportItemV1): string[] {
  * forever, and it would never appear in any review to be noticed.
  */
 async function applySkipDecision(
-  root: string, options: ProductStatusOptions,
+  steps: ProductStatusSteps, options: ProductStatusOptions,
   dimensions: readonly { dimensionId: string }[],
 ): Promise<ReadonlySet<string> | null | { refused: string }> {
   const target = options.skip ?? options.unskip;
-  if (target === undefined) return readRecordedSkips(root);
+  if (target === undefined) return steps.readSkips();
   if (!dimensions.some((dimension) => dimension.dimensionId === target)) {
     output.status("!", output.warn(`this product declares no capability named ${target}`));
     return { refused: `this product declares no capability named ${target}` };
   }
-  const updated = await recordSkip(root, target, options.skip !== undefined);
+  const updated = await steps.recordSkip(target, options.skip !== undefined);
   return updated === null ? { refused: "skip record is unreadable" } : updated;
 }
 
@@ -135,9 +186,16 @@ function reviewPresentation(
 export async function productStatusCommand(
   root: string, options: ProductStatusOptions = {},
 ): Promise<number> {
+  return productStatusCommandWith(diskProductStatusSteps(root), options);
+}
+
+/** {@link productStatusCommand} over {@link ProductStatusSteps}: THE ONE BODY. */
+export async function productStatusCommandWith(
+  steps: ProductStatusSteps, options: ProductStatusOptions = {},
+): Promise<number> {
   const json = options.json === true;
   return withQuietJson(json, async () => {
-    const resolved = await resolveActiveWorkspaceContract(root);
+    const resolved = await steps.resolveContract();
     if (resolved.status === "refused") {
       return emitProduct(resolved, json, refusalPresentation(resolved.reason));
     }
@@ -145,16 +203,14 @@ export async function productStatusCommand(
     // cache roots. A review of a product with nothing to check must not leave
     // host directories behind, so the zero case never reaches the resolver.
     const dimensions = resolved.contract.productReadinessDimensions;
-    const recorded = await applySkipDecision(root, options, dimensions);
+    const recorded = await applySkipDecision(steps, options, dimensions);
     if (recorded !== null && "refused" in recorded) {
       return emitProduct({ status: "refused" as const, reason: recorded.refused }, json,
         refusalPresentation(recorded.refused));
     }
     const report = dimensions.length === 0
       ? { items: [], declaresNoOptionalCapabilities: true }
-      : await reviewProductReadiness(
-        await resolveAuthorizedProviderPaths(), dimensions, recorded,
-        resolved.providerRequirements, root);
+      : await steps.review(await steps.providerPaths(), dimensions, recorded, resolved.providerRequirements);
     const outcome = { status: "reviewed" as const, packId: resolved.packId, ...report };
     return emitProduct(
       outcome, json,

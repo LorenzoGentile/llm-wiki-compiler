@@ -46,18 +46,20 @@ function receiptLeaf(
     : paths.completedReceiptFile;
 }
 
-/**
- * Read a bounded prune receipt and verify it under the current key. A valid HMAC
- * alone proves only that some receipt was signed; kind, unit, and operation bind
- * the record to this exact protocol step.
- */
-export async function readVerifiedPruneReceipt(
-  root: string,
-  unitId: string,
-  key: Buffer,
-  kind: PruneReceiptContentV1["kind"],
-  operation: PruneReceiptContentV1["operation"],
-): Promise<PruneReceiptV1 | null> {
+// --- Receipt reads, in TWO HALVES ---------------------------------------
+// The physical read (`readPruneReceiptLeaf`: namespace, confined no-follow capped
+// read, namespace-current check) stays here as this module's filesystem
+// ownership; the verdict (`verifiedPruneReceipt`: absence, readability, parse,
+// HMAC, kind/unit/operation binding) is a root-free decision. A valid HMAC alone
+// proves only that some receipt was signed; kind, unit, and operation bind the
+// record to this exact protocol step. The callers compose the two through their
+// own leaves: the prune-delete engine's completed/planned reads and retention's
+// resume check.
+
+/** The physical half: one prune receipt leaf's bytes, read inside a current lifecycle namespace. */
+export async function readPruneReceiptLeaf(
+  root: string, unitId: string, kind: PruneReceiptContentV1["kind"],
+): Promise<Awaited<ReturnType<typeof readConfinedLeafBuffer>>> {
   const namespace = await openPreparationLifecycleNamespace(root, "read");
   const paths = lifecyclePruneUnitPaths(namespace, unitId);
   const read = await readConfinedLeafBuffer(
@@ -67,6 +69,14 @@ export async function readVerifiedPruneReceipt(
     MAX_LIFECYCLE_RECEIPT_BYTES,
   );
   await assertPreparationLifecycleNamespaceCurrent(namespace);
+  return read;
+}
+
+/** The decision half, root-free: null when absent, else an authenticated receipt bound to this unit, kind and operation. */
+export function verifiedPruneReceipt(
+  read: Awaited<ReturnType<typeof readConfinedLeafBuffer>>, key: Buffer,
+  kind: PruneReceiptContentV1["kind"], unitId: string, operation: PruneReceiptContentV1["operation"],
+): PruneReceiptV1 | null {
   if (read.kind === "absent") return null;
   if (read.kind !== "ok") throw new Error("prune receipt is unreadable");
   const receipt = parseLifecycleReceipt(read.body.toString("utf8")) as PruneReceiptV1;

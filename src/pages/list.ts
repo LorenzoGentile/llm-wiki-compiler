@@ -17,18 +17,27 @@
  *     is false.
  *   - Path safety is enforced at `getPage` entry via `assertSafeSlug`; symlink
  *     confinement is handled at a lower level by `scanWikiPages`.
+ *   - `getPageFrom` and `listPagesFrom` are THE BODIES and hold no project
+ *     root: they reach the project only through {@link PageReads}, five reads
+ *     this module names itself. `getPage(root, …)` and `listPages(root, …)` are
+ *     delegates over a private binding built per call, whose members call the
+ *     same readers with the same paths as before. Naming the reads selects no
+ *     backend and rules on no mechanism; every member of the local binding is
+ *     still local disk.
  */
 
 import path from "path";
 import { scanWikiPages } from "../compiler/indexgen.js";
+import type { ScannedPage } from "../compiler/indexgen.js";
 import { safeReadFile, parseFrontmatter } from "../utils/markdown.js";
 import { extractWikilinkSlugs } from "../wiki/collect.js";
 import { assertSafeSlug } from "../viewer/path-safety.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
 import { loadNonDefaultProfile, collectEntityPagesWithMessages } from "../profile/block.js";
 import { journalHealthWarning } from "../trust/journal-health-warning.js";
+import type { JournalWarning } from "../trust/journal-health-warning.js";
 import { toEntityPageView } from "../profile/types.js";
-import type { EntityPageView, EntityProblemView, EntityPage } from "../profile/types.js";
+import type { EntityPageView, EntityProblemView, EntityPage, LoadedProfile } from "../profile/types.js";
 import type { PageDirectory } from "../export/types.js";
 
 export type { PageDirectory };
@@ -169,6 +178,47 @@ const DIR_NAMES: Record<PageDirectory, string> = {
 const PAGE_DIRECTORIES: PageDirectory[] = ["concepts", "queries"];
 
 /**
+ * Every read the two page functions make. `getPageFrom` asks only
+ * `readPageText`, once. `listPagesFrom` asks, one after another: for concepts
+ * and then for queries, `scanPages` once and then `readPageText` once per
+ * scanned page; then `loadProfile`; then `collectEntityPages` only for a
+ * non-default profile; then `journalWarning`.
+ */
+export interface PageReads {
+  /**
+   * One page's whole text. THE EMPTY STRING FOR EVERY FAILURE: an absent file,
+   * a directory, a link that cannot be followed and a failed read are all `""`
+   * and are not told apart. Never rejects. On local disk the read follows links
+   * and is NOT confined to the page directory; that is the incumbent behaviour,
+   * kept as it is.
+   */
+  readPageText(dir: PageDirectory, slug: string): Promise<string>;
+  /** Every `.md` page of one directory with its parsed frontmatter and no body; empty when the directory cannot be listed. */
+  scanPages(dir: PageDirectory): Promise<ScannedPage[]>;
+  /** The active non-default profile; `undefined` for the built-in default. */
+  loadProfile(): Promise<LoadedProfile | undefined>;
+  /** The promoted entity pages of a non-default profile, with their collector problems as views. */
+  collectEntityPages(loaded: LoadedProfile): Promise<{ pages: EntityPage[]; problems: EntityProblemView[] }>;
+  /** The journal health warning, or `null` for a healthy journal. */
+  journalWarning(): Promise<JournalWarning | null>;
+}
+
+/**
+ * LOCAL DISK. The page reads for the project at `root`, built per call and
+ * private to this module. Building them does no I/O and evaluates nothing:
+ * each member calls its reader, with the path it always had, only when asked.
+ */
+function diskPageReads(root: string): PageReads {
+  return {
+    readPageText: (dir, slug) => safeReadFile(path.join(root, DIR_NAMES[dir], `${slug}.md`)),
+    scanPages: (dir) => scanWikiPages(path.join(root, DIR_NAMES[dir])),
+    loadProfile: () => loadNonDefaultProfile(root),
+    collectEntityPages: (loaded) => collectEntityPagesWithMessages(root, loaded),
+    journalWarning: () => journalHealthWarning(root),
+  };
+}
+
+/**
  * Build a Page from its directory, slug, parsed frontmatter, and body text.
  * Links are always extracted from the body so they reflect real wikilinks,
  * not any frontmatter list.
@@ -205,9 +255,13 @@ function buildPage(
  * @param ref - Which directory and slug to load.
  */
 export async function getPage(root: string, ref: PageRef): Promise<Page | null> {
+  return getPageFrom(diskPageReads(root), ref);
+}
+
+/** {@link getPage} through `reads`: THE ONE BODY. The slug is checked BEFORE any read; an empty text is "no page". */
+export async function getPageFrom(reads: PageReads, ref: PageRef): Promise<Page | null> {
   assertSafeSlug(ref.slug);
-  const filePath = path.join(root, DIR_NAMES[ref.pageDirectory], `${ref.slug}.md`);
-  const content = await safeReadFile(filePath);
+  const content = await reads.readPageText(ref.pageDirectory, ref.slug);
   if (!content) return null;
   const { meta, body } = parseFrontmatter(content);
   return buildPage(ref.pageDirectory, ref.slug, meta, body, true);
@@ -229,18 +283,23 @@ export async function listPages(
   root: string,
   options: ListPagesOptions = {},
 ): Promise<ListPagesResult> {
-  const all = await collectPages(root, options);
+  return listPagesFrom(diskPageReads(root), options);
+}
+
+/** {@link listPages} through `reads`: THE ONE BODY. See {@link PageReads} for the order of the reads. */
+export async function listPagesFrom(reads: PageReads, options: ListPagesOptions = {}): Promise<ListPagesResult> {
+  const all = await collectPages(reads, options);
   all.sort(
     (a, b) =>
       a.pageDirectory.localeCompare(b.pageDirectory) || a.slug.localeCompare(b.slug),
   );
   const result = paginate(all, options);
-  const profile = await collectProfileBlock(root, options);
+  const profile = await collectProfileBlock(reads, options);
   const withProfile = profile ? { ...result, profile } : result;
   // Surface a pending/unavailable compile journal so an agent listing pages
   // never treats partial post-crash state as a complete listing. ABSENT when the
   // journal is ok, so the default envelope is byte-identical (parity-safe).
-  const warning = await journalHealthWarning(root);
+  const warning = await reads.journalWarning();
   return warning ? { ...withProfile, warnings: [warning] } : withProfile;
 }
 
@@ -276,12 +335,12 @@ function profileOffset(cursor: string | undefined, name: string): number {
  * so a large profile no longer returns an unbounded, body-bearing payload.
  */
 async function collectProfileBlock(
-  root: string,
+  reads: PageReads,
   options: ListPagesOptions,
 ): Promise<ListPagesProfileBlock | undefined> {
-  const loaded = await loadNonDefaultProfile(root);
+  const loaded = await reads.loadProfile();
   if (loaded === undefined) return undefined;
-  const { pages, problems } = await collectEntityPagesWithMessages(root, loaded);
+  const { pages, problems } = await reads.collectEntityPages(loaded);
   pages.sort((a, b) => a.id.localeCompare(b.id));
   const includeBody = options.includeBody === true;
   return windowEntityPages(pages, options, includeBody, problems);
@@ -337,12 +396,11 @@ function windowEntityPages(
  * Bodies are always read so wikilinks can be extracted; they are only retained
  * on the returned Page when `includeBody` is set.
  */
-async function collectPages(root: string, options: ListPagesOptions): Promise<Page[]> {
+async function collectPages(reads: PageReads, options: ListPagesOptions): Promise<Page[]> {
   const all: Page[] = [];
   for (const dir of PAGE_DIRECTORIES) {
-    const dirPath = path.join(root, DIR_NAMES[dir]);
-    for (const { slug, meta } of await scanWikiPages(dirPath)) {
-      const content = await safeReadFile(path.join(dirPath, `${slug}.md`));
+    for (const { slug, meta } of await reads.scanPages(dir)) {
+      const content = await reads.readPageText(dir, slug);
       const { body } = parseFrontmatter(content);
       const page = buildPage(dir, slug, meta, body, options.includeBody === true);
       if (page.orphaned && !options.includeOrphaned) continue;

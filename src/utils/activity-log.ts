@@ -14,10 +14,14 @@
  * returns the five most recent operations even though entries now have bodies.
  * The log complements wiki/index.md: the index organizes content for
  * discovery, the log tracks temporal progression.
+ *
+ * ONE BODY for an append: {@link appendLog} runs {@link appendLogWith} with the
+ * incumbent `appendLocationText(path.join(root, rel), …)`, called at call time.
+ * Local default = incumbent root forms; not a backend.
  */
 
-import { appendFile } from "fs/promises";
 import path from "path";
+import { appendLocationText } from "../storage/disk-locations.js";
 import {
   LOG_FILE,
   LOG_DESCRIPTION_MAX_CHARS,
@@ -118,9 +122,31 @@ export async function appendLog(
   description: string,
   opts: LogEntryOptions = {},
 ): Promise<void> {
+  return appendLogWith((relPath, text) => appendLocationText(path.join(root, relPath), text), operation, description, opts);
+}
+
+/** Appends `text` to the project-relative `relPath`. Local: `appendLocationText(path.join(root, relPath), text)`. */
+export type AppendProjectText = (relPath: string, text: string) => Promise<void>;
+
+/**
+ * {@link appendLog} over an explicit `appendText`: THE ONE body. The date, the
+ * entry formatting and the append all stay INSIDE the `try`, and any failure
+ * becomes the same `Skipped log.md update: …` warning — never a throw.
+ *
+ * @param appendText - Appends to a project-relative path; the local route is `appendLocationText`.
+ * @param operation - Short operation tag, e.g. "ingest", "compile", "query".
+ * @param description - Human-readable heading detail for the entry.
+ * @param opts - Optional bullet body and entry date.
+ */
+export async function appendLogWith(
+  appendText: AppendProjectText,
+  operation: string,
+  description: string,
+  opts: LogEntryOptions = {},
+): Promise<void> {
   try {
     const entry = formatLogEntry(operation, description, opts.date ?? new Date(), opts.details);
-    await appendFile(path.join(root, LOG_FILE), `${entry}\n\n`, "utf-8");
+    await appendText(LOG_FILE, `${entry}\n\n`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     output.status("!", output.warn(`Skipped log.md update: ${message}`));

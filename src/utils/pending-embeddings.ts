@@ -51,7 +51,7 @@
  *    (no-mkdir; null on absent/escape).
  *
  * The LEAF is then hardened too:
- *  - WRITE goes through {@link atomicWrite} (`{ confineRoot: <realRoot> }`): a RANDOM
+ *  - WRITE goes through `atomicWrite` (`{ confineRoot: <realRoot> }`): a RANDOM
  *    `O_EXCL` temp written through the handle then `rename`d onto the target — rename
  *    REPLACES a leaf instead of following it, where a plain `writeFile` would have
  *    overwritten a symlinked leaf's out-of-tree target. `confineRoot` ADDITIONALLY
@@ -75,13 +75,20 @@
  * throws — embeddings stay non-fatal to compile.
  *
  * The file is under `.llmwiki/`, so it is never emitted into `wiki/` output.
+ *
+ * ## Bound bodies
+ * The reader has one body over {@link EmbeddingMarkerReads}; the three writers
+ * (strict write, best-effort write, clear) have one body each over
+ * {@link EmbeddingMarkerWrites}. Normalization, the caps, empty handling, which
+ * resolver failures are swallowed, the errno warning discriminator, the
+ * messages, the marker choice and the error order all stay in those bodies; the
+ * root forms are thin delegates over the local disk's mechanisms.
  */
 
-import { unlink } from "fs/promises";
-import { openFileNoFollow } from "./no-follow-open.js";
-import { constants as fsConstants } from "node:fs";
-import type { FileHandle } from "node:fs/promises";
 import path from "path";
+import { removeLeaf, replaceLeafAtomicWithin } from "../storage/disk-guarded-leaves.js";
+import { readPrivateLeafText } from "../storage/disk-private-leaves.js";
+import type { CappedLeafRead } from "./confined-read.js";
 import {
   PENDING_EMBEDDINGS_FILE,
   QUARANTINED_EMBEDDINGS_FILE,
@@ -90,7 +97,6 @@ import {
   MAX_PENDING_EMBEDDING_ATTEMPTS,
 } from "./constants.js";
 import * as output from "./output.js";
-import { atomicWrite } from "./markdown.js";
 import { parseQualifiedPageId } from "./page-id.js";
 import {
   resolveConfinedPrivateDir,
@@ -239,50 +245,6 @@ function parseMarker(raw: string): MarkerParse {
 }
 
 /**
- * The trust state of an attempted marker read, distinguishing the cases
- * {@link readMarkerCapped} must NOT conflate:
- *  - `absent` → the leaf does not exist (`open` ENOENT). A clean project; not a
- *    fault.
- *  - `unreadable` → the leaf EXISTS but cannot be trusted: a symlinked leaf
- *    (`ELOOP`), a non-regular file, or one over {@link MAX_PENDING_EMBEDDINGS_BYTES}.
- *    Recovery data may be silently lost — surface it, never report it as clean.
- *  - `ok` → a regular, in-cap leaf was read into `body`.
- */
-type MarkerRead =
-  | { kind: "absent" }
-  | { kind: "unreadable" }
-  | { kind: "ok"; body: string };
-
-/**
- * Open the marker leaf with `O_RDONLY | O_NOFOLLOW`, `fstat` the HANDLE, and read
- * its bytes — returning a DISCRIMINATED {@link MarkerRead} so the caller can tell
- * ABSENT (open ENOENT) apart from UNREADABLE (a symlinked leaf `ELOOP`, a
- * non-regular file, or one larger than {@link MAX_PENDING_EMBEDDINGS_BYTES}).
- * Conflating the two would report an unreadable recovery marker as clean. Mirrors
- * `openGraphFileRead`.
- */
-async function readMarkerCapped(filePath: string): Promise<MarkerRead> {
-  let handle: FileHandle;
-  try {
-    handle = await openFileNoFollow(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    // ENOENT → genuinely absent; a symlinked leaf throws ELOOP → exists-but-untrusted.
-    return (err as NodeJS.ErrnoException)?.code === "ENOENT"
-      ? { kind: "absent" }
-      : { kind: "unreadable" };
-  }
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_PENDING_EMBEDDINGS_BYTES) return { kind: "unreadable" };
-    return { kind: "ok", body: await handle.readFile("utf-8") };
-  } catch {
-    return { kind: "unreadable" };
-  } finally {
-    await handle.close().catch(() => {});
-  }
-}
-
-/**
  * The trust-aware result of reading the pending marker, distinguishing "no marker
  * exists" (clean) from "marker exists but cannot be trusted" (silent recovery-data
  * loss). `detail` describes WHY a marker is `unavailable` (`escape`/`corrupt`/the
@@ -311,16 +273,62 @@ export async function readPendingMarker(
   root: string,
   markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
 ): Promise<PendingMarkerRead> {
+  return readPendingMarkerFrom(diskEmbeddingMarkerReads(root), markerFile);
+}
+
+/**
+ * What one look at a marker's text found: the capped leaf read's own three
+ * outcomes, or `escape` when the private directory could not be trusted, in
+ * which case no leaf was opened.
+ */
+export type MarkerTextRead = CappedLeafRead | { kind: "escape" };
+
+/**
+ * The one read the marker readers make, named so that {@link readPendingMarkerFrom}
+ * and the two warning mappers can run without a project root. Naming it selects
+ * no backend and rules on no mechanism.
+ */
+export interface EmbeddingMarkerReads {
+  /** One marker's text, at most {@link MAX_PENDING_EMBEDDINGS_BYTES} of it. Never rejects. */
+  readMarkerText(markerFile: EmbeddingMarkerFile): Promise<MarkerTextRead>;
+}
+
+/** LOCAL DISK. The marker reads for the project at `root`. Building them does no I/O. In no package index. */
+export function diskEmbeddingMarkerReads(root: string): EmbeddingMarkerReads {
+  return { readMarkerText: (markerFile) => readDiskMarkerText(root, markerFile) };
+}
+
+/**
+ * LOCAL DISK. The no-mkdir private-directory look, then the capped no-follow
+ * leaf read: exactly the two steps {@link readPendingMarker} made inline. A
+ * rejecting directory look is `escape`; an absent directory is `absent`.
+ */
+async function readDiskMarkerText(root: string, markerFile: EmbeddingMarkerFile): Promise<MarkerTextRead> {
   let privateDir: string | null;
   try {
     privateDir = await resolveExistingConfinedPrivateDir(root);
   } catch {
-    return { status: "unavailable", entries: [], detail: "escape" };
+    return { kind: "escape" };
   }
-  if (privateDir === null) return { status: "absent", entries: [] };
-  const read = await readMarkerCapped(pendingFileIn(privateDir, markerFile));
+  if (privateDir === null) return { kind: "absent" };
+  return readPrivateLeafText(pendingFileIn(privateDir, markerFile), MAX_PENDING_EMBEDDINGS_BYTES);
+}
+
+/**
+ * {@link readPendingMarker} through `reads`: THE ONE BODY. One marker read per
+ * call; what each outcome means, and the parse, are decided here.
+ */
+export async function readPendingMarkerFrom(
+  reads: EmbeddingMarkerReads,
+  markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
+): Promise<PendingMarkerRead> {
+  const read = await reads.readMarkerText(markerFile);
+  if (read.kind === "escape") return { status: "unavailable", entries: [], detail: "escape" };
+  // ABSENT (open ENOENT, a clean project) must not be conflated with a leaf that
+  // EXISTS but cannot be trusted: a symlinked leaf, a non-regular file, or one
+  // over the cap. Reporting that as clean would silently lose recovery data.
   if (read.kind === "absent") return { status: "absent", entries: [] };
-  if (read.kind === "unreadable") return { status: "unavailable", entries: [], detail: "unreadable" };
+  if (read.kind === "unavailable") return { status: "unavailable", entries: [], detail: "unreadable" };
   const result = parseMarker(read.body);
   if (!result.ok) return { status: "unavailable", entries: [], detail: result.detail };
   return { status: "ok", entries: result.entries };
@@ -402,13 +410,24 @@ export function warnQuarantined(quarantined: PendingEmbedding[]): void {
  */
 /** Persist the operation executor's write-ahead marker, surfacing every write failure. */
 export async function writePendingEmbeddingsStrict(root: string, entries: PendingEmbedding[]): Promise<void> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return writePendingEmbeddingsStrictFrom(diskEmbeddingMarkerWrites(root), entries);
+}
+
+/**
+ * {@link writePendingEmbeddingsStrict} through `writes`: THE ONE BODY. Normalize,
+ * then CREATE the private directory, whose rejection propagates, even for an
+ * empty set; an empty set then takes the best-effort clear, whose failures are
+ * swallowed as before. Otherwise the replacement, whose rejection propagates.
+ */
+export async function writePendingEmbeddingsStrictFrom(writes: EmbeddingMarkerWrites, entries: PendingEmbedding[]): Promise<void> {
   const normalized = normalizeMarker(entries);
-  const privateDir = await resolveConfinedPrivateDir(root);
+  const privateDir = await writes.createPrivateDir();
   if (normalized.length === 0) {
-    await clearPendingEmbeddings(root);
+    await clearPendingEmbeddingsFrom(writes);
     return;
   }
-  await atomicWrite(pendingFileIn(privateDir, PENDING_EMBEDDINGS_FILE), JSON.stringify(normalized), { confineRoot: realRootOf(privateDir) });
+  await writes.replaceLeaf(realRootOf(privateDir), pendingFileIn(privateDir, PENDING_EMBEDDINGS_FILE), JSON.stringify(normalized));
 }
 
 /** Best-effort retry marker; callers requiring write-ahead durability use the strict sibling. */
@@ -417,9 +436,23 @@ export async function writePendingEmbeddings(
   entries: PendingEmbedding[],
   markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
 ): Promise<void> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return writePendingEmbeddingsFrom(diskEmbeddingMarkerWrites(root), entries, markerFile);
+}
+
+/**
+ * {@link writePendingEmbeddings} through `writes`: THE ONE BODY. An empty set
+ * goes straight to the clear, which creates nothing; otherwise the private
+ * directory is created, a rejection is swallowed, and the write is classified.
+ */
+export async function writePendingEmbeddingsFrom(
+  writes: EmbeddingMarkerWrites,
+  entries: PendingEmbedding[],
+  markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
+): Promise<void> {
   const normalized = normalizeMarker(entries);
   if (normalized.length === 0) {
-    await clearPendingEmbeddings(root, markerFile);
+    await clearPendingEmbeddingsFrom(writes, markerFile);
     return;
   }
   let privateDir: string;
@@ -427,16 +460,16 @@ export async function writePendingEmbeddings(
     // FAIL CLOSED like `acquireLock`: a `.llmwiki` (or ancestor) that symlinks
     // outside the root makes the write resolver throw, so the marker is NEVER
     // created out-of-tree. Swallow the escape rather than break compile.
-    privateDir = await resolveConfinedPrivateDir(root);
+    privateDir = await writes.createPrivateDir();
   } catch {
     return;
   }
-  await writeMarkerConfined(privateDir, JSON.stringify(normalized), markerFile);
+  await writeMarkerConfined(writes, privateDir, JSON.stringify(normalized), markerFile);
 }
 
 /**
  * Distinguish the two write-failure classes that must NOT be conflated. The leaf
- * goes through the hardened {@link atomicWrite} (random `O_EXCL` temp → `rename`,
+ * goes through the hardened `atomicWrite` (random `O_EXCL` temp → `rename`,
  * which REPLACES a symlinked leaf; `confineRoot` ALSO fails closed if the leaf
  * escapes root):
  *  - an ESCAPING/symlinked-leaf confinement error is swallowed SILENTLY (fail-closed
@@ -446,9 +479,11 @@ export async function writePendingEmbeddings(
  *    VOID the write-ahead durability guarantee this module claims.
  * Neither throws — embeddings stay non-fatal to compile.
  */
-async function writeMarkerConfined(privateDir: string, body: string, markerFile: EmbeddingMarkerFile): Promise<void> {
+async function writeMarkerConfined(
+  writes: EmbeddingMarkerWrites, privateDir: string, body: string, markerFile: EmbeddingMarkerFile,
+): Promise<void> {
   try {
-    await atomicWrite(pendingFileIn(privateDir, markerFile), body, { confineRoot: realRootOf(privateDir) });
+    await writes.replaceLeaf(realRootOf(privateDir), pendingFileIn(privateDir, markerFile), body);
   } catch (err) {
     if (isIoFailure(err)) {
       output.status(
@@ -485,12 +520,56 @@ export async function clearPendingEmbeddings(
   root: string,
   markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
 ): Promise<void> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return clearPendingEmbeddingsFrom(diskEmbeddingMarkerWrites(root), markerFile);
+}
+
+/** {@link clearPendingEmbeddings} through `writes`: THE ONE BODY. Never creates the directory; every failure is a no-op. */
+export async function clearPendingEmbeddingsFrom(
+  writes: EmbeddingMarkerWrites,
+  markerFile: EmbeddingMarkerFile = PENDING_EMBEDDINGS_FILE,
+): Promise<void> {
   let privateDir: string | null;
   try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
+    privateDir = await writes.existingPrivateDir();
   } catch {
     return; // escaping `.llmwiki` — nothing safe to clear
   }
   if (privateDir === null) return; // .llmwiki absent → nothing to clear
-  await unlink(pendingFileIn(privateDir, markerFile)).catch(() => {}); // already gone — best-effort
+  await writes.removeLeaf(pendingFileIn(privateDir, markerFile)).catch(() => {}); // already gone — best-effort
+}
+
+/**
+ * The PHYSICAL mechanisms the three marker writers run over, named so their
+ * bodies can run without a project root. The two directory looks are DISTINCT
+ * on purpose: a write creates the private directory, a clear never does. Every
+ * member rejects with its own raw error; which failures are swallowed, warned
+ * or thrown is decided by the bodies. It is separate from
+ * {@link EmbeddingMarkerReads} because that one member folds its directory look
+ * into a never-rejecting read, while a writer must see the resolver's rejection.
+ * Naming these selects no backend.
+ */
+export interface EmbeddingMarkerWrites {
+  /** MECHANISM. The private directory, created when missing and confined: its realpath. Rejects with the resolver's error. */
+  createPrivateDir(): Promise<string>;
+  /** MECHANISM. The existing private directory, never created: its realpath, or `null` when absent. Rejects when it escapes. */
+  existingPrivateDir(): Promise<string | null>;
+  /** MECHANISM. Atomic replacement of `leaf`, confined to `confineRoot` exactly as given. Rejects raw. */
+  replaceLeaf(confineRoot: string, leaf: string, body: string): Promise<void>;
+  /** MECHANISM. Unlink `leaf` by path: a link itself, never its target. Rejects raw. */
+  removeLeaf(leaf: string): Promise<void>;
+}
+
+/**
+ * LOCAL DISK. The incumbent creating and no-mkdir resolvers, confined atomic
+ * replace and unlink for `root`. Building it does no I/O. Exported only so the
+ * retry lifecycle's root forms can compose it with {@link diskEmbeddingMarkerReads}; in no package index.
+ */
+export function diskEmbeddingMarkerWrites(root: string): EmbeddingMarkerWrites {
+  return {
+    createPrivateDir: () => resolveConfinedPrivateDir(root),
+    existingPrivateDir: () => resolveExistingConfinedPrivateDir(root),
+    replaceLeaf: (confineRoot, leaf, body) => replaceLeafAtomicWithin(confineRoot, leaf, body),
+    removeLeaf: (leaf) => removeLeaf(leaf),
+  };
 }

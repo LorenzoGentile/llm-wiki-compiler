@@ -9,10 +9,11 @@ import path from "node:path";
 import approve from "../src/commands/review-approve.js";
 import reject from "../src/commands/review-reject.js";
 import { maybeSaveQueryPage } from "../src/commands/query-publication.js";
-import { updateEmbeddingsLockedCore } from "../src/utils/embeddings.js";
+import { updateEmbeddingsLockedCoreFrom } from "../src/utils/embeddings.js";
 import { usePublicationRoot, propose, candidateBytes, retained, expectApprovalRefused, approvePage } from "./fixtures/publication-review.js";
 import * as planner from "../src/trust/planner.js";
 import { EmbeddingAttemptRecorder } from "../src/utils/embedding-attempts.js";
+import { boundWriterSources } from "./fixtures/embedding-success.js";
 
 const root = usePublicationRoot();
 it("publishes exact direct-save bytes, leaves same-slug concept unchanged and refreshes index MOC embeddings", async () => {
@@ -27,8 +28,8 @@ it("publishes exact direct-save bytes, leaves same-slug concept unchanged and re
   expect(await readFile(sameSlug, "utf8")).toBe(original);
   expect(await readFile(path.join(root.dir, "wiki/index.md"), "utf8")).toContain("answer");
   expect(await readFile(path.join(root.dir, "wiki/MOC.md"), "utf8")).toContain("answer");
-  expect(updateEmbeddingsLockedCore).toHaveBeenCalledWith(
-    expect.any(String), ["queries/answer"], expect.any(Function), "drain", expect.any(EmbeddingAttemptRecorder),
+  expect(updateEmbeddingsLockedCoreFrom).toHaveBeenCalledWith(
+    boundWriterSources(), ["queries/answer"], expect.any(Function), "drain", expect.any(EmbeddingAttemptRecorder),
   );
   await expect(candidateBytes(root.dir, candidate.id)).rejects.toMatchObject({ code: "ENOENT" });
 });

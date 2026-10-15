@@ -39,15 +39,25 @@
  *
  * IT NEVER FALLS BACK TO LEGACY. Every non-product mode — legacy, conflict,
  * unavailable — is a refusal carrying which one it was.
+ *
+ * ONE BODY EACH. {@link resolveProductActionWith} and
+ * {@link resolveActiveWorkspaceContractWith} own every decision above over
+ * {@link ProductActionSteps}, none of which takes a project root. The root forms
+ * keep their signatures and pass the local steps, which call the incumbent root
+ * readers and captures when asked, with their old arguments, so module spies
+ * still intercept. {@link productActionStepsOver} composes the same steps from
+ * each one's own root-free body over the product, source and page seams.
  */
 
 import { parseSha256Digest } from "../capability-providers/ids.js";
 import { resolveActionToken, type ActionTokenRouteV1 } from "../operations-packs/aliases.js";
 import { verifyCompositionLock } from "../operations-packs/composition-lock.js";
 import { compilePackAction } from "../operations-packs/compiler.js";
-import { captureSourceEvidenceInput } from "./source-evidence-capture.js";
-import { captureArtifactEvidenceInput } from "./artifact-evidence-capture.js";
-import { capturePageEvidenceInput } from "./page-evidence-capture.js";
+import { captureSourceEvidenceInput, captureSourceEvidenceInputFrom, type SourceEvidenceCaptureV1 } from "./source-evidence-capture.js";
+import { captureArtifactEvidenceInput, captureArtifactEvidenceInputFrom, type ArtifactEvidenceCaptureV1 } from "./artifact-evidence-capture.js";
+import { capturePageEvidenceInput, capturePageEvidenceInputFrom, type PageEvidenceCaptureOutcomeV1 } from "./page-evidence-capture.js";
+import type { PageEvidenceReads } from "./page-evidence-forms.js";
+import type { SourceLeafReads } from "../utils/flat-source-leaf.js";
 import type { CompiledPackActionV1 } from "../operations-packs/compiler-types.js";
 import { parseOperationsPack } from "../operations-packs/parse.js";
 import type { ProviderRequirementV2, WorkspaceContractV2 } from "../operations-packs/types.js";
@@ -60,15 +70,17 @@ import type {
 import type { LoadedProfile } from "../profile/types.js";
 import type { Sha256Digest } from "../capability-providers/types.js";
 import type { WorkflowParentRefV1 } from "../preparations/types.js";
-import { readStoredMemberText } from "./binding/manifest-authority.js";
+import { readStoredMemberText, readStoredMemberTextFrom } from "./binding/manifest-authority.js";
 import { ProductBindingError } from "./binding/problems.js";
-import { resolveActiveProduct, type ActiveProductResolution } from "./binding/resolve.js";
+import {
+  resolveActiveProduct, resolveActiveProductFrom, type ActiveProductResolution, type ActiveProductSources,
+} from "./binding/resolve.js";
 import type { ActiveProductBindingV1 } from "./binding/types.js";
 import {
   MAX_COMPOSITION_LOCK_BYTES, MAX_ROOT_OPERATIONS_PACK_BYTES, PRODUCT_SAFETY_FLOOR_DIGEST,
 } from "./constants.js";
-import { readInstalledProductPackage } from "./packages/store.js";
-import type { ProductPackageManifestV1 } from "./types.js";
+import { readInstalledProductPackage, readInstalledProductPackageFrom, type InstalledPackageRead } from "./packages/store.js";
+import type { PackageMemberRefV1, ProductPackageManifestV1 } from "./types.js";
 
 /** The active-product resolution arm that carries a usable binding. */
 type ActiveProductModeV1 = Extract<ActiveProductResolution, { mode: "product" }>;
@@ -111,6 +123,58 @@ interface PackAuthorityV1 {
   readonly lock: CompositionLockV1;
 }
 
+/** The caller's action input, as each capture takes and returns it. */
+type ActionInput = Readonly<Record<string, PackActionInputValueV2>>;
+/** The installed package's digest, as the package and member readers take it. */
+type PackageDigest = Parameters<typeof readInstalledProductPackage>[1];
+
+/** The reads one resolution makes, in order. No member takes a project root. */
+export interface ProductActionSteps {
+  /** The ONE active-product resolution. */
+  resolveActive(): Promise<ActiveProductResolution>;
+  /** The installed package, verified. */
+  readPackage(packageDigest: PackageDigest): Promise<InstalledPackageRead>;
+  /** One installed member as strict UTF-8 text, re-verified against its reference. */
+  readMember(packageDigest: PackageDigest, member: PackageMemberRefV1, maxBytes: number): Promise<string>;
+  /** Host-side source-evidence capture. */
+  captureSource(pack: WorkspaceOperationsPackV2, actionId: string, input: ActionInput): Promise<SourceEvidenceCaptureV1>;
+  /** Host-side artifact-evidence capture. */
+  captureArtifact(pack: WorkspaceOperationsPackV2, actionId: string, input: ActionInput): Promise<ArtifactEvidenceCaptureV1>;
+  /** Host-side page-evidence capture. */
+  capturePage(pack: WorkspaceOperationsPackV2, actionId: string, input: ActionInput): Promise<PageEvidenceCaptureOutcomeV1>;
+}
+
+/** LOCAL DISK. The incumbent root readers and captures for `root`, each called when asked. */
+function diskProductActionSteps(root: string): ProductActionSteps {
+  return {
+    resolveActive: () => resolveActiveProduct(root),
+    readPackage: (packageDigest) => readInstalledProductPackage(root, packageDigest),
+    readMember: (packageDigest, member, maxBytes) => readStoredMemberText(root, packageDigest, member, maxBytes),
+    captureSource: (pack, actionId, input) => captureSourceEvidenceInput(root, pack, actionId, input),
+    captureArtifact: (pack, actionId, input) => captureArtifactEvidenceInput(root, pack, actionId, input),
+    capturePage: (pack, actionId, input) => capturePageEvidenceInput(root, pack, actionId, input),
+  };
+}
+
+/**
+ * The same steps over each one's own root-free body: the product resolution and
+ * package reads over the product sources, source capture over the source leaves,
+ * and artifact and page capture over the page-evidence reads (which extend the
+ * artifact-evidence reads). Building it does no I/O.
+ */
+export function productActionStepsOver(sources: {
+  product: ActiveProductSources; sourceLeaves: SourceLeafReads; pages: PageEvidenceReads;
+}): ProductActionSteps {
+  return {
+    resolveActive: () => resolveActiveProductFrom(sources.product),
+    readPackage: (packageDigest) => readInstalledProductPackageFrom(sources.product.packages, packageDigest),
+    readMember: (packageDigest, member, maxBytes) => readStoredMemberTextFrom(sources.product.packages, packageDigest, member, maxBytes),
+    captureSource: (pack, actionId, input) => captureSourceEvidenceInputFrom(sources.sourceLeaves, pack, actionId, input),
+    captureArtifact: (pack, actionId, input) => captureArtifactEvidenceInputFrom(sources.pages, pack, actionId, input),
+    capturePage: (pack, actionId, input) => capturePageEvidenceInputFrom(sources.pages, pack, actionId, input),
+  };
+}
+
 /** Build one refusal. */
 function refused(reason: string): ProductActionResolutionV1 {
   return { status: "refused", reason };
@@ -131,13 +195,11 @@ function modeRefusal(resolution: ActiveProductResolution): string {
  * each leaf's byte count and content digest against the manifest.
  */
 async function readPackAuthority(
-  root: string, manifest: ProductPackageManifestV1,
+  steps: ProductActionSteps, manifest: ProductPackageManifestV1,
 ): Promise<PackAuthorityV1> {
-  const packText = await readStoredMemberText(
-    root, manifest.packageDigest, manifest.rootOperationsPack, MAX_ROOT_OPERATIONS_PACK_BYTES);
+  const packText = await steps.readMember(manifest.packageDigest, manifest.rootOperationsPack, MAX_ROOT_OPERATIONS_PACK_BYTES);
   const pack = parseOperationsPack(packText);
-  const lockText = await readStoredMemberText(
-    root, manifest.packageDigest, manifest.compositionLock, MAX_COMPOSITION_LOCK_BYTES);
+  const lockText = await steps.readMember(manifest.packageDigest, manifest.compositionLock, MAX_COMPOSITION_LOCK_BYTES);
   return { pack, lock: verifyCompositionLock(pack, lockText) };
 }
 
@@ -152,10 +214,10 @@ function knowledgeRuntimeIdentity(loaded: LoadedProfile): Sha256Digest {
 
 /** Resolve the token against the proven graph and compile the named action. */
 async function compileResolved(
-  root: string, request: ProductActionRequestV1,
+  steps: ProductActionSteps, request: ProductActionRequestV1,
   active: ActiveProductModeV1, manifest: ProductPackageManifestV1,
 ): Promise<ProductActionResolutionV1> {
-  const { pack, lock } = await readPackAuthority(root, manifest);
+  const { pack, lock } = await readPackAuthority(steps, manifest);
   const token = resolveActionToken({
     pack,
     composed: {
@@ -169,18 +231,18 @@ async function compileResolved(
   // supplied values — a caller-supplied digest is an assertion about bytes the
   // caller does not own, and sealing one would defeat the run-time drift check
   // exactly when it matters. The pure compiler then seals what the host read.
-  const captured = await captureSourceEvidenceInput(root, pack, token.actionId, request.input);
+  const captured = await steps.captureSource(pack, token.actionId, request.input);
   if ("refused" in captured) return refused(captured.refused);
   // The artifact-evidence sibling: capture-time verification + host-owned
   // member columns for an action whose provider phase reads a member-bearing
   // artifact (an unhealthy/unpinned ref refuses BEFORE staging — §5a leg one).
-  const artifactCaptured = await captureArtifactEvidenceInput(root, pack, token.actionId, captured.input);
+  const artifactCaptured = await steps.captureArtifact(pack, token.actionId, captured.input);
   if ("refused" in artifactCaptured) return refused(artifactCaptured.refused);
   // The page-evidence sibling (P5c §2a): host-DERIVED values from the page
   // the action targets — never caller input — sealed under capture-owned
   // keys, with capture-time verification (§5a leg one; the runtime rehash is
   // leg two).
-  const pageCaptured = await capturePageEvidenceInput(root, pack, token.actionId, artifactCaptured.input);
+  const pageCaptured = await steps.capturePage(pack, token.actionId, artifactCaptured.input);
   if ("refused" in pageCaptured) return refused(pageCaptured.refused);
   const compiled = await compilePackAction({
     workspaceId: request.workspaceId, binding: active.binding, pack,
@@ -273,12 +335,19 @@ export type ActiveWorkspaceContractV1 =
 export async function resolveActiveWorkspaceContract(
   root: string,
 ): Promise<ActiveWorkspaceContractV1> {
-  const resolution = await resolveActiveProduct(root);
+  return resolveActiveWorkspaceContractWith(diskProductActionSteps(root));
+}
+
+/** {@link resolveActiveWorkspaceContract} over {@link ProductActionSteps}: THE ONE BODY. */
+export async function resolveActiveWorkspaceContractWith(
+  steps: ProductActionSteps,
+): Promise<ActiveWorkspaceContractV1> {
+  const resolution = await steps.resolveActive();
   if (resolution.mode !== "product") return { status: "refused", reason: modeRefusal(resolution) };
-  const pkg = await readInstalledProductPackage(root, resolution.binding.packageDigest);
+  const pkg = await steps.readPackage(resolution.binding.packageDigest);
   if (pkg.status !== "ok") return { status: "refused", reason: `the installed product package is ${pkg.status}` };
   try {
-    const authority = await readPackAuthority(root, pkg.manifest);
+    const authority = await readPackAuthority(steps, pkg.manifest);
     return {
       status: "ok", contract: authority.pack.workspaceContract, packId: authority.pack.packId,
       providerRequirements: authority.pack.providerRequirements,
@@ -292,12 +361,19 @@ export async function resolveActiveWorkspaceContract(
 export async function resolveProductAction(
   root: string, request: ProductActionRequestV1,
 ): Promise<ProductActionResolutionV1> {
-  const resolution = await resolveActiveProduct(root);
+  return resolveProductActionWith(diskProductActionSteps(root), request);
+}
+
+/** {@link resolveProductAction} over {@link ProductActionSteps}: THE ONE BODY. */
+export async function resolveProductActionWith(
+  steps: ProductActionSteps, request: ProductActionRequestV1,
+): Promise<ProductActionResolutionV1> {
+  const resolution = await steps.resolveActive();
   if (resolution.mode !== "product") return refused(modeRefusal(resolution));
-  const pkg = await readInstalledProductPackage(root, resolution.binding.packageDigest);
+  const pkg = await steps.readPackage(resolution.binding.packageDigest);
   if (pkg.status !== "ok") return refused(`the installed product package is ${pkg.status}`);
   try {
-    return await compileResolved(root, request, resolution, pkg.manifest);
+    return await compileResolved(steps, request, resolution, pkg.manifest);
   } catch (error) {
     if (!RESOLUTION_REFUSALS.some((klass) => error instanceof klass)) throw error;
     return refused(`the product action could not be compiled: ${(error as Error).message}`);

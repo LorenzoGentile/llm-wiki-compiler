@@ -148,3 +148,22 @@ export async function writePruneReceipts(input: {
       canonicalBytes(signPruneReceipt(input.key, { ...common, kind: "prune-completed" })));
   }
 }
+
+/** The fixture a lifecycle suite plants units under. */
+type LifecycleFixture = Awaited<ReturnType<typeof lifecycleSnapshotFixture>>;
+
+/** Plant one COMPLETED quarantine unit whose single object is retained in custody. */
+export async function plantRetainedQuarantine(fixture: LifecycleFixture, unitId: string): Promise<void> {
+  const retained = quarantineObject(fixture.namespace, unitId);
+  await writeQuarantineReceipts({ ...fixture, unitId, objects: [retained.object], completed: true });
+  await mkdir(lifecycleQuarantineUnitPaths(fixture.namespace, unitId).bytesRoot);
+  await writeFile(retained.destination, retained.body);
+}
+
+/** Plant one PLANNED quarantine unit whose single object is still at its source. */
+export async function plantPlannedQuarantine(fixture: LifecycleFixture, unitId: string): Promise<void> {
+  const planned = quarantineObject(fixture.namespace, unitId);
+  await mkdir(path.dirname(planned.source), { recursive: true });
+  await writeFile(planned.source, planned.body);
+  await writeQuarantineReceipts({ ...fixture, unitId, objects: [planned.object] });
+}

@@ -15,15 +15,80 @@
 
 import { createHash } from "node:crypto";
 import { parseArtifactRef } from "../artifacts/ref.js";
-import { resolveArtifactRef } from "../artifacts/resolve.js";
-import { artifactPaths, hashArtifactBody, readArtifactBody } from "../artifacts/store.js";
-import { readLiveValidRelations } from "../relations/live-valid.js";
-import { readConfinedEntityFrontmatter } from "../profile/lifecycle-read.js";
-import { locatePreparationManifest, readPreparationInitialInput, resolvePreparationRun } from "../preparations/service-run-lookup.js";
+import type { ArtifactStoreReads } from "../artifacts/resolve.js";
+import { hashArtifactBody } from "../artifacts/store.js";
+import { readLiveValidRelations, readLiveValidRelationsFrom } from "../relations/live-valid.js";
+import { readConfinedEntityFrontmatter, readConfinedEntityFrontmatterFrom } from "../profile/lifecycle-read.js";
+import type { EffectiveProfileSources } from "../profile/load.js";
+import {
+  locatePreparationManifest, locatePreparationManifestFrom, readPreparationInitialInput, readPreparationInitialInputFrom,
+  resolvePreparationRun, resolvePreparationRunFrom,
+} from "../preparations/service-run-lookup.js";
+import { readPreparationEvidenceBytes, readPreparationEvidenceBytesFrom } from "../preparations/evidence-store.js";
+import { artifactEvidenceReadsOver, diskArtifactEvidenceReads, type ArtifactEvidenceReads } from "./artifact-evidence-capture.js";
 import type { LoadedProfile } from "../profile/types.js";
 import type {
   ArtifactDerefCaptureV2, PageFieldCaptureV2, RelationTargetCaptureV2, RunBindingCaptureV2,
 } from "../operations-packs/recipe-types.js";
+
+/**
+ * Every read a page-evidence capture or its runtime re-verification makes: the
+ * artifact reads, then the target page's frontmatter, the live relation graph,
+ * and the preparation run store. No member takes a project root.
+ */
+export interface PageEvidenceReads extends ArtifactEvidenceReads {
+  /** One entity page's confined frontmatter. */
+  entityFrontmatter(...args: DropRoot<typeof readConfinedEntityFrontmatter>): ReturnType<typeof readConfinedEntityFrontmatter>;
+  /** The live relations valid under `profile`. */
+  liveValidRelations(...args: DropRoot<typeof readLiveValidRelations>): ReturnType<typeof readLiveValidRelations>;
+  /** A run's preparation manifest, located by run id. */
+  locateManifest(...args: DropRoot<typeof locatePreparationManifest>): ReturnType<typeof locatePreparationManifest>;
+  /** A manifest's sealed initial input. */
+  initialInput(...args: DropRoot<typeof readPreparationInitialInput>): ReturnType<typeof readPreparationInitialInput>;
+  /** A run, located and authenticated. */
+  resolveRun(...args: DropRoot<typeof resolvePreparationRun>): ReturnType<typeof resolvePreparationRun>;
+  /** One preparation evidence object's verified bytes. */
+  evidenceBytes(...args: DropRoot<typeof readPreparationEvidenceBytes>): ReturnType<typeof readPreparationEvidenceBytes>;
+}
+
+/** A root-taking reader's parameters after its root. */
+type DropRoot<F extends (root: string, ...rest: never[]) => unknown> = F extends (root: string, ...rest: infer Rest) => unknown ? Rest : never;
+
+/** LOCAL DISK. The incumbent root readers, each called when asked; building them does no I/O. In no package index. */
+export function diskPageEvidenceReads(root: string): PageEvidenceReads {
+  return {
+    ...diskArtifactEvidenceReads(root),
+    entityFrontmatter: (def, slug) => readConfinedEntityFrontmatter(root, def, slug),
+    liveValidRelations: (profile) => readLiveValidRelations(root, profile),
+    locateManifest: (runId) => locatePreparationManifest(root, runId),
+    initialInput: (manifest) => readPreparationInitialInput(root, manifest),
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+    evidenceBytes: (location, digest, maxBytes) => readPreparationEvidenceBytes(root, location, digest, maxBytes),
+  };
+}
+
+/** The lower seams the page-evidence reads bind over, each the existing seam of the reader that answers it. */
+export interface PageEvidenceSources {
+  profile: EffectiveProfileSources;
+  store: ArtifactStoreReads;
+  pages: Parameters<typeof readConfinedEntityFrontmatterFrom>[0];
+  graph: Parameters<typeof readLiveValidRelationsFrom>[0];
+  runs: Parameters<typeof resolvePreparationRunFrom>[0];
+  evidence: Parameters<typeof readPreparationEvidenceBytesFrom>[0];
+}
+
+/** The same reads over {@link PageEvidenceSources}, each through its reader's existing one body. */
+export function pageEvidenceReadsOver(sources: PageEvidenceSources): PageEvidenceReads {
+  return {
+    ...artifactEvidenceReadsOver(sources.profile, sources.store),
+    entityFrontmatter: (def, slug) => readConfinedEntityFrontmatterFrom(sources.pages, def, slug),
+    liveValidRelations: (profile) => readLiveValidRelationsFrom(sources.graph, profile),
+    locateManifest: (runId) => locatePreparationManifestFrom(sources.runs, runId),
+    initialInput: (manifest) => readPreparationInitialInputFrom(sources.runs, manifest),
+    resolveRun: (runId) => resolvePreparationRunFrom(sources.runs, runId),
+    evidenceBytes: (location, digest, maxBytes) => readPreparationEvidenceBytesFrom(sources.evidence, location, digest, maxBytes),
+  };
+}
 
 /** One form's outcome: the sealed key/value pairs, or a named refusal. */
 export type FormCaptureV1 =
@@ -75,8 +140,8 @@ export function capturePageField(
  * ref must parse in full canonical form, name the declared type, resolve
  * healthy, and the body must REHASH to the pinned digest at capture time.
  */
-export async function captureArtifactDeref(
-  root: string, loaded: LoadedProfile, meta: Readonly<Record<string, unknown>>,
+export async function captureArtifactDerefFrom(
+  reads: PageEvidenceReads, loaded: LoadedProfile, meta: Readonly<Record<string, unknown>>,
   capture: ArtifactDerefCaptureV2, pageLabel: string,
   declaredFields?: Readonly<Record<string, unknown>>,
 ): Promise<FormCaptureV1> {
@@ -96,9 +161,9 @@ export async function captureArtifactDeref(
   if (def === undefined || def.members !== undefined) {
     return { refused: `capture ${capture.captureId}: ${ref.artifactType} is not a declared single-body artifact type` };
   }
-  const resolution = await resolveArtifactRef(root, loaded.profile, ref);
+  const resolution = await reads.resolve(loaded.profile, ref);
   if (resolution.health !== "ok") return { refused: `capture ${capture.captureId}: the pinned artifact is ${resolution.health}` };
-  const body = await readArtifactBody(root, artifactPaths(root, ref.artifactType, ref.slug, def.fileName), capture.maxBytes);
+  const body = await reads.readBody(ref.artifactType, ref.slug, def.fileName, capture.maxBytes);
   if (body.kind !== "ok") return { refused: `capture ${capture.captureId}: the artifact body is ${body.kind}` };
   if (hashArtifactBody(body.body) !== ref.sha256) {
     return { refused: `capture ${capture.captureId}: the artifact was rewritten during capture; retry` };
@@ -117,10 +182,10 @@ export async function captureArtifactDeref(
  * capture fields on the resolved target. Zero or many edges refuse — a judge
  * must never guess which proposition it is judging.
  */
-export async function captureRelationTarget(
-  root: string, loaded: LoadedProfile, fromPageId: string, capture: RelationTargetCaptureV2,
+export async function captureRelationTargetFrom(
+  reads: PageEvidenceReads, loaded: LoadedProfile, fromPageId: string, capture: RelationTargetCaptureV2,
 ): Promise<FormCaptureV1> {
-  const relations = await readLiveValidRelations(root, loaded.profile);
+  const relations = await reads.liveValidRelations(loaded.profile);
   const targets = relations
     .filter((relation) => relation.type === capture.relationType && relation.from === fromPageId
       && relation.to.startsWith(`${capture.targetEntityType}/`))
@@ -132,7 +197,7 @@ export async function captureRelationTarget(
   const slug = targetId.slice(capture.targetEntityType.length + 1);
   const def = loaded.profile.entities[capture.targetEntityType];
   if (def === undefined) return { refused: `capture ${capture.captureId}: entity type ${capture.targetEntityType} is not declared` };
-  const read = await readConfinedEntityFrontmatter(root, def, slug);
+  const read = await reads.entityFrontmatter(def, slug);
   if (read.kind !== "frontmatter") {
     return { refused: `capture ${capture.captureId}: relation target ${targetId} is ${read.kind}` };
   }
@@ -151,20 +216,20 @@ export async function captureRelationTarget(
  * expected state, and its sealed slug field must equal the descriptor
  * target's slug — a foreign or unfinished run never feeds a judge.
  */
-export async function captureRunBinding(
-  root: string, capture: RunBindingCaptureV2, runId: string, targetSlug: string,
+export async function captureRunBindingFrom(
+  reads: PageEvidenceReads, capture: RunBindingCaptureV2, runId: string, targetSlug: string,
 ): Promise<FormCaptureV1> {
-  const located = await locatePreparationManifest(root, runId);
+  const located = await reads.locateManifest(runId);
   if (!located.ok) return { refused: `capture ${capture.captureId}: run ${runId} could not be located: ${located.reason}` };
   if (located.manifest.plan.actionAuthority.actionId !== capture.expect.actionId) {
     return { refused: `capture ${capture.captureId}: run ${runId} is not a ${capture.expect.actionId} run` };
   }
-  const sealed = await readPreparationInitialInput(root, located.manifest);
+  const sealed = await reads.initialInput(located.manifest);
   if (!sealed.ok) return { refused: `capture ${capture.captureId}: run ${runId}: ${sealed.reason}` };
   if (sealed.record[capture.expect.slugField] !== targetSlug) {
     return { refused: `capture ${capture.captureId}: run ${runId} was sealed for "${String(sealed.record[capture.expect.slugField])}", not "${targetSlug}"` };
   }
-  const resolved = await resolvePreparationRun(root, runId);
+  const resolved = await reads.resolveRun(runId);
   if (!resolved.ok) return { refused: `capture ${capture.captureId}: run ${runId} could not be read: ${resolved.reason}` };
   if (resolved.run.state !== capture.expect.state) {
     return { refused: `capture ${capture.captureId}: run ${runId} is ${resolved.run.state}; ${capture.expect.state} is required` };

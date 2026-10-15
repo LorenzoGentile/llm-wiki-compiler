@@ -18,15 +18,21 @@
 import {
   loadEmbeddingsForSearch,
   findRelevantChunksV3,
+  findRelevantChunksV3From,
   findRelevantPagesV3,
+  findRelevantPagesV3From,
+  type EmbeddingLoadOutcome,
   type EmbeddingWarning,
 } from "../utils/embeddings-load.js";
 import type { EmbeddingStoreV3 } from "../utils/embeddings-store.js";
 import {
   loadSelectedPagesByPageId,
   loadPageRecordPairsByPageId,
+  loadPageRecordsByPageIdFrom,
   buildNamespaceDirs,
-  buildSurfaceEligibleCandidates,
+  buildSurfaceEligibleCandidatesFrom,
+  diskLivePageReads,
+  type LivePageReads,
   type SurfaceCandidate,
   type PageRecordWithId,
 } from "../utils/page-registry.js";
@@ -93,15 +99,75 @@ function dedupeRefs(refs: SelectedPageRef[]): SelectedPageRef[] {
  */
 export async function pickSearchRefs(root: string, question: string, options: RetrievalOptions = {}): Promise<SearchSelection> {
   const profile = await loadProfile(root);
-  const outcome = await loadEmbeddingsForSearch(root);
+  const embeddings = await loadEmbeddingsForSearch(root);
+  const journalWarning = await journalHealthWarning(root);
+  // The root path keeps calling the root-named lookups, with the root first.
+  const finders: SemanticFinders = {
+    chunks: (store, surface, query, k, loaded) => findRelevantChunksV3(root, store, surface, query, k, loaded),
+    pages: (store, surface, query, k, loaded) => findRelevantPagesV3(root, store, surface, query, k, loaded),
+  };
+  return selectSearchRefs(diskLivePageReads(root), { profile, embeddings, journalWarning }, question, options, finders);
+}
+
+/**
+ * What search loads before it reads any page: the active profile, the gated
+ * embedding store outcome, and the journal-health warning (or none). Plain
+ * values. {@link pickSearchRefs} loads them from the project, in that order.
+ */
+export interface LoadedSearchInputs {
+  profile: LoadedProfile;
+  embeddings: EmbeddingLoadOutcome;
+  journalWarning: JournalWarning | null;
+}
+
+/**
+ * {@link pickSearchRefs} over already-loaded inputs, with every live page read
+ * made through `pages`. Nothing here loads the profile, the embedding store or
+ * the journal: those stay with the caller.
+ *
+ * @param pages - Where live pages are read from.
+ * @param inputs - The three values search loads first.
+ * @param question - The query used to rank pages.
+ * @returns Ordered refs (pageId-keyed) plus structured warnings.
+ */
+export async function pickSearchRefsFrom(
+  pages: LivePageReads,
+  inputs: LoadedSearchInputs,
+  question: string,
+  options: RetrievalOptions = {},
+): Promise<SearchSelection> {
+  const finders: SemanticFinders = {
+    chunks: (store, surface, query, k, loaded) => findRelevantChunksV3From(pages, store, surface, query, k, loaded),
+    pages: (store, surface, query, k, loaded) => findRelevantPagesV3From(pages, store, surface, query, k, loaded),
+  };
+  return selectSearchRefs(pages, inputs, question, options, finders);
+}
+
+/** The two semantic lookups, already bound to where live pages are read from. */
+interface SemanticFinders {
+  chunks(...args: FinderArgs): ReturnType<typeof findRelevantChunksV3>;
+  pages(...args: FinderArgs): ReturnType<typeof findRelevantPagesV3>;
+}
+
+/** A lookup's arguments after the place pages are read from: store, surface, question, K, profile. */
+type FinderArgs = [store: EmbeddingStoreV3, surface: "search", question: string, k: number, profile: LoadedProfile];
+
+/** The one selection both forms share: semantic lookups first, then the fallback. */
+async function selectSearchRefs(
+  pages: LivePageReads,
+  inputs: LoadedSearchInputs,
+  question: string,
+  options: RetrievalOptions,
+  finders: SemanticFinders,
+): Promise<SearchSelection> {
+  const { profile, embeddings: outcome, journalWarning } = inputs;
   // A pending/unavailable compile journal applies to the whole result regardless
   // of which retrieval branch wins, so prepend it to the base warnings ONCE. An
   // ok journal contributes nothing, so the default warnings list is unchanged.
-  const journalWarning = await journalHealthWarning(root);
   const base: SearchWarning[] = journalWarning ? [journalWarning, ...outcome.warnings] : outcome.warnings;
   let warnings = base;
   if (outcome.store) {
-    const semantic = await selectViaEmbeddings(root, outcome.store, question, profile, options);
+    const semantic = await selectViaEmbeddings(finders, outcome.store, question, profile, options);
     // Stale entries are a read-path signal regardless of hit count, so enrich the
     // warnings BEFORE branching — the all-stale/zero-hits fallback must keep it;
     // an embedding-degrade warning rides the same channel.
@@ -109,7 +175,7 @@ export async function pickSearchRefs(root: string, question: string, options: Re
     warnings = withStaleWarning(withDegrade, semantic.stalePageIds);
     if (semantic.refs.length > 0) return { refs: dedupeRefs(semantic.refs), warnings };
   }
-  const { refs } = await selectFallbackRefs(root, question, "search", profile);
+  const { refs } = await selectFallbackRefsFrom(pages, question, "search", profile);
   return { refs, warnings };
 }
 
@@ -145,7 +211,7 @@ export function withStaleWarning(base: SearchWarning[], stalePageIds: PageId[]):
  * this library also serves the MCP stdio transport.
  */
 async function selectViaEmbeddings(
-  root: string,
+  finders: SemanticFinders,
   store: EmbeddingStoreV3,
   question: string,
   profile: LoadedProfile,
@@ -153,13 +219,13 @@ async function selectViaEmbeddings(
 ): Promise<SemanticSelection> {
   try {
     const { hits: chunkHits, stalePageIds: chunkStale } =
-      await findRelevantChunksV3(root, store, "search", question, CHUNK_TOP_K, profile);
+      await finders.chunks(store, "search", question, CHUNK_TOP_K, profile);
     if (chunkHits.length > 0) {
       const refs = chunkHits.map((c) => ({ pageId: c.pageId, slug: c.slug, title: "", kind: "chunk" as const }));
       return { refs, stalePageIds: chunkStale };
     }
     const { hits: pageHits, stalePageIds: pageStale } =
-      await findRelevantPagesV3(root, store, "search", question, EMBEDDING_TOP_K, profile);
+      await finders.pages(store, "search", question, EMBEDDING_TOP_K, profile);
     const refs = pageHits.map((p) => ({ pageId: p.pageId, slug: p.slug, title: p.title, kind: "page" as const }));
     return { refs, stalePageIds: pageStale };
   } catch (err) {
@@ -197,8 +263,19 @@ function renderCandidate(candidate: SurfaceCandidate): string {
  * @param profile - Active loaded profile (entity types + directories).
  * @returns Resolved pageId-keyed refs plus the model's reasoning.
  */
-export async function selectFallbackRefs(
+export function selectFallbackRefs(
   root: string,
+  question: string,
+  surface: "search" | "context",
+  profile: LoadedProfile,
+  pageScope?: readonly string[],
+): Promise<{ refs: SelectedPageRef[]; reasoning: string }> {
+  return selectFallbackRefsFrom(diskLivePageReads(root), question, surface, profile, pageScope);
+}
+
+/** {@link selectFallbackRefs}, with the live candidates enumerated through `livePages`. */
+export async function selectFallbackRefsFrom(
+  livePages: LivePageReads,
   question: string,
   surface: "search" | "context",
   profile: LoadedProfile,
@@ -206,7 +283,7 @@ export async function selectFallbackRefs(
 ): Promise<{ refs: SelectedPageRef[]; reasoning: string }> {
   const namespaces = ["concepts", "queries", ...Object.keys(profile.profile.entities)];
   const dirs = buildNamespaceDirs(profile.profile);
-  const eligible = await buildSurfaceEligibleCandidates(root, surface, namespaces, dirs, profile);
+  const eligible = await buildSurfaceEligibleCandidatesFrom(livePages.scans, surface, namespaces, dirs, profile);
   // D-GROUNDING-SCOPE: a scoped caller may only be offered in-scope pages, here too.
   const candidates = pageScope === undefined ? eligible : eligible.filter((candidate) => pageScope.includes(candidate.pageId));
   if (candidates.length === 0) {
@@ -250,6 +327,19 @@ export async function loadSelectedRefs(root: string, refs: SelectedPageRef[]): P
   const profile = await loadProfile(root);
   const namespaceDirs = buildNamespaceDirs(profile.profile);
   return loadSelectedPagesByPageId(root, refs.map((r) => r.pageId), namespaceDirs);
+}
+
+/**
+ * {@link loadSelectedRefs} over an already-loaded profile, with each page read
+ * through `pages`: the same confined read and the same silent drops.
+ *
+ * @param pages - Where live pages are read from.
+ * @param profile - The active loaded profile (entity types + directories).
+ * @param refs - Selected page refs to hydrate.
+ * @returns Populated page records for all found pages.
+ */
+export function loadSelectedRefsFrom(pages: LivePageReads, profile: LoadedProfile, refs: SelectedPageRef[]): Promise<PageRecord[]> {
+  return loadPageRecordsByPageIdFrom(pages.reads, refs.map((r) => r.pageId), buildNamespaceDirs(profile.profile));
 }
 
 /**

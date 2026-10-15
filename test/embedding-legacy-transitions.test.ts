@@ -9,7 +9,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { OpenAIProvider } from "../src/providers/openai.js";
 import { MAX_PENDING_EMBEDDING_ATTEMPTS as MAX, MAX_PENDING_EMBEDDINGS_BYTES, PENDING_EMBEDDINGS_FILE, QUARANTINED_EMBEDDINGS_FILE } from "../src/utils/constants.js";
-import * as markers from "../src/utils/pending-embeddings.js";
 import { loadPendingEmbeddings, normalizeMarker, writePendingEmbeddings } from "../src/utils/pending-embeddings.js";
 import { useCompileProject } from "./fixtures/compile-project.js";
 import { liveContentHash } from "./fixtures/embedding-chunks.js";
@@ -39,11 +38,12 @@ async function bound(attempts: number) {
 
 const LEGACY = [{ pageId: PAGE, attempts: MAX }];
 
-/** Quarantine alpha as written before content hashing, then swallow writes to one retry file for one refresh. */
-async function refreshLegacyWithSwallowedWrites(file: string): Promise<void> {
+/** Quarantine alpha as written before content hashing, then swallow writes to one retry file for one refresh; returns the restore. */
+async function refreshLegacyWithSwallowedWrites(file: string): Promise<() => void> {
   await writePendingEmbeddings(ctx.dir, LEGACY, QUARANTINED_EMBEDDINGS_FILE);
-  swallowMarkerWrites(file);
+  const restore = swallowMarkerWrites(file);
   await refresh();
+  return restore;
 }
 
 it("grants a legacy exclusion once, binding it before any request, and announces it", async () => {
@@ -64,20 +64,20 @@ it("grants a legacy exclusion once, binding it before any request, and announces
 });
 
 it("spends no grant and sends nothing when the binding write is swallowed", async () => {
-  await refreshLegacyWithSwallowedWrites(PENDING_EMBEDDINGS_FILE);
+  const restore = await refreshLegacyWithSwallowedWrites(PENDING_EMBEDDINGS_FILE);
   expect(provider).not.toHaveBeenCalled();
   expect(await loadPendingEmbeddings(ctx.dir, QUARANTINED_EMBEDDINGS_FILE)).toEqual(LEGACY);
-  vi.mocked(markers.writePendingEmbeddings).mockRestore();
+  restore();
   await refresh();
   expect(provider).toHaveBeenCalled();
 });
 
 it("completes an interrupted release without a second grant", async () => {
-  await refreshLegacyWithSwallowedWrites(QUARANTINED_EMBEDDINGS_FILE);
+  const restore = await refreshLegacyWithSwallowedWrites(QUARANTINED_EMBEDDINGS_FILE);
   // The charge is durable, so the attempt was allowed; the quarantine removal was lost.
   expect(await loadPendingEmbeddings(ctx.dir)).toEqual([await bound(1)]);
   expect(await loadPendingEmbeddings(ctx.dir, QUARANTINED_EMBEDDINGS_FILE)).toEqual(LEGACY);
-  vi.mocked(markers.writePendingEmbeddings).mockRestore();
+  restore();
   await refresh();
   expect(await loadPendingEmbeddings(ctx.dir)).toEqual([await bound(2)]);
   expect(await loadPendingEmbeddings(ctx.dir, QUARANTINED_EMBEDDINGS_FILE)).toEqual([]);

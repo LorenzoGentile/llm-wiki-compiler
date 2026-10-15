@@ -11,12 +11,22 @@
  * one exception is a per-rule breakdown that contradicts the totals beside it:
  * that field alone is dropped, because the totals are still trustworthy and
  * "lint has not been run yet" would be a worse lie than an absent breakdown.
+ *
+ * `writeLintCacheFrom` and `readLintCacheFrom` are THE ONE BODY of each half
+ * and hold no project root: they reach the project only through
+ * {@link LintCacheSources}. The root-taking `writeLintCache` and `readLintCache`
+ * are delegates over a private binding built per call. The sources do FOUR things
+ * and decide nothing: make a directory tree, replace a file's text, read a
+ * file's text, and say where a located path is relative to the project. The
+ * bodies own the order, the aggregation, WHICH paths are made relative, the
+ * clock, the bytes and every validation and null rule. Every member of the
+ * local binding is the same unconfined local-disk call as before.
  */
 
-import { mkdir, readFile } from "fs/promises";
 import path from "path";
-import { atomicWrite } from "../utils/markdown.js";
 import { LLMWIKI_DIR, LAST_LINT_FILE } from "../utils/constants.js";
+import { makeDirectoryTree, writeLeafAtomicUnconfined } from "../storage/disk-guarded-leaves.js";
+import { readLocationText } from "../storage/disk-locations.js";
 import type { LintResult, LintSummary } from "./types.js";
 
 /** Per-rule freshness counts, derived from the lint results. Optional so a pre-upgrade cache still parses. */
@@ -82,8 +92,34 @@ export const LINT_CACHE_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2
  * otherwise suppresses on non-loopback binds. Relativizing at the source
  * means the cache itself never holds a value that needs that gating.
  */
-function toRootRelativePath(root: string, file: string): string {
-  return path.isAbsolute(file) ? path.relative(root, file) : file;
+function toRootRelativePath(sources: LintCacheSources, file: string): string {
+  return path.isAbsolute(file) ? sources.projectRelative(file) : file;
+}
+
+/**
+ * Everything the lint cache asks of the project. Paths given to the first
+ * three members are project-relative. None confines, checks a link, or makes
+ * anything durable; each rejects with the backend's own error.
+ */
+export interface LintCacheSources {
+  /** Create a directory and its missing parents. Succeeds when it is already there. */
+  makeDirectoryTree(relDir: string): Promise<void>;
+  /** Replace a file's whole text so that a reader sees the old text or the new. NOT confined to the project. */
+  writeAtomic(relPath: string, text: string): Promise<void>;
+  /** A file's whole text as UTF-8, following links. */
+  readText(relPath: string): Promise<string>;
+  /** Where an ABSOLUTE located path is, relative to the project. Asked only for an absolute path. On local disk, `path.relative(root, file)`. */
+  projectRelative(file: string): string;
+}
+
+/** LOCAL DISK. The sources for the project at `root`, built per call. Building them does no I/O. In no package index. */
+export function diskLintCacheSources(root: string): LintCacheSources {
+  return {
+    makeDirectoryTree: (relDir) => makeDirectoryTree(path.join(root, relDir)),
+    writeAtomic: (relPath, text) => writeLeafAtomicUnconfined(path.join(root, relPath), text),
+    readText: (relPath) => readLocationText(path.join(root, relPath)),
+    projectRelative: (file) => path.relative(root, file),
+  };
 }
 
 /** All results emitted by a given lint rule, regardless of severity. */
@@ -135,10 +171,10 @@ function buildRuleAggregate(rule: string, ruleResults: LintResult[]): LintRuleAg
  * and to serve. Returns `undefined` for a clean run so the caller omits the
  * field rather than persisting an empty array.
  */
-function aggregateRules(root: string, results: LintResult[]): LintRuleAggregate[] | undefined {
+function aggregateRules(sources: LintCacheSources, results: LintResult[]): LintRuleAggregate[] | undefined {
   const actionable = results
     .filter((r) => r.severity === "error" || r.severity === "warning")
-    .map((r) => ({ ...r, file: toRootRelativePath(root, r.file) }));
+    .map((r) => ({ ...r, file: toRootRelativePath(sources, r.file) }));
   if (actionable.length === 0) return undefined;
 
   const ruleNames = [...new Set(actionable.map((r) => r.rule))];
@@ -153,8 +189,16 @@ function aggregateRules(root: string, results: LintResult[]): LintRuleAggregate[
  * the cache reflects the most recent run, including zero-issue runs.
  */
 export async function writeLintCache(root: string, summary: LintSummary): Promise<void> {
-  await mkdir(path.join(root, LLMWIKI_DIR), { recursive: true });
-  const rules = aggregateRules(root, summary.results);
+  return writeLintCacheFrom(diskLintCacheSources(root), summary);
+}
+
+/**
+ * {@link writeLintCache} through `sources`: THE ONE BODY. In this order: make
+ * the directory, aggregate the findings, read the clock, write the entry.
+ */
+export async function writeLintCacheFrom(sources: LintCacheSources, summary: LintSummary): Promise<void> {
+  await sources.makeDirectoryTree(LLMWIKI_DIR);
+  const rules = aggregateRules(sources, summary.results);
   const entry: LintCacheEntry = {
     warnings: summary.warnings,
     errors: summary.errors,
@@ -165,7 +209,7 @@ export async function writeLintCache(root: string, summary: LintSummary): Promis
     },
     ...(rules !== undefined ? { rules } : {}),
   };
-  await atomicWrite(path.join(root, LAST_LINT_FILE), `${JSON.stringify(entry, null, 2)}\n`);
+  await sources.writeAtomic(LAST_LINT_FILE, `${JSON.stringify(entry, null, 2)}\n`);
 }
 
 /**
@@ -178,9 +222,14 @@ export async function writeLintCache(root: string, summary: LintSummary): Promis
  * {@link rulesAgreeWithTotals}.
  */
 export async function readLintCache(root: string): Promise<LintCacheEntry | null> {
+  return readLintCacheFrom(diskLintCacheSources(root));
+}
+
+/** {@link readLintCache} through `sources`: THE ONE BODY. One whole-file read; any rejection of it reads as null. */
+export async function readLintCacheFrom(sources: LintCacheSources): Promise<LintCacheEntry | null> {
   let raw: string;
   try {
-    raw = await readFile(path.join(root, LAST_LINT_FILE), "utf-8");
+    raw = await sources.readText(LAST_LINT_FILE);
   } catch {
     return null;
   }

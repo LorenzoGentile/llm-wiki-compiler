@@ -6,10 +6,14 @@
  * exactly once, or exactly twice through one named protocol-owned companion
  * alias left behind by a durable no-replace write. Recovery of a synced
  * ready-only crash key reuses its bytes; incomplete scratch bytes are disposable.
+ * The durable no-replace publication of a key leaf is shared here too: it is the
+ * MECHANISM under both epochs' create-or-refuse bodies, answering only whether it
+ * created the leaf or found one there.
  */
 
 import { randomBytes } from "node:crypto";
 import { lstat } from "node:fs/promises";
+import { AtomicWriteCollisionError, atomicWriteNoReplaceDurable } from "./atomic-write.js";
 import type { openConfinedLeaf } from "./confined-read.js";
 
 /** One confined leaf whose open handle and metadata are already confirmed. */
@@ -40,4 +44,19 @@ export async function healthyKeyLinks(opened: ConfirmedConfinedLeaf, reservedAli
 export function recoveredEpochKey(ready: EpochKeyRecoveryRead, byteCount: number, subject: string): Buffer {
   if (ready.status === "unavailable") throw new Error(`${subject} key recovery is unavailable`);
   return ready.status === "ok" ? ready.key : randomBytes(byteCount);
+}
+
+/**
+ * Durably publish one key leaf's base64 text without replacing a leaf already
+ * there, confined to `root` with its exact parent and mode 0600. `collision` when
+ * a leaf owns the name; any other fault THROWS.
+ */
+export async function publishKeyLeafNoReplace(root: string, file: string, key: Buffer): Promise<"created" | "collision"> {
+  try {
+    await atomicWriteNoReplaceDurable(file, key.toString("base64"), { confineRoot: root, exactParent: true, mode: 0o600 });
+    return "created";
+  } catch (error) {
+    if (error instanceof AtomicWriteCollisionError) return "collision";
+    throw error;
+  }
 }

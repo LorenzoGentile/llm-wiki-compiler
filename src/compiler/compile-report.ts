@@ -6,9 +6,14 @@
  * structured {@link CompileResult} — without mutating any content pages on disk.
  * Every function here is pure presentation or append-only activity logging; the
  * orchestration spine in `index.ts` owns the page-mutating work.
+ *
+ * ONE BODY for the compile journal entry: {@link logCompile} runs
+ * {@link logCompileWith} with the incumbent `appendLog(root, …)` (called at call
+ * time), so the entry's text is built in exactly one place. Local default =
+ * incumbent root forms; not a backend.
  */
 
-import { appendLog, formatList, formatWikilinkList } from "../utils/activity-log.js";
+import { appendLog, formatList, formatWikilinkList, type LogEntryOptions } from "../utils/activity-log.js";
 import * as output from "../utils/output.js";
 import { CONCEPTS_DIR } from "../utils/constants.js";
 import type { SchemaConfig } from "../schema/index.js";
@@ -32,6 +37,25 @@ export async function logCompile(
   generation: PageGenerationResult,
   existingIds: Set<string>,
 ): Promise<void> {
+  return logCompileWith((operation, description, opts) => appendLog(root, operation, description, opts), buckets, generation, existingIds);
+}
+
+/** Appends one activity-log entry (warns, never throws). Local: `appendLog(root, …)`. */
+export type AppendLogEntry = (operation: string, description: string, opts: LogEntryOptions) => Promise<void>;
+
+/**
+ * {@link logCompile} over an explicit `append`: THE ONE body of the compile
+ * entry, in the incumbent order (the early return when nothing was compiled or
+ * deleted, then one `compile` entry).
+ *
+ * @param append - Appends one entry; the local route is `appendLog(root, …)`.
+ */
+export async function logCompileWith(
+  append: AppendLogEntry,
+  buckets: ChangeBuckets,
+  generation: PageGenerationResult,
+  existingIds: Set<string>,
+): Promise<void> {
   if (buckets.toCompile.length === 0 && buckets.deleted.length === 0) return;
   const produced = [...new Set([...generation.writtenPages.map((entry) => entry.slug), ...generation.seedSlugs])];
   const existed = (slug: string): boolean => existingIds.has(`${CONCEPTS_DIR}/${slug}`);
@@ -45,7 +69,7 @@ export async function logCompile(
   if (created.length > 0) details.push(`Created: ${formatWikilinkList(created)}`);
   if (updated.length > 0) details.push(`Updated: ${formatWikilinkList(updated)}`);
   if (buckets.deleted.length > 0) details.push(`Deleted sources: ${buckets.deleted.length}`);
-  await appendLog(root, "compile", heading, { details });
+  await append("compile", heading, { details });
 }
 
 /** Build the structured CompileResult and emit the CLI completion banner. */

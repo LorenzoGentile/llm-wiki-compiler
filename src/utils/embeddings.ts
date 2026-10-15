@@ -15,36 +15,66 @@
  *
  * Reentrancy (S11/S3): {@link updateEmbeddingsLockedCore} assumes the caller
  * already holds the project lock (compile / review / import). {@link updateEmbeddings}
- * is the self-locking wrapper for callers with no lock (query --save).
+ * is the self-locking wrapper for callers with no lock (query --save); the lock
+ * it takes stays a named LOCAL DISK mechanism.
+ *
+ * STORAGE. The locked core has ONE BODY, {@link updateEmbeddingsLockedCoreFrom},
+ * over the raw storage it reads and writes ({@link EmbeddingWriterSources}): the
+ * stored-embedding reads, the effective profile, the live pages and the store's
+ * raw writes. `updateEmbeddingsLockedCore` hands it the local disk's. NOT bound
+ * here, and still AMBIENT: the provider that embeds (and its batch size), the
+ * active embedding configuration (model, fingerprint, the disable switch, the
+ * binary opt-in) and the process output. `prepare` and `recorder` stay the
+ * caller's own inputs.
  */
 
 import * as output from "./output.js";
 import {
   STORE_VERSION,
-  writeEmbeddingStore,
-  readStoreForUpdate,
+  writeEmbeddingStoreFrom,
+  readStoreForUpdateFrom,
   resolveEmbeddingModel,
   resolveEmbeddingFingerprint,
   storeMatchesActiveEmbedding,
   type EmbeddingStoreV3,
 } from "./embeddings-store.js";
+import { diskStoredEmbeddingWrites, type StoredEmbeddingWrites } from "./embeddings-storage.js";
 import { resolveEmbedBatchSize } from "./embeddings-batch.js";
 import { getActiveEmbeddingProviderName } from "./embedding-provider.js";
 import { releaseLock } from "./lock.js";
 import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
-import { loadProfile } from "../profile/load.js";
+import { loadProfileFrom } from "../profile/load.js";
 import { migrateEmbeddingStore } from "./embeddings-migrate.js";
-import { collectEligibleLivePages, contentHashesOf, requestedPagesExistence, type PageExistence, type CollectedPage } from "./embeddings-collect.js";
+import { collectEligibleLivePagesFrom, contentHashesOf, requestedPagesExistenceFrom, type PageExistence, type CollectedPage } from "./embeddings-collect.js";
 import { reembedIntoStore, type ReembedReport } from "./embeddings-write.js";
 import type { PageId } from "./page-id.js";
 import { ENV_EMBEDDINGS } from "./constants.js";
 import { embeddingsDisabled } from "./embeddings-config.js";
 import { retainDeferredEmbeddings } from "./embeddings-deferred.js";
-import { planScopedEmbeddingUpdate, type EmbeddingPrepare } from "./embeddings-scoped.js";
+import { diskScopedEmbeddingSources, planScopedEmbeddingUpdateFrom, type EmbeddingPrepare, type ScopedEmbeddingSources } from "./embeddings-scoped.js";
 import type { EmbeddingAttemptRecorder } from "./embedding-attempts.js";
 
 /** Full reconciliation is the legacy default; batches can opt into affected-only writes. */
 export type EmbeddingRefreshScope = "drain" | "affected-only";
+
+/** What one locked refresh reports: the attempted set, the eligible universe, and the settled absent pages. */
+type EmbeddingRefreshResult = { embedded: PageId[]; eligible: PageId[]; pruned: PageId[] };
+
+/**
+ * The raw storage the locked core runs over: the affected-only planner's own
+ * sources ({@link ScopedEmbeddingSources}: the stored-embedding reads, the
+ * effective profile and the live pages), plus the store's RAW writes. Every
+ * member is an existing bound contract; none migrates, plans, validates or
+ * persists on the core's behalf.
+ */
+export interface EmbeddingWriterSources extends ScopedEmbeddingSources {
+  readonly writes: StoredEmbeddingWrites;
+}
+
+/** LOCAL DISK. The incumbent reads and writes for `root`. Building them does no I/O. Exported only so the refresh's root forms can compose it; in no package index. */
+export function diskEmbeddingWriterSources(root: string): EmbeddingWriterSources {
+  return { ...diskScopedEmbeddingSources(root), writes: diskStoredEmbeddingWrites(root) };
+}
 
 /**
  * Re-embed the given changed page ids and migrate the store to v3, holding the
@@ -98,17 +128,41 @@ export async function updateEmbeddingsLockedCore(
   prepare?: EmbeddingPrepare,
   scope: EmbeddingRefreshScope = "drain",
   recorder?: EmbeddingAttemptRecorder,
-): Promise<{ embedded: PageId[]; eligible: PageId[]; pruned: PageId[] }> {
+): Promise<EmbeddingRefreshResult> {
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return updateEmbeddingsLockedCoreFrom(diskEmbeddingWriterSources(root), changedPageIds, prepare, scope, recorder);
+}
+
+/**
+ * {@link updateEmbeddingsLockedCore} over {@link EmbeddingWriterSources}: THE
+ * ONE BODY. The disable switch, the scope, the migration, the retry hand-off
+ * (`prepare` before any provider call), deferred retention, the prune and
+ * persist conditions, the fingerprint stamp and `markPersisted` after a
+ * successful write are all decided here, in the incumbent order.
+ *
+ * @param sources - The stored-embedding reads, the effective profile, the live pages and the store's raw writes.
+ * @param changedPageIds - Qualified page ids whose pages changed this write.
+ * @param prepare - The caller's optional write-ahead hook, as for the root form.
+ * @param scope - `drain` (the default) or `affected-only`.
+ * @param recorder - The caller's optional attempt accounting.
+ */
+export async function updateEmbeddingsLockedCoreFrom(
+  sources: EmbeddingWriterSources,
+  changedPageIds: PageId[],
+  prepare?: EmbeddingPrepare,
+  scope: EmbeddingRefreshScope = "drain",
+  recorder?: EmbeddingAttemptRecorder,
+): Promise<EmbeddingRefreshResult> {
   if (embeddingsDisabled()) {
     output.verbose(`embeddings: skipped because ${ENV_EMBEDDINGS} disables refreshes`);
     return { embedded: [], eligible: [], pruned: [] };
   }
-  if (scope === "affected-only") return updateAffectedEmbeddings(root, changedPageIds, prepare, recorder);
+  if (scope === "affected-only") return updateAffectedEmbeddings(sources, changedPageIds, prepare, recorder);
   const model = resolveEmbeddingModel();
-  const profile = await loadProfile(root);
-  const collected = await collectEligibleLivePages(root, profile);
+  const profile = await loadProfileFrom(sources.profile);
+  const collected = await collectEligibleLivePagesFrom(sources.live, profile);
   const eligible = collected.map((p) => p.pageId);
-  const parsedOld = await readStoreForUpdate(root);
+  const parsedOld = await readStoreForUpdateFrom(sources.store);
   const onDiskVersion = parsedOld?.version ?? 0;
 
   // A store whose vectors came from a DIFFERENT embedding configuration — other
@@ -123,7 +177,7 @@ export async function updateEmbeddingsLockedCore(
   // removes quarantined ids. Direct callers retain the existing refresh contract.
   const reembed = prepare ? new Set(await prepare([...discovered], contentHashesOf(collected))) : discovered;
   retainDeferredEmbeddings(preservable, migrated, new Set([...discovered].filter(id => !reembed.has(id))));
-  const pruned = absentRequestedPageIds(changedPageIds, await requestedPagesExistence(root, profile, changedPageIds), migrated);
+  const pruned = absentRequestedPageIds(changedPageIds, await requestedPagesExistenceFrom(sources.live.pages, profile, changedPageIds), migrated);
 
   // Persist when there is real work: something to re-embed, a sub-v3 store to
   // upgrade (version-driven migration, S1), OR a prune that shrank the store
@@ -131,7 +185,7 @@ export async function updateEmbeddingsLockedCore(
   // with nothing eligible stays clean — never materialize an empty store.
   if (!shouldPersist(parsedOld, migrated, reembed, onDiskVersion)) return { embedded: [], eligible, pruned };
 
-  await embedAndPersist(root, migrated, collected, reembed, onDiskVersion, recorder);
+  await embedAndPersist(sources.writes, migrated, collected, reembed, onDiskVersion, recorder);
   // The re-embed INTENT set (what we attempted). It may over-include an id the
   // writer skips — see the @returns note; the marker lifecycle tolerates that.
   return { embedded: [...reembed], eligible, pruned };
@@ -143,18 +197,18 @@ function absentRequestedPageIds(requested: PageId[], existence: Map<PageId, Page
   return requested.filter(pageId => existence.get(pageId) === "absent" && !kept.has(pageId));
 }
 
-/** Apply the scoped plan through the existing provider and persistence seam. */
+/** Apply the bound scoped plan through the existing provider and the bound validated write. */
 async function updateAffectedEmbeddings(
-  root: string,
+  sources: EmbeddingWriterSources,
   affectedIds: PageId[],
   prepare?: EmbeddingPrepare,
   recorder?: EmbeddingAttemptRecorder,
-): Promise<{ embedded: PageId[]; eligible: PageId[]; pruned: PageId[] }> {
+): Promise<EmbeddingRefreshResult> {
   if (affectedIds.length === 0) return { embedded: [], eligible: [], pruned: [] };
-  const update = await planScopedEmbeddingUpdate(root, affectedIds, prepare);
+  const update = await planScopedEmbeddingUpdateFrom(sources, affectedIds, prepare);
   if (update.reembed.size > 0) {
-    await embedAndPersist(root, update.store, update.collected, update.reembed, STORE_VERSION, recorder);
-  } else if (update.pruned) await writeEmbeddingStore(root, update.store);
+    await embedAndPersist(sources.writes, update.store, update.collected, update.reembed, STORE_VERSION, recorder);
+  } else if (update.pruned) await writeEmbeddingStoreFrom(sources.writes, update.store);
   return { embedded: [...update.reembed], eligible: update.eligible, pruned: update.prunedIds };
 }
 
@@ -165,7 +219,7 @@ async function updateAffectedEmbeddings(
  * what was on disk. An absent on-disk store with nothing to embed stays clean.
  */
 function shouldPersist(
-  parsedOld: Awaited<ReturnType<typeof readStoreForUpdate>>,
+  parsedOld: Awaited<ReturnType<typeof readStoreForUpdateFrom>>,
   migrated: EmbeddingStoreV3,
   reembed: Set<PageId>,
   onDiskVersion: number,
@@ -178,7 +232,7 @@ function shouldPersist(
 
 /** True when migration produced fewer entries/chunks than the on-disk store had. */
 function migratedShrankStore(
-  parsedOld: Awaited<ReturnType<typeof readStoreForUpdate>>,
+  parsedOld: Awaited<ReturnType<typeof readStoreForUpdateFrom>>,
   migrated: EmbeddingStoreV3,
 ): boolean {
   const oldEntries = countField(parsedOld, "entries");
@@ -187,7 +241,7 @@ function migratedShrankStore(
 }
 
 /** Count an array field on a parsed store (0 when absent / not an array). */
-function countField(parsedOld: Awaited<ReturnType<typeof readStoreForUpdate>>, field: "entries" | "chunks"): number {
+function countField(parsedOld: Awaited<ReturnType<typeof readStoreForUpdateFrom>>, field: "entries" | "chunks"): number {
   const value = parsedOld?.store[field];
   return Array.isArray(value) ? value.length : 0;
 }
@@ -206,9 +260,9 @@ function unionReembed(
   return union;
 }
 
-/** Embed the re-embed set, merge over the migrated store, and persist v3. */
+/** Embed the re-embed set, merge over the migrated store, and persist v3 through the bound validated write. */
 async function embedAndPersist(
-  root: string,
+  writes: StoredEmbeddingWrites,
   migrated: EmbeddingStoreV3,
   collected: CollectedPage[],
   reembed: Set<PageId>,
@@ -222,7 +276,7 @@ async function embedAndPersist(
   // Done here, at the single write boundary, so no path can persist a store whose
   // provenance is unrecorded — that is what the next read gates preservation on.
   const stamped: EmbeddingStoreV3 = { ...store, fingerprint: resolveEmbeddingFingerprint() };
-  await writeEmbeddingStore(root, stamped);
+  await writeEmbeddingStoreFrom(writes, stamped);
   recorder?.markPersisted();
   reportPersist(stamped, report, onDiskVersion);
 }

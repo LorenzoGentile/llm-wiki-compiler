@@ -24,6 +24,50 @@
  * preparation handoff, which does not block. On any gate failure the acquired
  * lock is released before throwing. The gate itself acquires nothing beyond the
  * one raw lock and never re-enters this wrapper, so recovery stays non-recursive.
+ *
+ * ONE BODY, EXPLICIT LEGS. {@link runRecoveryGateWith} is the one gate body, and
+ * {@link acquireMutationLockWith} / {@link acquireMutationLockBlockingWith} the
+ * one body of each NON-DESTRUCTIVE acquisition. They are handed
+ * {@link RecoveryGateSteps}: the raw project lock (acquire, blocking acquire,
+ * release) and the strict page-journal recovery, both of which have accepted
+ * storage-bound bodies, and four whole DOMAIN legs, each reached by root, that
+ * decide for themselves — the Milestone A bundle-recovery detection, the
+ * portable pending-intent block, the preparation-lifecycle gate (which owns the
+ * destructive authorization, unchanged), and the handoff settlement, which
+ * WRITES. The body keeps every decision of its own: the recovery bypass, the
+ * leg order, the unsafe-journal refusal, the bundle refusal, the portable
+ * intent's exemption, the handoff intent's settlement exemption, and releasing
+ * the lock before rethrowing (a failing release propagates instead, as before).
+ * Every root form keeps its signature and passes {@link localRecoveryGateSteps},
+ * which call the incumbents at call time, so module spies and mocks still
+ * intercept. The destructive acquisition is not given a body here; the reset
+ * acquisition shares the ordinary body, while its project-scoped authority stays
+ * unchanged and root-bound in the lifecycle leg.
+ *
+ * THE LIFECYCLE-GATE DECISION OVER TWO READS. The lifecycle leg keeps ONE
+ * root-free decision body ({@link gatePreparationLifecycleFrom}) over
+ * {@link LifecycleGateReads}: the legacy private-alias shortcut and ONE already
+ * projected pending-state capture. The capture's own physical mechanics (namespace,
+ * inode, symlink, lease, provenance) stay in the local lifecycle-fs code behind
+ * {@link diskLifecycleGateReads}; they are disk implementation, not seams.
+ *
+ * THE BUNDLE-RECOVERY DECISION OVER EXPLICIT DOMAIN READS. The bundle-recovery
+ * leg ({@link detectBundleRecoveryFrom}) and the read-only resolver
+ * ({@link resolveOperationRecoveryStateFrom}) each keep ONE decision body over
+ * {@link OperationRecoveryReads}: the whole inventory, the key and one run. The
+ * production default is {@link diskOperationRecoveryReads}, the local-disk
+ * adapter that calls the incumbent `scanOperationInventory`/`readOperationKey`/
+ * `readOperationRun` at call time. This is a DOMAIN-READ boundary only: the
+ * store walk and the confined key/run leaf reads beneath those three stay
+ * root-bound.
+ *
+ * THE OTHER THREE LEGS likewise each delegate, per call, to ONE root-free body
+ * over local-disk collaborators: the portable block to `portableGateBlockFrom`
+ * (`portable/host/pending-gate.ts`), the lifecycle leg to
+ * {@link gatePreparationLifecycleFrom} above, and the handoff settlement to
+ * `settlePreparationHandoffsWith` (`preparations/recovery.ts`). Each leg's
+ * physical mechanics stay in its local adapter, and no non-disk production
+ * adapter exists for any of the four.
  */
 
 import { acquireLock, acquireLockBlocking, releaseLock, type AcquireLockOptions, type BlockingLockOptions } from "../utils/lock.js";
@@ -32,15 +76,17 @@ import { resolvePreparationLifecyclePending, settlePreparationHandoffsLocked } f
 import type { LifecyclePendingUnitV1, PreparationLifecyclePendingState } from "../preparations/recovery.js";
 import { selectSweepTargetUnit } from "../preparations/lifecycle-snapshot/sweep-target.js";
 import type { PreparationLifecycleOperationV1 } from "../preparations/lifecycle-snapshot/types.js";
-import { scanOperationInventory } from "./capacity.js";
+import { scanOperationInventory, type OperationInventory } from "./capacity.js";
 import { legacyPrivateAliasHasNoEntries } from "../utils/legacy-private-layout.js";
 import { PREPARATION_QUARANTINE_SEGMENT, PREPARATION_PRUNE_REGISTRY } from "../preparations/paths.js";
-import { readOperationKey } from "./key-epoch.js";
+import { readOperationKey, type OperationKeyRead } from "./key-epoch.js";
 import { operationManifestDigest } from "./manifest-parse.js";
 import type { OperationProblemCode } from "./problems.js";
-import { readOperationRun } from "./run-store.js";
+import { readOperationRun, type OperationRunRead } from "./run-store.js";
+import type { OperationRunBinding } from "./run-types.js";
 import { UNSETTLED_RUN_STATES } from "./run-validation.js";
 import type { OperationBundleManifest } from "./types.js";
+import { portableGateBlock, PortableRecoveryBlockingError } from "../portable/host/pending-gate.js";
 
 /**
  * The class of mutation acquiring the lock. `recovery` bypasses the whole gate
@@ -50,7 +96,11 @@ import type { OperationBundleManifest } from "./types.js";
  */
 export type RecoveryGateIntent =
   | "ordinary" | "review" | "recovery" | "quarantine" | "sweep" | "prune" | "handoff"
-  | "reset";
+  | "reset"
+  // A portable publication or its recovery. It takes the same lock and runs the
+  // same legacy legs, and is the one intent the pending-portable-intent leg lets
+  // through, because settling that intent is exactly what it is here to do.
+  | "portable";
 
 /** Typed refusal when the recovery gate blocks a mutation from proceeding. */
 export class RecoveryGateError extends Error {
@@ -520,6 +570,36 @@ export function evaluateDestructiveAuthorization(
 }
 
 /**
+ * What the lifecycle-gate decision reads. No member takes a project root.
+ */
+export interface LifecycleGateReads {
+  /**
+   * A LOCAL COMPATIBILITY OPTIMIZATION, never authority: true only when the
+   * legacy private alias provably holds none of `names`, so the capture can be
+   * skipped. A supplier that is not the local disk answers false, which costs one
+   * capture and nothing else.
+   */
+  privateAliasHasNoEntries(names: readonly string[]): Promise<boolean>;
+  /** ONE lifecycle capture, already projected; the gate never borrows a second. */
+  readLifecyclePending(): Promise<PreparationLifecyclePendingState>;
+}
+
+/** LOCAL-DISK reads for one root, built per call; each calls the incumbent when asked. In no package index. */
+export function diskLifecycleGateReads(root: string): LifecycleGateReads {
+  return {
+    privateAliasHasNoEntries: (names) => legacyPrivateAliasHasNoEntries(root, names),
+    readLifecyclePending: () => resolvePreparationLifecyclePending(root),
+  };
+}
+
+/** The lifecycle leg over the local-disk reads: {@link gatePreparationLifecycleFrom}. */
+async function gatePreparationLifecycle(
+  root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
+): Promise<LifecycleGateTicketV1 | null> {
+  return gatePreparationLifecycleFrom(diskLifecycleGateReads(root), intent, targetUnitId);
+}
+
+/**
  * The lifecycle leg of the gate, over THREE intent categories rather than two.
  *
  * A per-unit destructive intent is refused unless it owns the pending unit it
@@ -535,9 +615,14 @@ export function evaluateDestructiveAuthorization(
  * ONE observation serves the per-unit arms. The pending state and the sweep
  * target are projected from the SAME capture, so the gate cannot authorize
  * against a registry it read twice.
+ *
+ * THE ONE DECISION BODY, root-free: every root form and
+ * {@link localRecoveryGateSteps} reach it through `gatePreparationLifecycle`.
+ * Reset returns before any read; only a non-destructive intent asks the alias;
+ * {@link evaluateDestructiveAuthorization} stays the sole destructive predicate.
  */
-async function gatePreparationLifecycle(
-  root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
+export async function gatePreparationLifecycleFrom(
+  reads: LifecycleGateReads, intent: RecoveryGateIntent, targetUnitId: string | undefined,
 ): Promise<LifecycleGateTicketV1 | null> {
   // THE PROJECT-SCOPED ARM, TAKEN FIRST (§4 reset ordering). `reset` is neither
   // per-unit destructive nor non-destructive, and both of the other arms are
@@ -557,10 +642,10 @@ async function gatePreparationLifecycle(
   // refuses every OTHER destructive intent, because their key epoch is the thing
   // being reset and their leaves become reset's custody.
   if (intent === "reset") return null;
-  if (!isDestructiveIntent(intent) && await legacyPrivateAliasHasNoEntries(
-    root, [PREPARATION_QUARANTINE_SEGMENT, PREPARATION_PRUNE_REGISTRY],
+  if (!isDestructiveIntent(intent) && await reads.privateAliasHasNoEntries(
+    [PREPARATION_QUARANTINE_SEGMENT, PREPARATION_PRUNE_REGISTRY],
   )) return null;
-  const pending = await resolvePreparationLifecyclePending(root);
+  const pending = await reads.readLifecyclePending();
   if (!isDestructiveIntent(intent)) {
     refusePendingPreparationLifecycle(pending);
     return null;
@@ -598,13 +683,31 @@ function bindingFor(manifest: OperationBundleManifest, keyEpochId: `sha256:${str
 }
 
 /**
- * Detect whether any operation bundle needs recovery, returning the blocking
- * problem code or null when clean. The integrity-key and run-integrity classes are
- * enumerated as blocking and never collapsed to absent.
+ * The three DOMAIN reads the bundle-recovery decisions ask for. Each is a whole
+ * project-owned read; none is a leaf or filesystem port. Not `ProjectStore`, not a
+ * backend, and it selects nothing.
  */
+export interface OperationRecoveryReads {
+  /** The project's whole operation inventory (manifests and problems). Local: `scanOperationInventory(root)`. */
+  scanInventory(): Promise<OperationInventory>;
+  /** The project-global operation key. Local: `readOperationKey(root)`. */
+  readKey(): Promise<OperationKeyRead>;
+  /** One bundle's run under an exact binding. Local: `readOperationRun(root, binding)`. */
+  readRun(binding: OperationRunBinding): Promise<OperationRunRead>;
+}
+
+/** LOCAL-DISK ADAPTER. The incumbent reads for the project at `root`, each called at call time; building it does no I/O. In no package index. */
+export function diskOperationRecoveryReads(root: string): OperationRecoveryReads {
+  return {
+    scanInventory: () => scanOperationInventory(root),
+    readKey: () => readOperationKey(root),
+    readRun: (binding) => readOperationRun(root, binding),
+  };
+}
+
 /** The blocking code for one bundle's run, or null when it does not block. */
-async function runRecoveryBlock(root: string, manifest: OperationBundleManifest, keyEpochId: `sha256:${string}`): Promise<OperationProblemCode | null> {
-  const read = await readOperationRun(root, bindingFor(manifest, keyEpochId));
+async function runRecoveryBlock(reads: OperationRecoveryReads, manifest: OperationBundleManifest, keyEpochId: `sha256:${string}`): Promise<OperationProblemCode | null> {
+  const read = await reads.readRun(bindingFor(manifest, keyEpochId));
   if (read.status === "unavailable") return read.code ?? "run-integrity-invalid";
   // Block exactly the shared unsettled set — execution or recovery may have a live
   // effect an unrelated mutation could invalidate; pre-effect and terminal never block.
@@ -612,19 +715,70 @@ async function runRecoveryBlock(root: string, manifest: OperationBundleManifest,
   return null;
 }
 
+/** The gate's bundle-recovery leg over the local-disk adapter. */
 async function detectBundleRecovery(root: string): Promise<OperationProblemCode | null> {
-  const inventory = await scanOperationInventory(root);
+  return detectBundleRecoveryFrom(diskOperationRecoveryReads(root));
+}
+
+/**
+ * Detect whether any operation bundle needs recovery, returning the blocking
+ * problem code or null when clean. The integrity-key and run-integrity classes are
+ * enumerated as blocking and never collapsed to absent. THE ONE BODY: inventory
+ * problems block first; an empty inventory returns before the key is read; the
+ * first blocking run, in manifest order, wins.
+ *
+ * @param reads - The inventory, key and run reads; the production default is {@link diskOperationRecoveryReads}.
+ */
+export async function detectBundleRecoveryFrom(reads: OperationRecoveryReads): Promise<OperationProblemCode | null> {
+  const inventory = await reads.scanInventory();
   if (inventory.problems.length > 0) return "bundle-recovery-blocking";
   if (inventory.manifests.length === 0) return null;
-  const key = await readOperationKey(root);
+  const key = await reads.readKey();
   if (key.status === "absent") return "integrity-key-missing";
   if (key.status === "unavailable") return "integrity-key-unreadable";
   for (const manifest of inventory.manifests) {
-    const block = await runRecoveryBlock(root, manifest, key.keyEpochId);
+    const block = await runRecoveryBlock(reads, manifest, key.keyEpochId);
     if (block !== null) return block;
   }
   return null;
 }
+
+/**
+ * What one gated acquisition composes. The lock and the journal recovery have
+ * accepted storage-bound bodies; the four legs after them are whole DOMAIN legs,
+ * each reached by root, not storage ports (each local leg delegates to one
+ * root-free body; see the file header).
+ */
+export interface RecoveryGateSteps {
+  /** The raw project lock, fail-fast. Local: `acquireLock(root, options)`. */
+  acquireLock(root: string, options: AcquireLockOptions): Promise<boolean>;
+  /** The raw project lock, bounded-blocking; throws `LockBusyError`. Local: `acquireLockBlocking(root, options)`. */
+  acquireLockBlocking(root: string, options: BlockingLockOptions): Promise<void>;
+  /** Local: `releaseLock(root)`. */
+  releaseLock(root: string): Promise<void>;
+  /** The strict page-journal recovery. Local: `recoverJournalBeforeCompile(root)`. */
+  recoverJournal(root: string): ReturnType<typeof recoverJournalBeforeCompile>;
+  /** DOMAIN, root-bound: the bundle-recovery blocking code, or null. Local: this module's bundle detection. */
+  detectBundleRecovery(root: string): Promise<OperationProblemCode | null>;
+  /** DOMAIN, root-bound: the portable pending-intent block, or null. Local: `portableGateBlock(root)`. */
+  portableBlock(root: string): ReturnType<typeof portableGateBlock>;
+  /** DOMAIN, root-bound, owns destructive authorization: refuses or returns the ticket. Local: this module's lifecycle gate. */
+  gateLifecycle(root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined): Promise<LifecycleGateTicketV1 | null>;
+  /** DOMAIN, root-bound, WRITES: settle completable preparation handoffs. Local: `settlePreparationHandoffsLocked(root)`. */
+  settleHandoffs(root: string): Promise<unknown>;
+}
+
+/** LOCAL. The incumbent lock, recovery and legs, called at call time with their old arguments; frozen. In no package index. */
+const localRecoveryGateSteps: RecoveryGateSteps = Object.freeze({
+  acquireLock: (root: string, options: AcquireLockOptions) => acquireLock(root, options),
+  acquireLockBlocking: (root: string, options: BlockingLockOptions) => acquireLockBlocking(root, options),
+  releaseLock: (root: string) => releaseLock(root),
+  recoverJournal: (root: string) => recoverJournalBeforeCompile(root),
+  detectBundleRecovery: (root: string) => detectBundleRecovery(root),
+  portableBlock: (root: string) => portableGateBlock(root),
+  gateLifecycle: (root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined) => gatePreparationLifecycle(root, intent, targetUnitId),
+  settleHandoffs: (root: string) => settlePreparationHandoffsLocked(root),
+});
 
 /**
  * Run the journal + bundle recovery gate, throwing a typed refusal when it blocks.
@@ -632,37 +786,44 @@ async function detectBundleRecovery(root: string): Promise<OperationProblemCode 
  * itself (the recover coordinator has a runtime and reports its own outcome), so
  * the gate does not pre-empt it.
  */
-async function runRecoveryGate(
-  root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
+async function runRecoveryGateWith(
+  steps: RecoveryGateSteps, root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
 ): Promise<LifecycleGateTicketV1 | null> {
   if (intent === "recovery") return null;
   // The unconditional recovery order (design section 15.1): page journal first,
   // then the Milestone A bundle coordinator, then preparation recovery. Preparation
   // recovery runs LAST so a bundle create that outran its `handed-off` transition
   // is discovered and completed rather than duplicated.
-  const journal = await recoverJournalBeforeCompile(root);
+  const journal = await steps.recoverJournal(root);
   if (journal.status === "unsafe") {
     // Preserve the page-journal fail-closed contract callers already expect.
     throw new JournalUnsafeError("pre-mutation journal recovery unsafe");
   }
-  const bundleBlock = await detectBundleRecovery(root);
+  const bundleBlock = await steps.detectBundleRecovery(root);
   if (bundleBlock !== null) {
     throw new RecoveryGateError(bundleBlock, "operation bundle recovery is required before this mutation");
   }
+  // Registered projects only: an ordinary mutation waits while a portable
+  // publication intent is unresolved. On any other project this is one `lstat`
+  // and nothing else. The portable intent itself is let through, since settling
+  // that intent is its job. Like the refusal above it comes BEFORE the
+  // settlement leg, so a refusal means nothing was appended.
+  const portableBlock = intent === "portable" ? null : await steps.portableBlock(root);
+  if (portableBlock !== null) throw new PortableRecoveryBlockingError(portableBlock);
   // BEFORE the settlement leg below, and before the handoff intent's early
   // return, so a refusal means nothing happened: settlement APPENDS durable
   // transitions, and appending them and then refusing would leave the project
   // mutated by an acquisition the caller was told did not proceed. The handoff
   // intent's exemption is from settling its OWN `handoff-started` run, not from
   // lifecycle maintenance — it owns no lifecycle unit either.
-  const ticket = await gatePreparationLifecycle(root, intent, targetUnitId);
+  const ticket = await steps.gateLifecycle(root, intent, targetUnitId);
   // Preparation recovery settles a handoff whose bundle create outran its
   // `handed-off` transition, but never blocks: a parked or bundle-absent in-flight
   // handoff belongs to its own command's resume and cannot conflict with this
   // mutation, so blocking here would wrongly stall concurrent preparation work. The
   // handoff intent resolves its own run and skips this leg.
   if (intent === "handoff") return ticket;
-  await settlePreparationHandoffsLocked(root);
+  await steps.settleHandoffs(root);
   return ticket;
 }
 
@@ -670,10 +831,17 @@ async function runRecoveryGate(
 async function gateOrRelease(
   root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
 ): Promise<LifecycleGateTicketV1 | null> {
+  return gateOrReleaseWith(localRecoveryGateSteps, root, intent, targetUnitId);
+}
+
+/** THE ONE BODY of {@link gateOrRelease}: a failing release propagates in place of the gate's error, as before. */
+async function gateOrReleaseWith(
+  steps: RecoveryGateSteps, root: string, intent: RecoveryGateIntent, targetUnitId: string | undefined,
+): Promise<LifecycleGateTicketV1 | null> {
   try {
-    return await runRecoveryGate(root, intent, targetUnitId);
+    return await runRecoveryGateWith(steps, root, intent, targetUnitId);
   } catch (error) {
-    await releaseLock(root);
+    await steps.releaseLock(root);
     throw error;
   }
 }
@@ -747,9 +915,17 @@ export async function acquireMutationLock(
   root: string, intent: NonDestructiveGateIntent | ProjectScopedGateIntent,
   options: AcquireLockOptions = {},
 ): Promise<boolean> {
-  const acquired = await acquireLock(root, options);
+  return acquireMutationLockWith(localRecoveryGateSteps, root, intent, options);
+}
+
+/** THE ONE BODY of {@link acquireMutationLock}: busy returns false before any leg; `options` reach the lock untouched. */
+export async function acquireMutationLockWith(
+  steps: RecoveryGateSteps, root: string, intent: NonDestructiveGateIntent | ProjectScopedGateIntent,
+  options: AcquireLockOptions = {},
+): Promise<boolean> {
+  const acquired = await steps.acquireLock(root, options);
   if (!acquired) return false;
-  await gateOrRelease(root, intent, undefined);
+  await gateOrReleaseWith(steps, root, intent, undefined);
   return true;
 }
 
@@ -759,8 +935,15 @@ export async function acquireMutationLock(
  * LockBusyError); a gate block throws {@link RecoveryGateError} after releasing.
  */
 export async function acquireMutationLockBlocking(root: string, intent: NonDestructiveGateIntent, options: BlockingLockOptions = {}): Promise<void> {
-  await acquireLockBlocking(root, options);
-  await gateOrRelease(root, intent, undefined);
+  return acquireMutationLockBlockingWith(localRecoveryGateSteps, root, intent, options);
+}
+
+/** THE ONE BODY of {@link acquireMutationLockBlocking}: a busy timeout throws before any leg. */
+export async function acquireMutationLockBlockingWith(
+  steps: RecoveryGateSteps, root: string, intent: NonDestructiveGateIntent, options: BlockingLockOptions = {},
+): Promise<void> {
+  await steps.acquireLockBlocking(root, options);
+  await gateOrReleaseWith(steps, root, intent, undefined);
 }
 
 /** One manifest's read-only recovery classification without any mutation. */
@@ -772,8 +955,8 @@ type ManifestRecoveryRead = "unavailable" | "stale-active" | "parked" | "settled
  * `stale-active`, a `recovery-required` run is `parked`, and everything else
  * (pre-effect or terminal) is `settled`.
  */
-async function manifestRecoveryRead(root: string, manifest: OperationBundleManifest, keyEpochId: `sha256:${string}`): Promise<ManifestRecoveryRead> {
-  const read = await readOperationRun(root, bindingFor(manifest, keyEpochId));
+async function manifestRecoveryRead(reads: OperationRecoveryReads, manifest: OperationBundleManifest, keyEpochId: `sha256:${string}`): Promise<ManifestRecoveryRead> {
+  const read = await reads.readRun(bindingFor(manifest, keyEpochId));
   if (read.status === "unavailable") return "unavailable";
   if (read.status !== "ok" || !UNSETTLED_RUN_STATES.has(read.run.state)) return "settled";
   // Within the shared unsettled set, only `recovery-required` is the parked case; the
@@ -789,15 +972,27 @@ async function manifestRecoveryRead(root: string, manifest: OperationBundleManif
  * parked `recovery-required` run reports `bundle-recovery-required`.
  */
 export async function resolveOperationRecoveryState(root: string): Promise<OperationRecoveryReadState> {
-  const inventory = await scanOperationInventory(root);
+  return resolveOperationRecoveryStateFrom(diskOperationRecoveryReads(root));
+}
+
+/**
+ * {@link resolveOperationRecoveryState} over {@link OperationRecoveryReads}: THE ONE
+ * BODY. It writes nothing. Three outcomes: `clean`, `applying-stale-recovery-pending`,
+ * `bundle-recovery-required`. An unreadable run or a stale-active run returns at its
+ * position; a parked run only marks the result, so a later stale-active run still wins.
+ *
+ * @param reads - The inventory, key and run reads; the production default is {@link diskOperationRecoveryReads}.
+ */
+export async function resolveOperationRecoveryStateFrom(reads: OperationRecoveryReads): Promise<OperationRecoveryReadState> {
+  const inventory = await reads.scanInventory();
   if (inventory.problems.length > 0 || inventory.manifests.length === 0) {
     return inventory.problems.length > 0 ? "bundle-recovery-required" : "clean";
   }
-  const key = await readOperationKey(root);
+  const key = await reads.readKey();
   if (key.status !== "ok") return "bundle-recovery-required";
   let parked = false;
   for (const manifest of inventory.manifests) {
-    const classified = await manifestRecoveryRead(root, manifest, key.keyEpochId);
+    const classified = await manifestRecoveryRead(reads, manifest, key.keyEpochId);
     if (classified === "unavailable") return "bundle-recovery-required";
     if (classified === "stale-active") return "applying-stale-recovery-pending";
     if (classified === "parked") parked = true;

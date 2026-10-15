@@ -26,7 +26,8 @@
 
 import type { ProfilePack } from "../profile/types.js";
 import type { RelationRef } from "./types.js";
-import { readRelations } from "./store-read.js";
+import { diskGraphStoreReads, type GraphStoreReads } from "../utils/jsonl-store.js";
+import { readRelationsFrom } from "./store-read.js";
 import { validateRelationAgainstProfile } from "./relation-contract.js";
 
 /**
@@ -45,7 +46,12 @@ import { validateRelationAgainstProfile } from "./relation-contract.js";
  *   re-validated against.
  * @returns The live, profile-valid relations in first-seen id order.
  */
-export async function readLiveValidRelations(root: string, profile: ProfilePack): Promise<RelationRef[]> {
-  const { relations } = await readRelations(root);
+export function readLiveValidRelations(root: string, profile: ProfilePack): Promise<RelationRef[]> {
+  return readLiveValidRelationsFrom(diskGraphStoreReads(root), profile);
+}
+
+/** {@link readLiveValidRelations} over a graph-store read: THE ONE BODY. Lock-free, as its root form is. */
+export async function readLiveValidRelationsFrom(graph: GraphStoreReads, profile: ProfilePack): Promise<RelationRef[]> {
+  const { relations } = await readRelationsFrom(graph);
   return relations.filter((rel) => validateRelationAgainstProfile(rel, profile).length === 0);
 }

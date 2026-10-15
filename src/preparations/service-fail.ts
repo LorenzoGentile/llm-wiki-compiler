@@ -16,14 +16,17 @@
  * handoff, no owner, no effects and no residual findings. So it is one appender
  * call, and it completes a real lifecycle without inventing a completeness
  * authority or a leg runner to do it.
+ *
+ * ONE BODY, {@link failPreparationOperationWith}, over the control verbs' shared steps
+ * (`ControlVerbSteps`); the root form passes the local disk steps.
  */
 
 import { preparationRunActor } from "./principals.js";
 import type { PreparationPrincipal } from "./principals.js";
 import type { PreparationRunBinding, PreparationRunV1 } from "./run-types.js";
 import { LEGAL_EDGES } from "./run-validation.js";
-import { appendControlTransitionLocked, withControlTarget } from "./service-control-transition.js";
-import type { ControlAppendV1 } from "./service-control-transition.js";
+import { appendControlTransitionWith, diskControlVerbSteps, withControlTargetFrom } from "./service-control-transition.js";
+import type { ControlAppendV1, ControlVerbSteps } from "./service-control-transition.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
 
 /** Request for the `fail` operation. Carries no actor, surface or grant. */
@@ -83,10 +86,10 @@ function failRefusal(run: PreparationRunV1): string | null {
 
 /** Append the terminal transition through the shared control-verb primitive. */
 async function appendFailed(
-  root: string, binding: PreparationRunBinding, run: PreparationRunV1,
+  steps: ControlVerbSteps, binding: PreparationRunBinding, run: PreparationRunV1,
   principal: PreparationPrincipal,
 ): Promise<ControlAppendV1> {
-  return appendControlTransitionLocked(root, binding, run, {
+  return appendControlTransitionWith(steps, binding, run, {
     type: "failed", stateAfter: "failed",
     payload: { kind: "none" },
     actor: preparationRunActor(principal), at: new Date().toISOString(),
@@ -95,7 +98,7 @@ async function appendFailed(
 
 /** Apply the state precondition, then append. */
 async function failResolved(
-  root: string, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
+  steps: ControlVerbSteps, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
   principal: PreparationPrincipal,
 ): Promise<FailResultV1> {
   const refused = failRefusal(run);
@@ -104,7 +107,7 @@ async function failResolved(
   // read `project lock is busy` for every decline, including the recovery
   // gate's — which told an operator to retry something that would refuse
   // identically forever.
-  const appended = await appendFailed(root, binding, run, principal);
+  const appended = await appendFailed(steps, binding, run, principal);
   return appended.ok ? { status: "failed", runId } : { status: "refused", reason: appended.reason };
 }
 
@@ -116,6 +119,14 @@ async function failResolved(
  */
 export async function failPreparationOperation(
   root: string, principal: PreparationPrincipal, request: FailRequestV1,
+): Promise<FailResultV1> {
+  // Building the disk steps does no I/O and awaits nothing, so the body's capture still runs before the first await.
+  return failPreparationOperationWith(diskControlVerbSteps(root), principal, request);
+}
+
+/** {@link failPreparationOperation} over {@link ControlVerbSteps}: THE ONE BODY. */
+export async function failPreparationOperationWith(
+  steps: ControlVerbSteps, principal: PreparationPrincipal, request: FailRequestV1,
 ): Promise<FailResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE (D-10-9), exactly as `stage` captures
   // its request. This operation read `request.runId` twice, both times after
@@ -145,5 +156,5 @@ export async function failPreparationOperation(
   const captured = capturedRequest<FailRequestV1>(request);
   if (captured === null) return { status: "refused", reason: REQUEST_CAPTURE_REFUSAL };
   const runId = captured.runId;
-  return withControlTarget(root, runId, (binding, run) => failResolved(root, runId, binding, run, principal));
+  return withControlTargetFrom(steps, runId, (binding, run) => failResolved(steps, runId, binding, run, principal));
 }

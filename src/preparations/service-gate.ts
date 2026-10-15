@@ -41,7 +41,7 @@
  * coarse check can never admit a kind the exact check would refuse.
  */
 
-import { RecoveryGateError, acquireMutationLock } from "../operation-bundles/lock-gate.js";
+import { acquireMutationLock } from "../operation-bundles/lock-gate.js";
 // The same pairing the gate documents: the gate acquires, utils releases.
 import { releaseLock } from "../utils/lock.js";
 import {
@@ -53,17 +53,62 @@ import type { GateProofId } from "./ids.js";
 import { preparationRunActor, principalHasGrant } from "./principals.js";
 import type { PreparationPrincipal } from "./principals.js";
 import { preparationRunPredecessor } from "./run-integrity.js";
-import { appendProjectedTransitionLocked } from "./run-store.js";
-import type { PreparationRunContentProjector } from "./run-store.js";
+import { appendPreparationTransitionWith, appendProjectedTransitionLocked } from "./run-store.js";
+import type { PreparationRunContentProjector, PreparationRunWriteSteps } from "./run-store.js";
 import type {
   AppendPreparationTransitionInput, GateProofSummaryV1, PreparationRunBinding,
   PreparationRunState, PreparationRunV1,
 } from "./run-types.js";
 import { stateOnlyTransitionStates } from "./run-validation.js";
-import { resolveGateAuthority } from "./service-gate-authority.js";
+import { underGatedLock } from "./service-control-transition.js";
+import type { ProjectedRunAppend } from "./gate-driver.js";
+import type { PreparationManifestLeafReads } from "./manifest-store.js";
+import { resolveGateAuthority, resolveGateAuthorityFrom, type GateAuthorityLookupV1 } from "./service-gate-authority.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
-import { resolveHostReadiness } from "./service-readiness.js";
-import { resolvePreparationRun } from "./service-run-lookup.js";
+import {
+  resolveHostReadiness, resolveHostReadinessFrom, type HostReadinessV1, type PreparationReadinessReads,
+} from "./service-readiness.js";
+import {
+  resolvePreparationRun, resolvePreparationRunFrom, type PreparationRunLookupReads, type PreparationRunLookupV1,
+} from "./service-run-lookup.js";
+
+/** What one gate decision asks for, in order. No member takes a project root. */
+export interface GateOperationSteps {
+  /** Whether the project's own configuration can be read. */
+  hostReadiness(): Promise<HostReadinessV1>;
+  /** The project lock at `review` intent: a MECHANISM. `acquire` is true when held, false when busy, and THROWS a `RecoveryGateError` when the gate refuses. */
+  readonly lock: { acquire(): Promise<boolean>; release(): Promise<void> };
+  /** The named run, authenticated, with its binding. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
+  /** The authoritative state the decision binds, from the run's own manifest. */
+  gateAuthority(binding: PreparationRunBinding, run: PreparationRunV1, gateId: string): Promise<GateAuthorityLookupV1>;
+  /** The projected append. */
+  readonly appendProjected: ProjectedRunAppend;
+}
+
+/** LOCAL DISK. The incumbent readers, lock and writer for `root`, each called when asked. */
+function diskGateOperationSteps(root: string): GateOperationSteps {
+  return {
+    hostReadiness: () => resolveHostReadiness(root),
+    lock: { acquire: () => acquireMutationLock(root, "review"), release: () => releaseLock(root) },
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+    gateAuthority: (binding, run, gateId) => resolveGateAuthority(root, binding, run, gateId),
+    appendProjected: (binding, expected, input, project) => appendProjectedTransitionLocked(root, binding, expected, input, project),
+  };
+}
+
+/** The same steps over each one's own body, under the caller's `lock`. Building it does no I/O. */
+export function gateOperationStepsOver(sources: {
+  readiness: PreparationReadinessReads; lookup: PreparationRunLookupReads; manifests: PreparationManifestLeafReads; writes: PreparationRunWriteSteps;
+}, lock: GateOperationSteps["lock"]): GateOperationSteps {
+  return {
+    hostReadiness: () => resolveHostReadinessFrom(sources.readiness),
+    lock,
+    resolveRun: (runId) => resolvePreparationRunFrom(sources.lookup, runId),
+    gateAuthority: (binding, run, gateId) => resolveGateAuthorityFrom(sources.manifests, binding, run, gateId),
+    appendProjected: (binding, expected, input, project) => appendPreparationTransitionWith(sources.writes, binding, expected, input, project),
+  };
+}
 
 /** Request for the `gate` operation. Carries no actor, surface or grant. */
 export interface GateRequestV1 {
@@ -115,7 +160,7 @@ function nextDecisionIndex(run: PreparationRunV1, gateId: string): number {
 
 /** Everything one recorded decision needs, already resolved under the lock. */
 interface RecordGateInput {
-  readonly root: string;
+  readonly steps: GateOperationSteps;
   readonly binding: PreparationRunBinding;
   readonly run: PreparationRunV1;
   readonly principal: PreparationPrincipal;
@@ -143,8 +188,8 @@ async function recordGateLocked(
     type: "gate-decided", stateAfter: input.run.state, actor: preparationRunActor(input.principal),
     at: input.at, payload: { kind: "gate", gateProofId: summary.gateProofId, decision: summary.decision },
   };
-  const next = await appendProjectedTransitionLocked(
-    input.root, input.binding, preparationRunPredecessor(input.run), transition,
+  const next = await input.steps.appendProjected(
+    input.binding, preparationRunPredecessor(input.run), transition,
     gateProofProjector(summary),
   );
   const persisted = next.gateProofs.find((proof) => proof.gateProofId === summary.gateProofId);
@@ -159,9 +204,9 @@ async function recordGateLocked(
 
 /** Resolve the run, check it may carry a decision, and record one. */
 async function gateLocked(
-  root: string, principal: PreparationPrincipal, request: GateRequestV1, at: string,
+  steps: GateOperationSteps, principal: PreparationPrincipal, request: GateRequestV1, at: string,
 ): Promise<GateResultV1> {
-  const resolved = await resolvePreparationRun(root, request.runId);
+  const resolved = await steps.resolveRun(request.runId);
   if (!resolved.ok) return { status: "refused", reason: resolved.reason };
   if (!GATE_RECORDABLE_RUN_STATES.has(resolved.run.state)) {
     return {
@@ -170,10 +215,10 @@ async function gateLocked(
         + "it is recordable only where the run does not move to carry it",
     };
   }
-  const authority = await resolveGateAuthority(root, resolved.binding, resolved.run, request.gateId);
+  const authority = await steps.gateAuthority(resolved.binding, resolved.run, request.gateId);
   if (!authority.ok) return { status: "refused", reason: authority.reason };
   const input: RecordGateInput = {
-    root, binding: resolved.binding, run: resolved.run, principal, request, at,
+    steps, binding: resolved.binding, run: resolved.run, principal, request, at,
   };
   try {
     return await recordGateLocked(input, authority.authoritative);
@@ -202,6 +247,23 @@ async function gateLocked(
  */
 export async function gatePreparationOperation(
   root: string, principal: PreparationPrincipal, request: GateRequestV1,
+): Promise<GateResultV1> {
+  // Building the disk steps does no I/O and awaits nothing, so the body's capture still runs before the first await.
+  return gatePreparationOperationWith(diskGateOperationSteps(root), principal, request);
+}
+
+/**
+ * {@link gatePreparationOperation} over {@link GateOperationSteps}: THE ONE BODY.
+ *
+ * The steps are readiness, the review lock, the run, its gate authority and the
+ * projected append, none of which takes a project root. The review lock is the one
+ * MECHANISM the steps carry; both of its refusals are decided in the body. The
+ * root form keeps its signature and passes {@link diskGateOperationSteps}, which
+ * calls the incumbent readers, lock and writer when asked;
+ * {@link gateOperationStepsOver} composes them from each one's own body.
+ */
+export async function gatePreparationOperationWith(
+  steps: GateOperationSteps, principal: PreparationPrincipal, request: GateRequestV1,
 ): Promise<GateResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE (D-10-9), read once and threaded. A
   // field re-read after an await retargets the decision at a gate or a run the
@@ -244,7 +306,7 @@ export async function gatePreparationOperation(
   }
   // READINESS FIRST. This operation writes durable key-bound run state, so a
   // project whose own configuration cannot be read is not one it can act in.
-  const ready = await resolveHostReadiness(root);
+  const ready = await steps.hostReadiness();
   if (!ready.ready) return { status: "refused", reason: ready.reason ?? "the project is not ready" };
   // BOTH WAYS THE GATED ACQUISITION DECLINES ARE ANSWERS, and only the busy one
   // was carried. `acquireMutationLock` refuses at `review` while any lifecycle
@@ -252,18 +314,7 @@ export async function gatePreparationOperation(
   // in the exact state an operator reaches while repairing a project whose key
   // is gone. It was unreachable until a reset surface shipped, which is why the
   // comment below argued the point for one arm and not the other.
-  let acquired: boolean;
-  try {
-    acquired = await acquireMutationLock(root, "review");
-  } catch (error) {
-    if (error instanceof RecoveryGateError) return { status: "refused", reason: error.message };
-    throw error;
-  }
-  // A REFUSAL, not a throw: a busy lock means nothing happened.
-  if (!acquired) return { status: "refused", reason: "project lock is busy" };
-  try {
-    return await gateLocked(root, principal, captured, new Date().toISOString());
-  } finally {
-    await releaseLock(root);
-  }
+  // A busy lock is a REFUSAL, not a throw: it means nothing happened.
+  return underGatedLock<GateResultV1>(steps.lock, (reason) => ({ status: "refused", reason }),
+    () => gateLocked(steps, principal, captured, new Date().toISOString()));
 }

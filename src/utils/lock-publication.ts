@@ -13,7 +13,7 @@
  *
  * This module publishes instead: the complete owner record is written to a
  * uniquely named same-directory scratch leaf, which is then linked onto the
- * authoritative name through {@link linkTempNoReplace} — the repository's
+ * authoritative name through `linkTempNoReplace` — the repository's
  * create-only commit primitive, whose `EEXIST` means another acquirer published
  * first. The authoritative name goes from absent to complete in one step, so
  * there is no interval in which a reader can see a live lock as empty.
@@ -22,11 +22,22 @@
  * fixed `<file>.tmp` reservation is safe for content-addressed writes, where
  * every writer's bytes are identical; lock records are NOT interchangeable, and
  * a shared scratch name would let one acquirer publish another's owner record.
+ *
+ * STORAGE. {@link publishLockRecordFrom} is THE ONE BODY, over two separate
+ * capabilities it is handed: {@link LockPublicationIo}, the raw physical file
+ * operations, and a {@link ScratchEntropy} HOST port for the scratch name's
+ * randomness (not a storage policy). The body keeps every decision — the
+ * scratch name, the create-outside-try order, the hook position, the collision
+ * class test and the best-effort cleanup. The root {@link publishLockRecord}
+ * keeps its signature and passes {@link diskLockPublicationIo} and
+ * {@link hostScratchEntropy}. Nothing here knows about lock ownership, process
+ * liveness or staleness; acquisition and release stay in `./lock.ts`.
  */
 
-import { open, unlink } from "fs/promises";
 import { randomBytes } from "node:crypto";
-import { AtomicWriteCollisionError, linkTempNoReplace } from "./atomic-write-no-replace-durable.js";
+import { removeLeaf } from "../storage/disk-guarded-leaves.js";
+import { createPrivateLeafExclusive, linkPrivateLeafNoReplace } from "../storage/disk-private-leaves.js";
+import { AtomicWriteCollisionError } from "./atomic-write-no-replace-durable.js";
 
 /**
  * Entropy in the scratch leaf name. Distinguishes concurrent acquirers, and —
@@ -34,6 +45,42 @@ import { AtomicWriteCollisionError, linkTempNoReplace } from "./atomic-write-no-
  * process whose pid has since been reused.
  */
 const SCRATCH_ENTROPY_BYTES = 8;
+
+/**
+ * The RAW physical I/O one publication asks for. Each member gives a physical
+ * answer only and decides nothing; it is not hosted, access-controlled, durable
+ * (no `fsync`) or identity-guarded, and it is in no package index.
+ */
+export interface LockPublicationIo {
+  /**
+   * Create `leaf` exclusively (`wx`, the process default mode filtered by the
+   * umask), write `text`, close. REJECTS raw — an existing name or link included —
+   * and a failure after the write (a rejecting close) leaves the leaf behind.
+   * Disk: `createPrivateLeafExclusive`.
+   */
+  createLeafExclusive(leaf: string, text: string): Promise<void>;
+  /**
+   * Give the file at `from` the second name `to`, never replacing: an existing
+   * `to` REJECTS with `AtomicWriteCollisionError` and is untouched; every other
+   * failure REJECTS raw. Disk: `linkPrivateLeafNoReplace`.
+   */
+  linkLeafNoReplace(from: string, to: string): Promise<void>;
+  /** Unlink `leaf`, by path. REJECTS raw. Disk: `removeLeaf`. */
+  removeLeaf(leaf: string): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent primitives, called at call time; no state, frozen. */
+export const diskLockPublicationIo: LockPublicationIo = Object.freeze({
+  createLeafExclusive: (leaf: string, text: string) => createPrivateLeafExclusive(leaf, text),
+  linkLeafNoReplace: (from: string, to: string) => linkPrivateLeafNoReplace(from, to),
+  removeLeaf: (leaf: string) => removeLeaf(leaf),
+});
+
+/** HOST capability, not storage: `bytes` of FRESH entropy as lowercase hex, a new value on every call. */
+export type ScratchEntropy = (bytes: number) => string;
+
+/** LOCAL HOST. `randomBytes(bytes).toString("hex")`, called at call time. */
+export const hostScratchEntropy: ScratchEntropy = (bytes) => randomBytes(bytes).toString("hex");
 
 /** Seams observing one publication; supplied by tests, absent in production. */
 export interface LockPublicationHooks {
@@ -61,11 +108,45 @@ export async function publishLockRecord(
   ownerRecord: string,
   hooks: LockPublicationHooks = {},
 ): Promise<boolean> {
-  const scratchPath = lockScratchPath(lockPath);
-  await writeCompleteRecord(scratchPath, ownerRecord);
+  return publishLockRecordFrom(diskLockPublicationIo, hostScratchEntropy, lockPath, ownerRecord, hooks);
+}
+
+/**
+ * THE ONE BODY of {@link publishLockRecord}, over the raw I/O and the entropy
+ * port it is handed. The create is OUTSIDE the try: a failed create (even one
+ * that wrote before failing) is NOT cleaned up. An `AtomicWriteCollisionError`
+ * raised inside the try — by the link, or (inherited) by the `beforePublish`
+ * hook — means "taken" (`false`); everything else propagates. The scratch
+ * alias is removed on every outcome after a successful create, best-effort.
+ */
+export async function publishLockRecordFrom(
+  io: LockPublicationIo,
+  entropy: ScratchEntropy,
+  lockPath: string,
+  ownerRecord: string,
+  hooks: LockPublicationHooks = {},
+): Promise<boolean> {
+  const scratchPath = lockScratchPath(lockPath, entropy);
+  // Write the whole record and close, so the leaf is complete before it is linked.
+  //
+  // The mode is left at the process default DELIBERATELY, but the default does
+  // NOT guarantee cross-UID readability and this comment must not imply it does:
+  // `open(…, "wx")` requests `0o666` and the kernel filters it through the
+  // process umask, so a `0o077` umask yields `0o600` here anyway.
+  //
+  // What the default does guarantee is that publication is no more restrictive
+  // than the create-then-write it replaces, and that matters because this leaf's
+  // readability is load-bearing: `isLockStale` treats an owner it cannot read as
+  // stale, so a lock another UID is unable to open is classified reclaimable and
+  // reclaimed from its live owner — double ownership by a different route.
+  // Hard-coding `0o600` would make that failure UNCONDITIONAL, which is the only
+  // reason the mode is unspecified. Under a restrictive umask the hazard remains,
+  // and closing it needs the staleness predicate to distinguish "cannot read" from
+  // "does not qualify" — out of scope here, and not fixed by a mode argument.
+  await io.createLeafExclusive(scratchPath, ownerRecord);
   try {
     await hooks.beforePublish?.();
-    await linkTempNoReplace(scratchPath, lockPath);
+    await io.linkLeafNoReplace(scratchPath, lockPath);
     return true;
   } catch (error) {
     if (error instanceof AtomicWriteCollisionError) return false;
@@ -77,38 +158,11 @@ export async function publishLockRecord(
     // swept by name, because a filename is not a classification of the content
     // beneath it and a pattern-matched unlink inside the private directory is a
     // worse hazard than the litter it removes.
-    await unlink(scratchPath).catch(() => {});
+    await io.removeLeaf(scratchPath).catch(() => {});
   }
 }
 
-/** Reserve one acquirer's scratch leaf beside the lock it intends to publish. */
-function lockScratchPath(lockPath: string): string {
-  return `${lockPath}.${randomBytes(SCRATCH_ENTROPY_BYTES).toString("hex")}.publishing`;
-}
-
-/**
- * Write the whole record and close, so the leaf is complete before it is linked.
- *
- * The mode is left at the process default DELIBERATELY, but the default does
- * NOT guarantee cross-UID readability and this comment must not imply it does:
- * `open(…, "wx")` requests `0o666` and the kernel filters it through the
- * process umask, so a `0o077` umask yields `0o600` here anyway.
- *
- * What the default does guarantee is that publication is no more restrictive
- * than the create-then-write it replaces, and that matters because this leaf's
- * readability is load-bearing: `isLockStale` treats an owner it cannot read as
- * stale, so a lock another UID is unable to open is classified reclaimable and
- * reclaimed from its live owner — double ownership by a different route.
- * Hard-coding `0o600` would make that failure UNCONDITIONAL, which is the only
- * reason the mode is unspecified. Under a restrictive umask the hazard remains,
- * and closing it needs the staleness predicate to distinguish "cannot read" from
- * "does not qualify" — out of scope here, and not fixed by a mode argument.
- */
-async function writeCompleteRecord(scratchPath: string, ownerRecord: string): Promise<void> {
-  const handle = await open(scratchPath, "wx");
-  try {
-    await handle.writeFile(ownerRecord, "utf-8");
-  } finally {
-    await handle.close();
-  }
+/** Reserve one acquirer's scratch leaf beside the lock it intends to publish, with fresh host entropy. */
+function lockScratchPath(lockPath: string, entropy: ScratchEntropy): string {
+  return `${lockPath}.${entropy(SCRATCH_ENTROPY_BYTES)}.publishing`;
 }

@@ -4,20 +4,29 @@
  * allocated review candidate identity. It validates the first identity before
  * store access, checks literal pending/archive ownership, and commits pending
  * bytes through the candidate no-replace primitive.
+ *
+ * THE ALLOCATOR HAS ONE BODY, {@link publishFreshCandidateFrom}, over the raw
+ * effects of {@link CandidatePublicationStore}. The domain stays here: identity
+ * minting and validation, the sixteen-attempt bound, which namespaces are
+ * consulted and in what order, the archive recheck at the publication boundary,
+ * and what each failure means (a collision retries, an unsafe directory passes
+ * through, any other fault is the fixed publication refusal). The store's
+ * members are raw effects or named MECHANISMS: the candidate-store namespace
+ * identity check (custody), directory confinement and the atomic no-replace
+ * publish. Their disk forms are {@link diskCandidatePublicationStore}.
  */
 
 import { randomBytes } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
-import path from "node:path";
-import {
-  AtomicWriteCollisionError,
-  atomicWriteNoReplace,
-} from "../utils/atomic-write.js";
+import { AtomicWriteCollisionError } from "../utils/atomic-write.js";
 import { CANDIDATES_ARCHIVE_DIR, CANDIDATES_DIR } from "../utils/constants.js";
-import { assertCandidateNamespacesHealthy } from "./candidate-custody.js";
-import { assertCandidateSlug, assertWritableCandidateId, candidatePath } from "./candidate-paths.js";
+import {
+  assertCandidateNamespacesHealthyFrom,
+  diskCandidateCustodyReads,
+  type CandidateStoreWriteReads,
+} from "./candidate-custody.js";
+import { assertCandidateSlug, assertWritableCandidateId } from "./candidate-paths.js";
 import { assertCandidateIdsWritable } from "./candidate-selection.js";
-import { resolveConfinedCandidatesDir, UnsafeCandidateDirError } from "./candidate-store-paths.js";
+import { UnsafeCandidateDirError } from "./candidate-store-paths.js";
 
 /** Bytes of random suffix appended to generated candidate IDs. */
 const ID_SUFFIX_BYTES = 4;
@@ -48,6 +57,63 @@ export class CandidatePublicationUnavailableError extends Error {
   }
 }
 
+/** The two points at which the caller's hooks run around one exclusive create. */
+interface CandidateCreateHooks {
+  /** Runs after the parent check and before the commit. Rejects to abort the create. */
+  readonly afterParentCheck: () => Promise<void>;
+  /** Runs after the leaf has been committed. */
+  readonly afterCommit?: () => Promise<void>;
+}
+
+/**
+ * The raw candidate-store effects the fresh allocator runs over. Each member
+ * rejects with its own error; the allocator decides what that error means.
+ */
+export interface CandidatePublicationStore {
+  /**
+   * MECHANISM (candidate-store custody: namespace identity). Resolves when each
+   * owned namespace that exists is readable and the two are distinct objects;
+   * rejects otherwise.
+   */
+  assertNamespacesHealthy(): Promise<void>;
+  /**
+   * MECHANISM (directory confinement). Where the owned directory `relDir` is,
+   * or `null` when it is absent. Rejects with `UnsafeCandidateDirError` when
+   * it escapes the project or is not a directory.
+   */
+  ownedDirectory(relDir: string): Promise<string | null>;
+  /** RAW. Whether anything, a link included, is at `<dir>/<leafName>`. Rejects with the raw fault. */
+  leafPresent(dir: string, leafName: string): Promise<boolean>;
+  /**
+   * MECHANISM (confined, atomic, no-replace publish). Resolve the pending leaf
+   * of `id` under the project, then create it with `text` without ever
+   * replacing an existing leaf: an occupied leaf, or a hook rejection, rejects.
+   */
+  createPending(id: string, text: string, hooks: CandidateCreateHooks): Promise<void>;
+}
+
+/**
+ * The publication store composed from the store mechanisms: the namespace
+ * policy is the shared domain body ({@link assertCandidateNamespacesHealthyFrom}),
+ * the owned directory is the alias-tolerant binding's real directory, and the
+ * exclusive create resolves the confined pending leaf first. Building it does no I/O.
+ */
+export function candidatePublicationStoreFrom(reads: CandidateStoreWriteReads): CandidatePublicationStore {
+  return {
+    assertNamespacesHealthy: () => assertCandidateNamespacesHealthyFrom(reads),
+    ownedDirectory: async (relDir) => (await reads.captureDirectory(relDir))?.realDir ?? null,
+    leafPresent: (dir, leafName) => reads.leafPresent(dir, leafName),
+    createPending: async (id, text, hooks) => {
+      await reads.createLeaf(await reads.leafPath(id, "pending"), text, hooks);
+    },
+  };
+}
+
+/** LOCAL DISK. {@link candidatePublicationStoreFrom} over the project at `root`. In no package index. */
+export function diskCandidatePublicationStore(root: string): CandidatePublicationStore {
+  return candidatePublicationStoreFrom(diskCandidateCustodyReads(root));
+}
+
 /** Candidate plus its already-materialized serialized authority. */
 export interface CandidatePublication<T> {
   readonly candidate: T;
@@ -73,43 +139,40 @@ export function writableCandidateId(
 }
 
 /** True when one exact no-follow leaf already owns an identity. */
-async function candidateObjectExists(root: string, dir: string, id: string): Promise<boolean> {
-  const ownedDir = await resolveConfinedCandidatesDir(root, dir);
+async function candidateObjectExists(store: CandidatePublicationStore, dir: string, id: string): Promise<boolean> {
+  const ownedDir = await store.ownedDirectory(dir);
   if (ownedDir === null) return false;
   try {
-    await lstat(path.join(ownedDir, `${id}.json`));
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return await store.leafPresent(ownedDir, `${id}.json`);
+  } catch {
     throw new CandidatePublicationUnavailableError();
   }
 }
 
 /** True when pending or archive already owns the exact identity. */
-async function candidateIdentityExists(root: string, id: string): Promise<boolean> {
-  await assertCandidateNamespacesHealthy(root);
-  return (await candidateObjectExists(root, CANDIDATES_DIR, id)) ||
-    (await candidateObjectExists(root, CANDIDATES_ARCHIVE_DIR, id));
+async function candidateIdentityExists(store: CandidatePublicationStore, id: string): Promise<boolean> {
+  await store.assertNamespacesHealthy();
+  return (await candidateObjectExists(store, CANDIDATES_DIR, id)) ||
+    (await candidateObjectExists(store, CANDIDATES_ARCHIVE_DIR, id));
 }
 
 /** Publish one attempt, translating only non-confinement I/O faults. */
 async function publishAttempt(
-  root: string,
+  store: CandidatePublicationStore,
   publication: CandidatePublication<unknown>,
   id: string,
   attempt: number,
   options: FreshCandidateWriteOptions,
 ): Promise<void> {
   try {
-    await atomicWriteNoReplace(await candidatePath(root, id), publication.serialized, {
-      confineRoot: await realpath(root),
-      afterParentCheckForTest: async () => {
+    await store.createPending(id, publication.serialized, {
+      afterParentCheck: async () => {
         await options.beforePublishForTest?.(id, attempt);
-        if (await candidateObjectExists(root, CANDIDATES_ARCHIVE_DIR, id)) {
+        if (await candidateObjectExists(store, CANDIDATES_ARCHIVE_DIR, id)) {
           throw new AtomicWriteCollisionError();
         }
       },
-      afterNoReplaceCommitForTest: options.afterPublishForTest,
+      afterCommit: options.afterPublishForTest,
     });
   } catch (error) {
     if (error instanceof AtomicWriteCollisionError || error instanceof UnsafeCandidateDirError) {
@@ -120,11 +183,13 @@ async function publishAttempt(
 }
 
 /**
- * Publish a new identity using at most sixteen collision-exclusive attempts.
- * `firstId` must have been minted before any caller-side store scan.
+ * Publish a new identity using at most sixteen collision-exclusive attempts, over
+ * a publication store: THE ONE BODY (the disk store is
+ * {@link diskCandidatePublicationStore}). `firstId` must have been minted before
+ * any caller-side store scan.
  */
-export async function publishFreshCandidate<T>(
-  root: string,
+export async function publishFreshCandidateFrom<T>(
+  store: CandidatePublicationStore,
   slug: string,
   firstId: string,
   materialize: (id: string) => CandidatePublication<T>,
@@ -133,9 +198,9 @@ export async function publishFreshCandidate<T>(
   for (let attempt = 0; attempt < MAX_FRESH_CANDIDATE_ATTEMPTS; attempt += 1) {
     const id = attempt === 0 ? firstId : writableCandidateId(slug, attempt, options);
     const publication = materialize(id);
-    if (await candidateIdentityExists(root, id)) continue;
+    if (await candidateIdentityExists(store, id)) continue;
     try {
-      await publishAttempt(root, publication, id, attempt, options);
+      await publishAttempt(store, publication, id, attempt, options);
       return publication.candidate;
     } catch (error) {
       if (error instanceof AtomicWriteCollisionError) continue;

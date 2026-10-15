@@ -3,6 +3,9 @@
  * @description Prune/sweep classification from authenticated receipt content
  * and current source/staging postconditions. Filename prefixes are only an
  * additional consistency check and never select authority semantics.
+ *
+ * ONE BODY, {@link classifyPrunePassOneFrom}, over the classifiers' leaf-read
+ * seam; the root form passes the namespace's confined disk reads.
  */
 
 import path from "node:path";
@@ -24,7 +27,9 @@ import {
   prunePostcondition,
 } from "./postconditions.js";
 import {
+  diskLifecycleLeafReads,
   lifecycleObservationDisposition,
+  type LifecycleLeafReads,
   type LifecyclePassOneUnit,
 } from "./classifier-types.js";
 import type {
@@ -118,6 +123,20 @@ export async function classifyPrunePassOne(
   key: CapturedLifecycleKey,
   bounds: LifecycleScanBounds,
 ): Promise<LifecyclePassOneUnit> {
+  return classifyPrunePassOneFrom(diskLifecycleLeafReads(namespace), namespace, observation, key, bounds);
+}
+
+/**
+ * {@link classifyPrunePassOne} over {@link LifecycleLeafReads}: THE ONE BODY. The
+ * namespace is the path schema only; every leaf it names is read through `reads`.
+ */
+export async function classifyPrunePassOneFrom(
+  reads: LifecycleLeafReads,
+  namespace: PreparationLifecycleNamespaceV1,
+  observation: LifecycleUnitObservation,
+  key: CapturedLifecycleKey,
+  bounds: LifecycleScanBounds,
+): Promise<LifecyclePassOneUnit> {
   const disposition = lifecycleObservationDisposition(observation);
   if (disposition.status === "unavailable") {
     return unavailable(namespace, observation, disposition.detail, disposition.code);
@@ -126,7 +145,7 @@ export async function classifyPrunePassOne(
   const names = pruneNames(namespace, observation.unitId);
   try {
     const planned = await observeBoundLifecycleReceipt(
-      namespace, names.paths.plannedReceiptFile, observation.unitRoot,
+      reads, names.paths.plannedReceiptFile, observation.unitRoot,
       observation.unitId, "prune-planned", key, bounds,
     );
     if (planned === "absent") {
@@ -149,13 +168,14 @@ export async function classifyPrunePassOne(
       return unavailable(namespace, observation, "prune unit contains unknown durable content", "unit-unavailable", operation);
     }
     const completed = await observeBoundLifecycleReceipt(
-      namespace, names.paths.completedReceiptFile, observation.unitRoot,
+      reads, names.paths.completedReceiptFile, observation.unitRoot,
       observation.unitId, "prune-completed", key, bounds,
     );
     if (completed !== "absent" && !lifecycleReceiptPairMatches(planned, completed)) {
       return unavailable(namespace, observation, "prune receipt pair does not bind exactly", "unit-unavailable", operation);
     }
     const state = await prunePostcondition(
+      reads,
       namespace,
       observation.unitRoot,
       plan,

@@ -7,13 +7,22 @@
  *
  * Source type is persisted in frontmatter under the `sourceType` key for
  * downstream tooling and human readers.
+ *
+ * ONE BODY PER ENTRY, TWO PROJECT STEPS. {@link ingestSourceWith} and
+ * {@link ingestTextSourceWith} decide over {@link IngestProjectSteps}: the gated
+ * save, then the journal entry for a real write only. The operator-named input
+ * (a URL or a local path) is HOST input, not project storage, and is fetched in
+ * the body as before. The root forms keep their signatures and pass the local
+ * steps, built per call, which call the incumbent `saveSourceUnderProjectGate`
+ * and journal append when asked, so module spies and mocks still intercept. The
+ * registered-project lock stays inside the local save.
  */
 
 import path from "path";
 import { readFile } from "fs/promises";
 import { createHash } from "node:crypto";
 import { buildFrontmatter } from "../utils/markdown.js";
-import { saveSource } from "../utils/source-writer.js";
+import { saveSourceUnderProjectGate } from "../operation-bundles/registered-project-lock.js";
 import { appendLog } from "../utils/activity-log.js";
 import { MAX_SOURCE_CHARS, MIN_SOURCE_CHARS, SOURCES_DIR, IMAGE_EXTENSIONS, TRANSCRIPT_EXTENSIONS } from "../utils/constants.js";
 import * as output from "../utils/output.js";
@@ -272,6 +281,57 @@ async function journalIngest(
   });
 }
 
+/** The two project steps one ingest takes, in order. No member takes a project root. */
+export interface IngestProjectSteps {
+  /** Save the document under the project gate; resolves to where it landed and whether bytes changed. */
+  save(title: string, document: string, source: string): ReturnType<typeof saveSourceUnderProjectGate>;
+  /** Journal one real write; never asked for an unchanged re-ingest. */
+  journal(title: string, source: string, savedPath: string, charCount: number): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent gated save and journal append for `root`, each called when asked. */
+function localIngestSteps(root: string): IngestProjectSteps {
+  return {
+    save: (title, document, source) => saveSourceUnderProjectGate(root, title, document, source),
+    journal: (title, source, savedPath, charCount) => journalIngest(root, title, source, savedPath, charCount),
+  };
+}
+
+/** One prepared ingest: the document to save and what the result reports about it. */
+interface PreparedIngest {
+  title: string;
+  source: string;
+  document: string;
+  extracted: TruncateResult;
+  sourceType: SourceType;
+}
+
+/**
+ * The tail both entries share: save, then (optionally) note where it landed,
+ * then journal only a real write, then the result.
+ */
+async function saveThenJournal(
+  steps: IngestProjectSteps, prepared: PreparedIngest, onSaved?: (savedPath: string) => void,
+): Promise<IngestResult> {
+  const { title, source, document, extracted, sourceType } = prepared;
+  const { path: savedPath, writeStatus } = await steps.save(title, document, source);
+  onSaved?.(savedPath);
+
+  // Journal only real writes — a no-op re-ingest must not append a log line.
+  if (writeStatus !== "unchanged") {
+    await steps.journal(title, source, savedPath, extracted.content.length);
+  }
+
+  return {
+    filename: path.basename(savedPath),
+    charCount: extracted.content.length,
+    truncated: extracted.truncated,
+    source,
+    sourceType,
+    writeStatus,
+  };
+}
+
 /** Format the root-relative source reference recorded in the Markdown journal. */
 export function journalSavedPath(savedPath: string, pathApi = path): string {
   return `${SOURCES_DIR}/${pathApi.basename(savedPath)}`;
@@ -286,6 +346,11 @@ export function journalSavedPath(savedPath: string, pathApi = path): string {
  * @returns Saved filename, character count, truncation flag, source URI, and detected source type.
  */
 export async function ingestSource(root: string, source: string): Promise<IngestResult> {
+  return ingestSourceWith(localIngestSteps(root), source);
+}
+
+/** {@link ingestSource} over {@link IngestProjectSteps}: THE ONE BODY. Detect, fetch, limit, document, then save and journal. */
+export async function ingestSourceWith(steps: IngestProjectSteps, source: string): Promise<IngestResult> {
   const sourceType = await detectSourceType(source);
   output.status("*", output.info(`Ingesting [${sourceType}]: ${source}`));
   verbose(`source type: ${sourceType}`);
@@ -296,22 +361,8 @@ export async function ingestSource(root: string, source: string): Promise<Ingest
   const result = enforceCharLimit(content);
   enforceMinContent(result.content);
   const document = buildDocument(title, source, result, sourceType);
-  const { path: savedPath, writeStatus } = await saveSource(root, title, document, source);
-  verbose(`saved: ${savedPath} (${result.content.length} chars extracted)`);
-
-  // Journal only real writes — a no-op re-ingest must not append a log line.
-  if (writeStatus !== "unchanged") {
-    await journalIngest(root, title, source, savedPath, result.content.length);
-  }
-
-  return {
-    filename: path.basename(savedPath),
-    charCount: result.content.length,
-    truncated: result.truncated,
-    source,
-    sourceType,
-    writeStatus,
-  };
+  return saveThenJournal(steps, { title, source, document, extracted: result, sourceType },
+    (savedPath) => verbose(`saved: ${savedPath} (${result.content.length} chars extracted)`));
 }
 
 /** Input shape for raw-text ingestion. */
@@ -332,6 +383,11 @@ export interface IngestTextInput { title: string; text: string; source?: string 
  * @returns Structured ingest result with filename, char count, and source URI.
  */
 export async function ingestTextSource(root: string, input: IngestTextInput): Promise<IngestResult> {
+  return ingestTextSourceWith(localIngestSteps(root), input);
+}
+
+/** {@link ingestTextSource} over {@link IngestProjectSteps}: THE ONE BODY. Identity, limit, document, then save and journal. */
+export async function ingestTextSourceWith(steps: IngestProjectSteps, input: IngestTextInput): Promise<IngestResult> {
   const digest = createHash("sha256")
     .update(`${input.title.length}\n`)
     .update(input.title)
@@ -341,21 +397,7 @@ export async function ingestTextSource(root: string, input: IngestTextInput): Pr
   const result = enforceCharLimit(input.text);
   enforceMinContent(result.content);
   const document = buildDocument(input.title, source, result, "file");
-  const { path: savedPath, writeStatus } = await saveSource(root, input.title, document, source);
-
-  // Journal only real writes — a no-op re-ingest must not append a log line.
-  if (writeStatus !== "unchanged") {
-    await journalIngest(root, input.title, source, savedPath, result.content.length);
-  }
-
-  return {
-    filename: path.basename(savedPath),
-    charCount: result.content.length,
-    truncated: result.truncated,
-    source,
-    sourceType: "file",
-    writeStatus,
-  };
+  return saveThenJournal(steps, { title: input.title, source, document, extracted: result, sourceType: "file" });
 }
 
 /**

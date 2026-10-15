@@ -5,6 +5,12 @@
  * Errors on critical rules (broken links/citations, duplicates) cost 4 pts
  * each; contradicted pages cost 2 pts; all other warnings/info cost 1 pt each.
  * The final score is clamped to [0, 100].
+ *
+ * The score has ONE body, {@link evaluateHealthFrom}, over the lint run's own
+ * {@link LintSources}: the lint run reads through all of them, and the pending
+ * review count reads through their `candidates` member. It names no project
+ * root. `evaluateHealth` and `runAllLintRules` build the local-disk sources
+ * from their root and delegate.
  */
 
 import {
@@ -21,8 +27,9 @@ import {
   checkSchemaCrossLinks,
 } from "../linter/rules.js";
 import { loadSchema } from "../schema/loader.js";
-import { countCandidates } from "../compiler/candidates.js";
-import { lint } from "../linter/index.js";
+import { countCandidatesFrom } from "../compiler/candidate-read.js";
+import { lintFrom } from "../linter/index.js";
+import { diskLintSources, type LintSources } from "../linter/lint-sources.js";
 import type { LintResult } from "../linter/types.js";
 import type { HealthResult, HealthRuleResult } from "./types.js";
 
@@ -79,14 +86,31 @@ function aggregateRules(results: LintResult[]): HealthRuleResult[] {
  * by page-health-distribution so both see the same diagnostics.
  */
 export async function runAllLintRules(root: string): Promise<LintResult[]> {
-  const summary = await lint(root);
+  return runAllLintRulesFrom(diskLintSources(root));
+}
+
+/** {@link runAllLintRules} over {@link LintSources}: the flat findings of one lint run, with no project root. */
+export async function runAllLintRulesFrom(sources: LintSources): Promise<LintResult[]> {
+  const summary = await lintFrom(sources);
   return summary.results;
 }
 
 export async function evaluateHealth(root: string): Promise<HealthResult> {
+  return evaluateHealthFrom(diskLintSources(root));
+}
+
+/**
+ * {@link evaluateHealth} over {@link LintSources}: THE ONE BODY. The lint run
+ * and the pending review count start together. A count that fails is 0; a lint
+ * run that fails rejects the score.
+ *
+ * @param sources - The lint run's sources; their `candidates` member is also what the pending reviews are counted through.
+ * @returns The clamped score, the per-rule breakdown and the pending review count.
+ */
+export async function evaluateHealthFrom(sources: LintSources): Promise<HealthResult> {
   const [allResults, pendingReviews] = await Promise.all([
-    runAllLintRules(root),
-    countCandidates(root).catch(() => 0),
+    runAllLintRulesFrom(sources),
+    countCandidatesFrom(sources.candidates).catch(() => 0),
   ]);
 
   const rules = aggregateRules(allResults);

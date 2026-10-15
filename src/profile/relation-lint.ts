@@ -20,17 +20,18 @@
  * findings and the default lint output stays byte-identical.
  */
 
-import { readRelations } from "../relations/store-read.js";
+import { readRelationsFrom } from "../relations/store-read.js";
 import { RelationStoreCorruptError, RelationStoreTooNewError, RelationStoreSymlinkError } from "../relations/types.js";
-import { GraphDirConfinementError } from "../utils/jsonl-store.js";
+import { diskGraphStoreReads, GraphDirConfinementError, type GraphStoreReads } from "../utils/jsonl-store.js";
 import { validateRelationAgainstProfile } from "../relations/relation-contract.js";
 import type { RelationRef } from "../relations/types.js";
 import type { EntityId, EntityPage, EntityProblemView, ProfilePack } from "./types.js";
 import type { LintResult } from "../linter/types.js";
 import {
-  collectStandingRelationProblems,
+  collectStandingRelationProblemsFrom,
   LIFECYCLE_RELATION_UNMET_KIND,
   LIFECYCLE_RELATION_UNVERIFIABLE_KIND,
+  type StandingRelationSources,
 } from "./relation-standing.js";
 
 /** Rule id for a relation endpoint that references a non-existent page. */
@@ -130,9 +131,18 @@ export async function checkRelationStore(
   pages: EntityPage[],
   profile: ProfilePack,
 ): Promise<LintResult[]> {
+  return checkRelationStoreFrom(diskGraphStoreReads(root), pages, profile);
+}
+
+/** {@link checkRelationStore} over a graph-store read: THE ONE BODY. It holds no project root. */
+export async function checkRelationStoreFrom(
+  graph: GraphStoreReads,
+  pages: EntityPage[],
+  profile: ProfilePack,
+): Promise<LintResult[]> {
   let read;
   try {
-    read = await readRelations(root);
+    read = await readRelationsFrom(graph);
   } catch (error) {
     const finding = readErrorFinding(error);
     if (finding) return [finding];
@@ -187,14 +197,17 @@ function standingFinding(problem: EntityProblemView): LintResult {
  * cannot be read (fail-closed, never a throw). A default/non-gated profile yields
  * no findings, so the default lint output stays byte-identical.
  *
- * @param root - Absolute project root directory.
+ * It holds no project root: profile lint is its one caller and hands it the
+ * standing check's own sources.
+ *
+ * @param sources - The gated entity scans, the relation store and the endpoint page reads.
  * @param profile - The CURRENT profile pack (its lifecycles gate the check).
  * @returns The standing-precondition findings (possibly empty).
  */
-export async function checkStandingRelationPreconditions(
-  root: string,
+export async function checkStandingRelationPreconditionsFrom(
+  sources: StandingRelationSources,
   profile: ProfilePack,
 ): Promise<LintResult[]> {
-  const problems = await collectStandingRelationProblems(root, profile);
+  const problems = await collectStandingRelationProblemsFrom(sources, profile);
   return problems.map(standingFinding);
 }

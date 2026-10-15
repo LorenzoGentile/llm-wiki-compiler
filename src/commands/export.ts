@@ -18,6 +18,20 @@
  * the default-all run so a plain `export` never emits a directory.
  *
  * No LLM calls are made — export is a pure transformation of wiki content.
+ *
+ * THE IN-MEMORY JSON EXPORT HAS ONE BODY, {@link exportJsonFrom}, over raw
+ * sources ({@link ExportJsonSources}): the export page sources, the profile
+ * block's sources and the journal. `exportJson(root)` hands it the local
+ * disk's sources, built per call.
+ *
+ * THE FILE EXPORT HAS ONE BODY, {@link runExportFrom}, over
+ * {@link RunExportSources}: the same reads, the OKF export core's sources, and
+ * two local mechanisms named as members: the package.json load through this
+ * module's `require` (its cache included) and the atomic file writer. The
+ * option checks, the title decision, target selection, each format's content,
+ * the write order and every message are the body's. The output paths are
+ * local paths under the project or wherever `--out` names; this is a legacy
+ * local contract, not a `ProjectStore` capability.
  */
 
 import path from "path";
@@ -25,7 +39,7 @@ import { createRequire } from "module";
 import { atomicWrite } from "../utils/markdown.js";
 import * as output from "../utils/output.js";
 import { verbose } from "../utils/output.js";
-import { collectExportPages } from "../export/collect.js";
+import { collectExportPagesFrom, diskExportPageSources, type ExportPageSources } from "../export/collect.js";
 import { buildLlmsTxt, buildLlmsFullTxt } from "../export/llms-txt.js";
 import {
   buildJsonExport,
@@ -36,13 +50,15 @@ import {
   type JsonExportProfileBlock,
   type JsonExportWarning,
 } from "../export/json-export.js";
-import { buildExportProfileBlock } from "../export/profile-block.js";
+import { buildExportProfileBlockFrom, type ExportProfileSources } from "../export/profile-block.js";
 import { validateProjectId } from "../export/project-id.js";
-import { journalHealthWarning } from "../trust/journal-health-warning.js";
+import { diskProfileSummarySources } from "../profile/block.js";
+import { diskJournalReadSources, type JournalReadSources } from "../trust/journal-classify.js";
+import { journalHealthWarningFrom } from "../trust/journal-health-warning.js";
 import { buildJsonLd } from "../export/json-ld.js";
 import { buildGraphml } from "../export/graphml.js";
 import { buildMarp } from "../export/marp.js";
-import { runOkfExport } from "../export/okf/run.js";
+import { diskOkfExportSources, runOkfExportFrom, type OkfExportSources } from "../export/okf/run.js";
 import { EXPORT_DIR } from "../utils/constants.js";
 import { EXPORT_TARGETS, DEFAULT_EXPORT_TARGETS, MARP_SOURCES } from "../export/types.js";
 import type { ExportPage, ExportTarget, MarpSource } from "../export/types.js";
@@ -93,10 +109,13 @@ export interface ExportResult {
   pageCount: number;
 }
 
-/** Resolve the human-readable project title from package.json, defaulting gracefully. */
-function resolveProjectTitle(root: string): string {
+/**
+ * Resolve the human-readable project title from package.json, defaulting gracefully.
+ * The load is synchronous and may answer from the loader's cache; any throw falls back.
+ */
+function resolveProjectTitleFrom(loadPackageJson: (location: string) => unknown, root: string): string {
   try {
-    const pkg = require(path.join(root, "package.json")) as { name?: string };
+    const pkg = loadPackageJson(path.join(root, "package.json")) as { name?: string };
     return typeof pkg.name === "string" ? pkg.name : "Knowledge Wiki";
   } catch {
     return "Knowledge Wiki";
@@ -107,9 +126,10 @@ function resolveProjectTitle(root: string): string {
  * Probe the project's compile journal and return the read-surface warnings to
  * embed in the export (currently the JSON target only). Empty for a healthy
  * project so the default envelope is unchanged. Read-only — never mutates disk.
+ * The one mapping, over the journal's read sources; both export bodies use it.
  */
-async function collectExportWarnings(root: string): Promise<JsonExportWarning[]> {
-  const warning = await journalHealthWarning(root);
+async function collectExportWarningsFrom(journal: JournalReadSources): Promise<JsonExportWarning[]> {
+  const warning = await journalHealthWarningFrom(journal);
   return warning ? [warning] : [];
 }
 
@@ -212,12 +232,62 @@ function computeReportedPageCount(
  * @returns Paths written and page count.
  */
 export async function runExport(root: string, options: ExportOptions = {}): Promise<ExportResult> {
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return runExportFrom(diskRunExportSources(root), root, options);
+}
+
+/** Everything {@link runExportFrom} reads and writes through. Production builds all from one root. */
+export interface RunExportSources {
+  pages: ExportPageSources;
+  profile: ExportProfileSources;
+  journal: JournalReadSources;
+  /** The OKF export core's sources, for the opt-in `okf` target (which collects its pages again). */
+  okf: OkfExportSources;
+  /** SYNCHRONOUS: the parsed package.json at a path; THROWS when it cannot be loaded. */
+  loadPackageJson(location: string): unknown;
+  /** Write one export file atomically, creating its parent directories. */
+  writeFile(location: string, content: string): Promise<void>;
+}
+
+/** LOCAL DISK. The export sources for the project at `root`: this module's `require` and the atomic writer. Building them does no I/O. */
+function diskRunExportSources(root: string): RunExportSources {
+  return {
+    pages: diskExportPageSources(root), profile: diskProfileSummarySources(root), journal: diskJournalReadSources(root),
+    okf: diskOkfExportSources(root),
+    loadPackageJson: (location) => require(location),
+    writeFile: (location, content) => atomicWrite(location, content),
+  };
+}
+
+/** Run the OKF export core for the `okf` target, printing its warnings then its bundle line. */
+async function exportOkfTarget(okf: OkfExportSources, root: string, out: string | undefined): Promise<string[]> {
+  const { outDir, writtenPaths, warnings: okfWarnings } = await runOkfExportFrom(okf, root, { out });
+  for (const w of okfWarnings) output.status("!", output.warn(w));
+  output.status("+", output.success(`Exported okf bundle → ${output.source(outDir)}`));
+  return writtenPaths;
+}
+
+/** Write one single-file target under `dist/exports/`, then report it. */
+async function writeTarget(sources: RunExportSources, root: string, target: ExportTarget, content: string): Promise<string> {
+  const outPath = path.join(root, EXPORT_DIR, TARGET_FILENAMES[target]);
+  await sources.writeFile(outPath, content);
+  verbose(`target ${target}: ${content.length} chars → ${outPath}`);
+  output.status("+", output.success(`Exported ${target} → ${output.source(outPath)}`));
+  return outPath;
+}
+
+/**
+ * {@link runExport} over {@link RunExportSources}: THE ONE BODY. The projectId check
+ * first; then the pages, the title, the profile block and the journal warnings; then
+ * the target and marp-source checks; then each target in order.
+ */
+export async function runExportFrom(sources: RunExportSources, root: string, options: ExportOptions = {}): Promise<ExportResult> {
   const projectId =
     options.projectId !== undefined ? validateProjectId(options.projectId) : undefined;
-  const pages = await collectExportPages(root);
-  const projectTitle = resolveProjectTitle(root);
-  const profile = await buildExportProfileBlock(root);
-  const warnings = await collectExportWarnings(root);
+  const pages = await collectExportPagesFrom(sources.pages);
+  const projectTitle = resolveProjectTitleFrom(sources.loadPackageJson, root);
+  const profile = await buildExportProfileBlockFrom(sources.profile);
+  const warnings = await collectExportWarningsFrom(sources.journal);
   verbose(`export: ${pages.length} pages collected`);
 
   const targets = resolveTargets(options.target);
@@ -226,18 +296,11 @@ export async function runExport(root: string, options: ExportOptions = {}): Prom
 
   for (const target of targets) {
     if (target === "okf") {
-      const { outDir, writtenPaths, warnings: okfWarnings } = await runOkfExport(root, { out: options.out });
-      written.push(...writtenPaths);
-      for (const w of okfWarnings) output.status("!", output.warn(w));
-      output.status("+", output.success(`Exported okf bundle → ${output.source(outDir)}`));
+      written.push(...(await exportOkfTarget(sources.okf, root, options.out)));
       continue;
     }
     const content = buildContent({ target, pages, projectTitle, marpSource, projectId, profile, warnings });
-    const outPath = path.join(root, EXPORT_DIR, TARGET_FILENAMES[target]);
-    await atomicWrite(outPath, content);
-    written.push(outPath);
-    verbose(`target ${target}: ${content.length} chars → ${outPath}`);
-    output.status("+", output.success(`Exported ${target} → ${output.source(outPath)}`));
+    written.push(await writeTarget(sources, root, target, content));
   }
 
   return { written, pageCount: computeReportedPageCount(pages, targets, marpSource) };
@@ -272,9 +335,34 @@ export async function exportJson(
   root: string,
   options: ExportJsonOptions = {},
 ): Promise<JsonExportDocument> {
-  const pages = await collectExportPages(root);
-  const profile = await buildExportProfileBlock(root);
-  const warnings = await collectExportWarnings(root);
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return exportJsonFrom(
+    { pages: diskExportPageSources(root), profile: diskProfileSummarySources(root), journal: diskJournalReadSources(root) }, options);
+}
+
+/**
+ * Everything {@link exportJsonFrom} reads: the export page sources, the profile
+ * block's sources and the journal. Nothing ties the three to one project;
+ * production builds all from one root.
+ */
+export interface ExportJsonSources {
+  pages: ExportPageSources;
+  profile: ExportProfileSources;
+  journal: JournalReadSources;
+}
+
+/**
+ * {@link exportJson} over {@link ExportJsonSources}: THE ONE BODY. One step
+ * after another: the pages, the profile block, the journal warning; then the
+ * document, whose `projectId` is validated last, as before.
+ */
+export async function exportJsonFrom(
+  sources: ExportJsonSources,
+  options: ExportJsonOptions = {},
+): Promise<JsonExportDocument> {
+  const pages = await collectExportPagesFrom(sources.pages);
+  const profile = await buildExportProfileBlockFrom(sources.profile);
+  const warnings = await collectExportWarningsFrom(sources.journal);
   // Reconstruct build options from ONLY the public knob so a forged `profile` or
   // `warnings` on the caller's object can never reach the document; the
   // pipeline-computed `profile`/`warnings` are the sole source of those blocks.

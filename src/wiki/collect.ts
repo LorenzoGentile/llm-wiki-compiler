@@ -24,14 +24,19 @@
  *   - `src/viewer/collect.ts` retains every record and maps `parseStatus`
  *     flags into `ViewerWarning` objects so users can diagnose malformed
  *     pages in the UI.
+ *
+ * Disk access: the scan reads through a `LegacyLocalEntityScans` binding.
+ * `scanEntityDir` builds the local-disk one from the project root, which is
+ * what every production caller uses; `scanEntityDirFrom` takes the binding.
+ * The binding only opens, lists, resolves and reads. Everything this file
+ * decides about content stays here.
  */
 
-import { readdir, readFile, lstat, open } from "fs/promises";
-import path from "path";
 import { parseFrontmatterStatus, slugify } from "../utils/markdown.js";
 import { CONCEPTS_DIR, QUERIES_DIR } from "../utils/constants.js";
 import type { PageDirectory } from "../export/types.js";
-import { safeRealpath, isInsideDir } from "../utils/path-confine.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans, LocalEntityDirectory } from "../storage/legacy-local-reads.js";
 import { findWikilinks } from "./wikilinks.js";
 
 
@@ -148,19 +153,16 @@ function scanFromParsed(
 
 /**
  * Read only a bounded leading PREFIX of `filePath` (up to
- * {@link FRONTMATTER_PREFIX_CAP_BYTES}) via a single `fs.open` + bounded read,
+ * {@link FRONTMATTER_PREFIX_CAP_BYTES}) via the directory's single bounded read,
  * returning its UTF-8 decoding alongside whether the whole file fit in the cap.
  * The metadata-only path uses this to avoid paying full-body I/O on every poll.
  */
-async function readBoundedPrefix(filePath: string): Promise<{ text: string; complete: boolean }> {
-  const handle = await open(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(FRONTMATTER_PREFIX_CAP_BYTES);
-    const { bytesRead } = await handle.read(buffer, 0, FRONTMATTER_PREFIX_CAP_BYTES, 0);
-    return { text: buffer.toString("utf-8", 0, bytesRead), complete: bytesRead < FRONTMATTER_PREFIX_CAP_BYTES };
-  } finally {
-    await handle.close();
-  }
+async function readBoundedPrefix(
+  directory: LocalEntityDirectory,
+  filePath: string,
+): Promise<{ text: string; complete: boolean }> {
+  const prefix = await directory.readPrefix(filePath, FRONTMATTER_PREFIX_CAP_BYTES);
+  return { text: prefix.toString("utf-8"), complete: prefix.length < FRONTMATTER_PREFIX_CAP_BYTES };
 }
 
 /** The two byte sequences a frontmatter block can open with (LF and CRLF). */
@@ -188,8 +190,12 @@ function startsWithFrontmatterOpening(text: string): boolean {
  * a full read of a file with no leading frontmatter — and a multi-MB body that
  * does not open with a fence is summarized from the small prefix, never read whole.
  */
-async function readMetadataOnlyScan(filePath: string, stem: string): Promise<RawEntityScan | null> {
-  const { text, complete } = await readBoundedPrefix(filePath);
+async function readMetadataOnlyScan(
+  directory: LocalEntityDirectory,
+  filePath: string,
+  stem: string,
+): Promise<RawEntityScan | null> {
+  const { text, complete } = await readBoundedPrefix(directory, filePath);
   const parsed = parseFrontmatterStatus(text);
   // Not opening with a fence is already decisive: there is no frontmatter, so
   // the rest of the file is irrelevant and need not be read.
@@ -215,13 +221,14 @@ async function readMetadataOnlyScan(filePath: string, stem: string): Promise<Raw
  * read so behaviour is never wrong.
  */
 async function readEntityScan(
+  directory: LocalEntityDirectory,
   filePath: string,
   stem: string,
   includeBody: boolean,
 ): Promise<RawEntityScan | null> {
   if (!includeBody) {
     try {
-      const metadataScan = await readMetadataOnlyScan(filePath, stem);
+      const metadataScan = await readMetadataOnlyScan(directory, filePath, stem);
       if (metadataScan) return metadataScan;
     } catch {
       return null;
@@ -229,7 +236,7 @@ async function readEntityScan(
   }
   let raw: string;
   try {
-    raw = await readFile(filePath, "utf-8");
+    raw = await directory.readText(filePath);
   } catch {
     return null;
   }
@@ -286,52 +293,51 @@ export interface ScanEntityDirOptions {
  * @param opts - When `includeBody` is false, bodies are dropped for a count-only
  *   scan; defaults to retaining bodies so existing callers are byte-unchanged.
  */
-export async function scanEntityDir(
+export function scanEntityDir(
   root: string,
   dir: string,
   opts: ScanEntityDirOptions = {},
 ): Promise<EntityDirScan> {
+  return scanEntityDirFrom(diskLocalEntityScans(root), dir, opts);
+}
+
+/**
+ * {@link scanEntityDir} over a read binding in place of a project root. The
+ * binding opens the directory (which is where the root and the directory
+ * itself are checked: absent is `missing`, a linked or unresolvable one is
+ * `invalid`), lists it, resolves each entry and reads it. This function keeps
+ * the rest: a listing that fails is `missing`; only names ending `.md` are
+ * pages, taken in the listing's own order; an entry that does not resolve or
+ * cannot be read is dropped without a problem; and the entry's locator is
+ * reported as its `filePath`.
+ *
+ * @param source - The binding to scan through.
+ * @param dir - The entity directory, relative to the project, as the caller spells it.
+ * @param opts - As for {@link scanEntityDir}.
+ */
+export async function scanEntityDirFrom(
+  source: LegacyLocalEntityScans,
+  dir: string,
+  opts: ScanEntityDirOptions = {},
+): Promise<EntityDirScan> {
   const includeBody = opts.includeBody ?? true;
-  const canonicalRoot = await safeRealpath(root);
-  if (!canonicalRoot) return { scans: [], dirStatus: "invalid" };
-  const expectedDir = path.join(canonicalRoot, dir);
-  const dirStatus = await classifyEntityDir(expectedDir);
-  if (dirStatus !== "ok") return { scans: [], dirStatus };
+  const opened = await source.openEntityDirectory(dir);
+  if (opened.status !== "ok") return { scans: [], dirStatus: opened.status };
+  const { directory } = opened;
   let files: string[];
   try {
-    files = await readdir(expectedDir);
+    files = await directory.listNames();
   } catch {
     return { scans: [], dirStatus: "missing" };
   }
   const scans: RawEntityScan[] = [];
   for (const file of files.filter((f) => f.endsWith(".md"))) {
-    const resolved = await safeRealpath(path.join(expectedDir, file));
-    if (!resolved || !isInsideDir(resolved, expectedDir)) continue;
-    const scan = await readEntityScan(resolved, file.replace(/\.md$/, ""), includeBody);
+    const resolved = await directory.resolveEntry(file);
+    if (!resolved) continue;
+    const scan = await readEntityScan(directory, resolved, file.replace(/\.md$/, ""), includeBody);
     if (scan) scans.push(scan);
   }
   return { scans, dirStatus: "ok" };
-}
-
-/**
- * Classify an entity directory at its EXPECTED canonical path:
- *   - the path does not exist at all (lstat ENOENT) → `missing` (benign);
- *   - it exists but its realpath differs from the expected path (a symlink, or
- *     a confinement failure) → `invalid`;
- *   - otherwise → `ok`.
- *
- * Distinguishing absent from invalid lets the non-default collector surface a
- * symlinked directory as a problem while treating a missing directory as an
- * empty (but healthy) entity type.
- */
-async function classifyEntityDir(expectedDir: string): Promise<EntityDirStatus> {
-  try {
-    await lstat(expectedDir);
-  } catch {
-    return "missing";
-  }
-  const realDir = await safeRealpath(expectedDir);
-  return realDir === expectedDir ? "ok" : "invalid";
 }
 
 /**
@@ -362,10 +368,18 @@ function scanToRawWikiPage(scan: RawEntityScan, pageDirectory: PageDirectory): R
  * Slug values are the raw filename stems VERBATIM — this path never calls
  * `entityId()` or `slugify()`.
  */
-export async function collectRawWikiPages(root: string): Promise<RawWikiPage[]> {
+export function collectRawWikiPages(root: string): Promise<RawWikiPage[]> {
+  return collectRawWikiPagesFrom(diskLocalEntityScans(root));
+}
+
+/**
+ * {@link collectRawWikiPages} over a read binding in place of a project root.
+ * Both directory scans start together on the ONE binding, concepts first.
+ */
+export async function collectRawWikiPagesFrom(scans: LegacyLocalEntityScans): Promise<RawWikiPage[]> {
   const [concepts, queries] = await Promise.all([
-    scanEntityDir(root, CONCEPTS_DIR),
-    scanEntityDir(root, QUERIES_DIR),
+    scanEntityDirFrom(scans, CONCEPTS_DIR),
+    scanEntityDirFrom(scans, QUERIES_DIR),
   ]);
   // The default path ignores dirStatus: a missing OR invalid dir is treated as
   // empty, exactly as before the refactor (the parity golden proves this).

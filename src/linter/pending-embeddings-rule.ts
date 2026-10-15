@@ -11,10 +11,16 @@
  *
  * An empty marker (the default) yields zero findings, so the default lint output
  * stays byte-identical (parity-safe).
+ *
+ * `checkPendingEmbeddingsFrom` is THE ONE BODY and holds no project root; the
+ * root-taking `checkPendingEmbeddings` builds the local disk marker reads for
+ * that one call and delegates. Both warnings are asked together, as before,
+ * and each still makes its own two marker reads.
  */
 
-import { pendingEmbeddingsWarning } from "../trust/pending-embeddings-warning.js";
-import { quarantinedEmbeddingsWarning } from "../trust/quarantined-embeddings-warning.js";
+import { pendingEmbeddingsWarningFrom } from "../trust/pending-embeddings-warning.js";
+import { quarantinedEmbeddingsWarningFrom } from "../trust/quarantined-embeddings-warning.js";
+import { diskEmbeddingMarkerReads, type EmbeddingMarkerReads } from "../utils/pending-embeddings.js";
 import { PENDING_EMBEDDINGS_FILE } from "../utils/constants.js";
 import type { LintResult } from "./types.js";
 
@@ -29,8 +35,13 @@ import type { LintResult } from "./types.js";
  * @returns Separate pending and quarantine warnings; empty when neither needs attention.
  */
 export async function checkPendingEmbeddings(root: string): Promise<LintResult[]> {
+  return checkPendingEmbeddingsFrom(diskEmbeddingMarkerReads(root));
+}
+
+/** {@link checkPendingEmbeddings} through `reads`: THE ONE BODY. */
+export async function checkPendingEmbeddingsFrom(reads: EmbeddingMarkerReads): Promise<LintResult[]> {
   const [warning, quarantine] = await Promise.all([
-    pendingEmbeddingsWarning(root), quarantinedEmbeddingsWarning(root),
+    pendingEmbeddingsWarningFrom(reads), quarantinedEmbeddingsWarningFrom(reads),
   ]);
   const results: LintResult[] = [];
   if (warning) results.push({

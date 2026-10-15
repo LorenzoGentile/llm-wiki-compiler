@@ -17,10 +17,11 @@
  * read surface stays byte-identical (parity-safe). An UNAVAILABLE marker is no
  * longer reported as clean: it surfaces {@link PENDING_EMBEDDINGS_UNAVAILABLE_CODE}
  * (fail closed VISIBLY, never silently as empty). Exhausted entries are reported
- * separately by quarantinedEmbeddingsWarning, not advertised as awaiting retry.
+ * separately by quarantinedEmbeddingsWarningFrom, not advertised as awaiting retry.
  */
 
-import { readPendingMarker } from "../utils/pending-embeddings.js";
+import { diskEmbeddingMarkerReads, readPendingMarkerFrom } from "../utils/pending-embeddings.js";
+import type { EmbeddingMarkerReads } from "../utils/pending-embeddings.js";
 import { MAX_PENDING_EMBEDDING_ATTEMPTS, QUARANTINED_EMBEDDINGS_FILE } from "../utils/constants.js";
 import type { ReadSurfaceWarning } from "./journal-health-warning.js";
 
@@ -60,8 +61,13 @@ function unavailableMessage(detail: string): string {
  * @returns The pending-embeddings warning, or `null` when nothing needs attention.
  */
 export async function pendingEmbeddingsWarning(root: string): Promise<ReadSurfaceWarning | null> {
+  return pendingEmbeddingsWarningFrom(diskEmbeddingMarkerReads(root));
+}
+
+/** {@link pendingEmbeddingsWarning} through `reads`: THE ONE BODY. Both markers are read, started together, pending first. */
+export async function pendingEmbeddingsWarningFrom(reads: EmbeddingMarkerReads): Promise<ReadSurfaceWarning | null> {
   const [marker, quarantine] = await Promise.all([
-    readPendingMarker(root), readPendingMarker(root, QUARANTINED_EMBEDDINGS_FILE),
+    readPendingMarkerFrom(reads), readPendingMarkerFrom(reads, QUARANTINED_EMBEDDINGS_FILE),
   ]);
   if (marker.status === "unavailable") {
     return {

@@ -19,13 +19,25 @@
  * mint a second one as a side effect of running one directory deep — and the
  * project's own configuration must be readable. Neither is a statement about the
  * operator's plan, so both are settled before a single document byte is read.
+ *
+ * THE SAME FOUR QUESTIONS, OVER THE MODULE'S OWN READS. Each of the four
+ * root-named functions keeps its signature and delegates to a `…From` mirror
+ * that takes `PreparationReadinessReads` and no project root. The mirrors are
+ * the same four entry points and no fifth: the profile half stays private in
+ * both forms. EVERY DECISION STAYS IN THE MIRRORS: the order, the words, which
+ * failed store probe means not-there and which means could-not-tell, the write
+ * path's deliberate collapse of the two, and reset's missing key clause. The
+ * reads only report: a store probe resolves or rejects, raw; the profile loads
+ * or rejects; the key read answers. They classify nothing. On disk they are the
+ * same four calls as before, made when asked. Nothing here selects a backend,
+ * and a mirror is no more an authority boundary than the function it mirrors.
  */
 
 import { access, stat } from "node:fs/promises";
 import path from "node:path";
 import { loadProfile } from "../profile/load.js";
 import { LLMWIKI_DIR } from "../utils/constants.js";
-import { readPreparationKey } from "./key-epoch.js";
+import { readPreparationKey, type PreparationKeyRead } from "./key-epoch.js";
 
 /** Whether the project is in a state the caller can act in. */
 export interface HostReadinessV1 {
@@ -33,6 +45,44 @@ export interface HostReadinessV1 {
   readonly ready: boolean;
   /** Why not, when `ready` is false. */
   readonly reason: string | null;
+}
+
+/**
+ * What readiness asks of the store. Owned by this module; no read takes a
+ * project root. EVERY MEMBER ONLY REPORTS: what a rejection or an answer means
+ * is decided by the function that asked. EVERY MEMBER MUST RETURN A PROMISE
+ * that resolves or rejects, and must never throw synchronously; the bodies add
+ * no normalization for a member that does.
+ */
+export interface PreparationReadinessReads {
+  /**
+   * Look at the store directory, as `stat` does: is what is there a directory?
+   * REJECTS, raw, when the look fails; the read path classifies that error.
+   */
+  observeStore(): Promise<"directory" | "not-directory">;
+  /**
+   * The write path's probe, as `access` does: resolves when the store can be
+   * reached and REJECTS when it cannot, for whatever reason.
+   */
+  probeStore(): Promise<void>;
+  /** Load the project's profile. Rejects for a present-but-broken one. */
+  loadProfile(): Promise<unknown>;
+  /** The preparation key read. Only its status is consulted here. */
+  readKey(): Promise<PreparationKeyRead>;
+}
+
+/**
+ * The local-disk readiness reads for one project root. Private, and built per
+ * call: each closure makes the incumbent's call when it is asked, never earlier.
+ */
+function diskPreparationReadinessReads(root: string): PreparationReadinessReads {
+  const store = path.join(root, LLMWIKI_DIR);
+  return {
+    observeStore: async () => ((await stat(store)).isDirectory() ? "directory" : "not-directory"),
+    probeStore: () => access(store),
+    loadProfile: () => loadProfile(root),
+    readKey: () => readPreparationKey(root),
+  };
 }
 
 /**
@@ -49,11 +99,11 @@ export interface HostReadinessV1 {
  * third readiness entry point on the surface with no caller, and the choice
  * between the three is precisely the decision that produced a defect once.
  *
- * @param root - The project root the operation acts within.
+ * @param reads - The module's reads for the project the operation acts within.
  * @returns Whether the project's configuration could be read, and why not.
  */
-async function resolveProfileReadiness(root: string): Promise<HostReadinessV1> {
-  const profile = await loadProfile(root).catch(() => null);
+async function resolveProfileReadiness(reads: PreparationReadinessReads): Promise<HostReadinessV1> {
+  const profile = await reads.loadProfile().catch(() => null);
   // "missing" would be wrong: `loadProfile` yields the built-in default for a
   // clean project and throws only for a PRESENT-but-broken profile.
   return profile === null
@@ -83,9 +133,14 @@ async function resolveProfileReadiness(root: string): Promise<HostReadinessV1> {
  * a defect rather than caution.
  */
 export async function resolveHostReadiness(root: string): Promise<HostReadinessV1> {
-  const profile = await resolveProfileReadiness(root);
+  return resolveHostReadinessFrom(diskPreparationReadinessReads(root));
+}
+
+/** {@link resolveHostReadiness} over the module's reads: the one body. Profile, then key. */
+export async function resolveHostReadinessFrom(reads: PreparationReadinessReads): Promise<HostReadinessV1> {
+  const profile = await resolveProfileReadiness(reads);
   if (!profile.ready) return profile;
-  const key = await readPreparationKey(root);
+  const key = await reads.readKey();
   return key.status === "unavailable"
     ? { ready: false, reason: "the preparation key is unreadable; preparation commands cannot proceed" }
     : { ready: true, reason: null };
@@ -126,7 +181,15 @@ export type ReadReadinessV1 =
  * @returns Whether the store is there, missing, or unobservable.
  */
 export async function resolvePreparationReadReadiness(root: string): Promise<ReadReadinessV1> {
-  const store = path.join(root, LLMWIKI_DIR);
+  return resolvePreparationReadReadinessFrom(diskPreparationReadinessReads(root));
+}
+
+/**
+ * {@link resolvePreparationReadReadiness} over the module's reads: the one
+ * body. The store look, then profile, then key. A look that fails is
+ * classified HERE, by its error code, and never propagates.
+ */
+export async function resolvePreparationReadReadinessFrom(reads: PreparationReadinessReads): Promise<ReadReadinessV1> {
   try {
     // `stat` RATHER THAN `access`, because the two failures have to be told
     // apart: `access` reports one boolean for "not there" and "not allowed to
@@ -134,8 +197,8 @@ export async function resolvePreparationReadReadiness(root: string): Promise<Rea
     // answers. ENOENT and ENOTDIR are the only ones meaning the store is not
     // there; everything else — EACCES, EPERM, EIO, a loop — means we could not
     // determine it, and must never read as an empty project.
-    const stats = await stat(store);
-    if (!stats.isDirectory()) {
+    const observed = await reads.observeStore();
+    if (observed !== "directory") {
       return { status: "absent", detail: `${LLMWIKI_DIR} exists here but is not a directory` };
     }
   } catch (error) {
@@ -144,7 +207,7 @@ export async function resolvePreparationReadReadiness(root: string): Promise<Rea
       ? { status: "absent", detail: `no ${LLMWIKI_DIR} store here; run from the project root` }
       : { status: "unreadable", detail: `the ${LLMWIKI_DIR} store could not be read (${code || "unknown error"})` };
   }
-  const ready = await resolveHostReadiness(root);
+  const ready = await resolveHostReadinessFrom(reads);
   // A PRESENT STORE WHOSE CONFIGURATION WILL NOT LOAD IS `unreadable`, NOT
   // `absent`: the project is here, something about it cannot be seen, and a
   // reader told "no store here" would go looking in the wrong directory.
@@ -168,8 +231,8 @@ export async function resolvePreparationReadReadiness(root: string): Promise<Rea
  * preserving extraction, so the distinction is named as owed work rather than
  * introduced here alongside it.
  */
-async function missingStoreRefusal(root: string): Promise<string | null> {
-  const present = await access(path.join(root, LLMWIKI_DIR)).then(() => true, () => false);
+async function missingStoreRefusal(reads: PreparationReadinessReads): Promise<string | null> {
+  const present = await reads.probeStore().then(() => true, () => false);
   return present
     ? null
     : "no .llmwiki store here; run from the project root rather than creating a second store";
@@ -198,9 +261,14 @@ async function missingStoreRefusal(root: string): Promise<string | null> {
  * @returns The refusal, or `null` when the project can be acted in.
  */
 export async function preparationResetPreflightRefusal(root: string): Promise<string | null> {
-  const blocked = await missingStoreRefusal(root);
+  return preparationResetPreflightRefusalFrom(diskPreparationReadinessReads(root));
+}
+
+/** {@link preparationResetPreflightRefusal} over the module's reads: the one body. Store, then profile; NEVER the key. */
+export async function preparationResetPreflightRefusalFrom(reads: PreparationReadinessReads): Promise<string | null> {
+  const blocked = await missingStoreRefusal(reads);
   if (blocked !== null) return blocked;
-  const profile = await resolveProfileReadiness(root);
+  const profile = await resolveProfileReadiness(reads);
   return profile.ready ? null : profile.reason ?? "the project is not ready";
 }
 
@@ -214,9 +282,14 @@ export async function preparationResetPreflightRefusal(root: string): Promise<st
  * "no project here" means. The single added clause is the key.
  */
 export async function preparationPreflightRefusal(root: string): Promise<string | null> {
-  const blocked = await preparationResetPreflightRefusal(root);
+  return preparationPreflightRefusalFrom(diskPreparationReadinessReads(root));
+}
+
+/** {@link preparationPreflightRefusal} over the module's reads: the one body. The reset preflight, then the key. */
+export async function preparationPreflightRefusalFrom(reads: PreparationReadinessReads): Promise<string | null> {
+  const blocked = await preparationResetPreflightRefusalFrom(reads);
   if (blocked !== null) return blocked;
-  const key = await readPreparationKey(root);
+  const key = await reads.readKey();
   return key.status === "unavailable"
     ? "the preparation key is unreadable; preparation commands cannot proceed"
     : null;

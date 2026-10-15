@@ -10,23 +10,7 @@ import path from "node:path";
 import os from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { projectionAdapter } from "../../src/operation-bundles/adapters/projection.js";
-import { canonicalBytes } from "../../src/profile/templates/signing/canonical.js";
-import type { OperationDigest, ProjectionOperationMutation } from "../../src/operation-bundles/types.js";
-import { digestOf, makeBinding, makeContext, type BindingSet } from "./adapter-fixtures.js";
-
-const RECIPE_DIGEST = `sha256:${"5".repeat(64)}` as OperationDigest;
-const RECIPE_ID = "recipe-a";
-const OUTPUT = "out.json";
-const RENDERED = canonicalBytes({ recipeId: RECIPE_ID, recipeDigest: RECIPE_DIGEST, output: OUTPUT });
-const OUTPUT_DIGEST = digestOf(RENDERED);
-
-function projectionMutation(set: BindingSet): ProjectionOperationMutation {
-  return {
-    kind: "projection", index: 0, mutationId: set.onDisk.mutationId, dependsOn: [], reconciliationRefs: [],
-    operation: "render", target: { recipeId: RECIPE_ID, recipeDigest: RECIPE_DIGEST, output: OUTPUT, criticality: "required" },
-    precondition: { kind: "absent" }, postcondition: { digest: OUTPUT_DIGEST },
-  };
-}
+import { makeBinding, makeContext, projectionMutation } from "./adapter-fixtures.js";
 
 let root = "";
 beforeEach(async () => { root = await mkdtemp(path.join(os.tmpdir(), "proj-adapter-")); });

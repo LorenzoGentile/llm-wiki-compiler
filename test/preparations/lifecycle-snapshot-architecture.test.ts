@@ -102,14 +102,32 @@ describe("preparation lifecycle authority architecture", () => {
     const quarantine = await readFile(path.join(PREPARATIONS, "quarantine.ts"), "utf8");
     expect(namedImportsFrom(capacity, "./orphan-scan.js"))
       .not.toContain("scanPreparationOrphans");
+    // THE BOUND BODY IS THE SAME TRAVERSAL under a second name, so it is
+    // forbidden to the same two modules.
+    expect(namedImportsFrom(capacity, "./orphan-scan.js"))
+      .not.toContain("scanPreparationOrphansFrom");
     // NOT asserted for quarantine.ts any more. It required an import that only
     // the deleted uncaptured scanner used, so the control was pinning dead
     // weight: keeping the symbol imported would have been the cheapest way to
     // satisfy it, which is the opposite of what it is for.
     expect(namedImportsFrom(quarantine, "./orphan-scan.js"))
       .not.toContain("scanPreparationOrphans");
+    expect(namedImportsFrom(quarantine, "./orphan-scan.js"))
+      .not.toContain("scanPreparationOrphansFrom");
   });
+});
 
+describe("the compatibility-traversal import control", () => {
+  it("POSITIVE CONTROL: the matcher sees both names of the traversal, aliased or not", () => {
+    const source = 'import { scanActivePreparationStore, scanPreparationOrphans } from "./orphan-scan.js";\n' +
+      'import { scanPreparationOrphansFrom as walkEverything } from "./orphan-scan.js";';
+    expect(namedImportsFrom(source, "./orphan-scan.js")).toEqual([
+      "scanActivePreparationStore", "scanPreparationOrphans", "scanPreparationOrphansFrom",
+    ]);
+  });
+});
+
+describe("preparation lifecycle authority architecture: the matcher itself", () => {
   it("proves the structural matcher rejects representative reverse edges", () => {
     const source = 'import { lstat } from "node:fs/promises";\n' +
       'import { project } from "../lifecycle-compat.js";';

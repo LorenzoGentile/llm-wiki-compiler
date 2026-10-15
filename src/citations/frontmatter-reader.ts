@@ -8,15 +8,27 @@
  * These small reads avoid retained body bytes; they are not a speed optimization
  * and can cost more I/O calls than a full read, especially for late/missing fences.
  * Decode once after collecting bytes so UTF-8 split across reads stays intact.
+ *
+ * The reader needs ONE operation of its caller's handle: a positional read.
+ * {@link PositionalBytes} names it, so the same reader runs over a Node
+ * `FileHandle` (which satisfies it) and over bytes held in memory.
  */
-import type { FileHandle } from "node:fs/promises";
 import { parseFrontmatterStatus } from "../utils/markdown.js";
+
+/**
+ * Bytes that can be read at an absolute position: `read` fills at most `length`
+ * bytes of `buffer` from `offset`, starting at `position` in the source, and
+ * answers how many it wrote; zero means the end. Lent for one read only.
+ */
+export interface PositionalBytes {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+}
 
 const OPENINGS = ["---\n", "---\r\n"];
 const CLOSING = Buffer.from("\n---");
 
 /** Probe one byte at a time so an impossible opener stops immediately. */
-async function readOpening(handle: FileHandle): Promise<Buffer | null> {
+async function readOpening(handle: PositionalBytes): Promise<Buffer | null> {
   const bytes: number[] = [];
   const byte = Buffer.alloc(1);
   while (true) {
@@ -30,7 +42,7 @@ async function readOpening(handle: FileHandle): Promise<Buffer | null> {
 }
 
 /** Read production-compatible resolution frontmatter without closing the handle. */
-export async function readResolutionFrontmatter(handle: FileHandle): Promise<Record<string, unknown>> {
+export async function readResolutionFrontmatter(handle: PositionalBytes): Promise<Record<string, unknown>> {
   const opening = await readOpening(handle);
   if (!opening) return {};
   const bytes = [...opening];

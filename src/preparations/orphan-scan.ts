@@ -7,10 +7,23 @@
  * 9D/9E. Co-located Milestone A subtrees are a different store's namespace and
  * are ignored rather than mis-counted as orphans. Every unknown or unreadable
  * leg is reported instead of silently omitted.
+ *
+ * ONE WALK, OVER THE SCANNER'S OWN READS. The walk, the classifiers, the
+ * directory policy, the byte caps, the entry and depth budgets, the order and
+ * every problem's words live in one body that takes `PreparationStoreWalkReads`
+ * and no project root; it works in paths relative to the store's `.llmwiki`.
+ * The two root-named entry points keep their signatures and delegate to the
+ * two `…From` bodies over the private local-disk reads, built on each call.
+ * No file handle crosses the seam: a directory is visited by a provider that
+ * opens, lists and releases it, and a leaf is observed and released before the
+ * answer. On disk that is the same no-follow, confined, handle-bound code as
+ * before, in `utils/inventory-scan.ts`. Binding the walk makes nothing below it
+ * storage-neutral, and nothing here selects a backend.
  */
 
 import path from "node:path";
-import { noteInventoryProblem as problem, durableAlias, verified, walkInventoryDirectory, openInventoryLeaf, recordInventoryLeaf, positiveScanEntryLimit } from "../utils/inventory-scan.js";
+import { durableAlias, verified, positiveScanEntryLimit, captureInventoryLeaf, walkInventoryTree } from "../utils/inventory-scan.js";
+import { diskInventoryWalkReads } from "../utils/inventory-disk-walk.js";
 import { assertPreparationId, assertPreparationRunId } from "./ids.js";
 import {
   MAX_PREPARATION_INVENTORY_ENTRIES,
@@ -58,9 +71,50 @@ export interface PreparationOrphanScan {
 /** Test-only lower bound for deterministic directory-exhaustion coverage. */
 export interface PreparationScanOptions { maxDirectoryEntriesForTest?: number }
 
+/** One directory entry as the scanner reads it: a name and three kind tests. */
+export interface PreparationStoreEntry {
+  name: string;
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * What the scanner asks of the store. Owned by the scanner. Every path is
+ * relative to the store's `.llmwiki`; no member takes a project root and no
+ * file handle crosses in either direction.
+ */
+export interface PreparationStoreWalkReads {
+  /**
+   * Visit one directory. THE PROVIDER'S CONTRACT, which the scanner cannot check:
+   *  - ORDER: obtain an entry, THEN call `take()`. Never call `take()` when no
+   *    entry is in hand, so never at the end of a directory. If `take()` is
+   *    false, deliver nothing more from this visit; otherwise await
+   *    `inspect(entry)` before obtaining the next. An entry may have been
+   *    obtained and not delivered; nothing here bounds what the store reads.
+   *  - REFUSALS: answer `absent`, `unavailable` or `unlistable` ONLY when
+   *    neither `take` nor `inspect` was called. A failure after that REJECTS.
+   *  - NAMES: each name is one non-empty path segment, not `.` or `..`, with no
+   *    separator. The scanner joins names into paths and does not re-check them.
+   *  - RELEASE: whatever the visit holds is released on every path, including
+   *    when `inspect` rejects. `inspect` may start a nested visit.
+   */
+  visitDirectory(
+    directory: string,
+    visitor: { take(): boolean; inspect(entry: PreparationStoreEntry): Promise<void> },
+  ): Promise<"visited" | "absent" | "unavailable" | "unlistable">;
+  /**
+   * One leaf's size and identity, taken from the opened leaf and nothing else;
+   * nothing stays open afterwards. `dev` and `ino` are an identity pair: equal
+   * pairs mean the same stored object, because byte totals count by them.
+   */
+  observeLeaf(file: string, parent: string): Promise<
+    { kind: "confirmed"; size: number; dev: number; ino: number } | { kind: "absent" } | { kind: "unavailable" }
+  >;
+}
+
 interface ScanState {
-  root: string;
-  llmwikiRoot: string;
+  reads: PreparationStoreWalkReads;
   maxEntries: number;
   entries: number;
   exhausted: boolean;
@@ -79,6 +133,11 @@ const LEAF_BYTE_CAPS: Partial<Record<PreparationLeafKind, number>> = {
   run: MAX_PREPARATION_RUN_BYTES,
   cancel: MAX_PREPARATION_RUN_BYTES,
 };
+
+/** Record one problem against a store-relative path, reported as the project-relative path it always was. */
+function problem(state: ScanState, dimension: string, detail: string, relative: string): void {
+  state.problems.push({ dimension, detail, path: path.join(".llmwiki", relative) });
+}
 
 /** Classify one preparation-owned regular leaf from validated path segments. */
 function classifyLeaf(relative: string): ClassifiedLeaf {
@@ -171,13 +230,13 @@ function captureDirectoryIdentity(state: ScanState, relative: string): void {
 
 /** Capture one opened regular file and its protocol-aware classification. */
 async function captureLeaf(state: ScanState, file: string, parent: string): Promise<void> {
-  const opened = await openInventoryLeaf(state, file, parent, "preparation");
-  if (opened === null) return;
-  const relativePath = path.relative(state.llmwikiRoot, file);
-  const classified = classifyLeaf(relativePath);
-  noteLeafCap(state, classified.kind, opened.size, file);
-  await recordInventoryLeaf(state.leaves, classified, relativePath, opened);
-  if (classified.kind === "unknown") problem(state, "preparation-entry", "unknown preparation leaf", file);
+  await captureInventoryLeaf((leaf, dir) => state.reads.observeLeaf(leaf, dir), file, parent, {
+    label: "preparation",
+    problem: (dimension, detail, relative) => problem(state, dimension, detail, relative),
+    classify: classifyLeaf,
+    noteCap: (kind, bytes, leaf) => noteLeafCap(state, kind, bytes, leaf),
+    record: (observation) => { state.leaves.push(observation); },
+  });
 }
 
 /** Refuse a recognized leaf whose metadata already exceeds its local cap. */
@@ -196,8 +255,8 @@ function takeEntry(state: ScanState, dir: string): boolean {
 }
 
 /** Inspect one directory entry without duplicating topology decisions. */
-async function inspectEntry(state: ScanState, entry: { name: string; isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean }, dir: string, depth: number): Promise<void> {
-  const child = path.join(dir, entry.name), relative = path.relative(state.llmwikiRoot, child);
+async function inspectEntry(state: ScanState, entry: PreparationStoreEntry, dir: string, depth: number): Promise<void> {
+  const child = path.join(dir, entry.name), relative = child;
   if (entry.isDirectory()) {
     const policy = directoryPolicy(relative);
     if (policy === "ignore") return;
@@ -214,16 +273,7 @@ async function inspectEntry(state: ScanState, entry: { name: string; isDirectory
 
 /** Traverse until the global entry bound is reached, then fail closed. */
 async function walk(state: ScanState, dir: string, depth: number): Promise<void> {
-  if (state.exhausted) return;
-  if (depth > MAX_SCAN_DEPTH) {
-    problem(state, "directory-depth", "preparation inventory depth exceeded", dir);
-    state.exhausted = true;
-    return;
-  }
-  await walkInventoryDirectory(state, { directory: dir, store: "preparation" }, {
-    take: () => !state.exhausted && takeEntry(state, dir),
-    inspect: (entry) => inspectEntry(state, entry, dir, depth),
-  });
+  await walkInventoryTree(state, dir, depth, { label: "preparation", maxDepth: MAX_SCAN_DEPTH, problem, takeEntry, inspectEntry });
 }
 
 /** Return the effective host-capped entry ceiling for one scan request. */
@@ -236,12 +286,11 @@ export function preparationScanEntryLimit(
 
 /** Initialize one isolated scan without traversing any physical store. */
 function scanState(
-  root: string,
+  reads: PreparationStoreWalkReads,
   options: PreparationScanOptions,
 ): ScanState {
-  const llmwikiRoot = path.join(root, ".llmwiki");
   return {
-    root: path.resolve(root), llmwikiRoot: path.resolve(llmwikiRoot),
+    reads,
     maxEntries: preparationScanEntryLimit(options),
     entries: 0, exhausted: false, leaves: [], workspaces: new Set(), preparationDirectories: new Map(), problems: [],
   };
@@ -257,13 +306,32 @@ function scanResult(state: ScanState): PreparationOrphanScan {
   };
 }
 
+/**
+ * The local-disk reads for one project root. Built per call, and PURE to
+ * build: two lexical path resolutions and no I/O. Each closure joins the
+ * store-relative path back under the resolved `.llmwiki` and calls the shared
+ * primitive with the resolved root, as the scan state did before. Exported for
+ * the store's leaf composition (`store-leaf-reads.ts`) only; in no package index.
+ */
+export function diskPreparationStoreWalkReads(root: string): PreparationStoreWalkReads {
+  return diskInventoryWalkReads(root, ".llmwiki");
+}
+
 /** Inventory active preparation storage without entering a lifecycle registry. */
 export async function scanActivePreparationStore(
   root: string,
   options: PreparationScanOptions = {},
 ): Promise<PreparationOrphanScan> {
-  const state = scanState(root, options);
-  await walk(state, path.join(state.llmwikiRoot, "workspaces"), 0);
+  return scanActivePreparationStoreFrom(diskPreparationStoreWalkReads(root), options);
+}
+
+/** {@link scanActivePreparationStore} over the scanner's reads: the active walk only. */
+export async function scanActivePreparationStoreFrom(
+  reads: PreparationStoreWalkReads,
+  options: PreparationScanOptions = {},
+): Promise<PreparationOrphanScan> {
+  const state = scanState(reads, options);
+  await walk(state, "workspaces", 0);
   return scanResult(state);
 }
 
@@ -275,8 +343,21 @@ export async function scanPreparationOrphans(
   root: string,
   options: PreparationScanOptions = {},
 ): Promise<PreparationOrphanScan> {
-  const state = scanState(root, options);
-  await walk(state, path.join(state.llmwikiRoot, "workspaces"), 0);
-  await walk(state, path.join(state.llmwikiRoot, PREPARATION_QUARANTINE_SEGMENT), 0);
+  return scanPreparationOrphansFrom(diskPreparationStoreWalkReads(root), options);
+}
+
+/**
+ * {@link scanPreparationOrphans} over the scanner's reads: the active walk, then
+ * the quarantine segment, on ONE state, so one budget spans both. THIS WALKS THE
+ * LIFECYCLE REGISTRY, exactly as the root form does; capacity and destructive
+ * planning must use neither.
+ */
+export async function scanPreparationOrphansFrom(
+  reads: PreparationStoreWalkReads,
+  options: PreparationScanOptions = {},
+): Promise<PreparationOrphanScan> {
+  const state = scanState(reads, options);
+  await walk(state, "workspaces", 0);
+  await walk(state, PREPARATION_QUARANTINE_SEGMENT, 0);
   return scanResult(state);
 }

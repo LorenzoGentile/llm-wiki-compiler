@@ -14,14 +14,26 @@
  * loader; we surface that code directly so an agent SEES that the index is
  * outdated rather than getting a silently empty semantic section. The hits carry
  * a qualified `pageId`, and ranking resolves it via `findPageByQualifiedId`.
+ *
+ * Disk access: {@link retrieveSemanticChunks} loads the embedding store and the
+ * profile from the project root and reads live pages through the root-named
+ * lookup. {@link retrieveSemanticChunksFrom} takes a `LivePageReads` and the two
+ * loads as functions instead. Both run one private body, which makes each call
+ * only when it is reached: none for a non-positive limit, and no profile load
+ * when there is no usable store.
  */
 
 import {
   loadEmbeddingsForContext,
   findRelevantChunksV3,
+  findRelevantChunksV3From,
   type ChunkHitV3,
+  type EmbeddingLoadOutcome,
 } from "../utils/embeddings-load.js";
+import type { EmbeddingStoreV3 } from "../utils/embeddings-store.js";
+import type { LivePageReads } from "../utils/page-registry.js";
 import { loadProfile } from "../profile/load.js";
+import type { LoadedProfile } from "../profile/types.js";
 import { CHUNK_TOP_K } from "../utils/constants.js";
 
 /** Stable warning code returned when semantic retrieval did not contribute. */
@@ -66,6 +78,24 @@ export interface SemanticRetrievalOutcome {
 }
 
 /**
+ * The two loads the semantic step makes, as functions, so that each runs only
+ * when the step reaches it. {@link retrieveSemanticChunksFrom} calls them as
+ * `loads.embeddings()` and `loads.profile()`. They stand for the two root
+ * loaders; they are not a storage interface.
+ */
+export interface LazyContextLoads {
+  /** Load the embedding store. A rejection is NOT caught: it rejects the step. */
+  embeddings(): Promise<EmbeddingLoadOutcome>;
+  /** Load the active profile. A rejection becomes a retrieval warning. */
+  profile(): Promise<LoadedProfile>;
+}
+
+/** The three calls one retrieval makes, in the order the shared body makes them. */
+interface SemanticSteps extends LazyContextLoads {
+  chunks(store: EmbeddingStoreV3, k: number, profile: LoadedProfile): ReturnType<typeof findRelevantChunksV3>;
+}
+
+/**
  * Best-effort semantic retrieval over the v3 store. Returns the top-k chunks the
  * active embedding store can offer for `prompt`, OR a warning explaining why
  * semantic retrieval contributed nothing this call.
@@ -74,19 +104,56 @@ export interface SemanticRetrievalOutcome {
  * @param prompt - The ranking prompt (NOT the truncated display copy).
  * @param topChunks - Maximum chunks to retrieve (≤ 0 → no-op).
  */
-export async function retrieveSemanticChunks(
+export function retrieveSemanticChunks(
   root: string,
   prompt: string,
   topChunks: number,
 ): Promise<SemanticRetrievalOutcome> {
+  return retrieveChunksLazily({
+    embeddings: () => loadEmbeddingsForContext(root),
+    profile: () => loadProfile(root),
+    chunks: (store, k, profile) => findRelevantChunksV3(root, store, "context", prompt, k, profile),
+  }, topChunks);
+}
+
+/**
+ * {@link retrieveSemanticChunks} with every live page read made through `pages`
+ * and the two loads supplied as functions. Nothing here takes a project root.
+ *
+ * @param pages - Where live pages are read from.
+ * @param loads - The store load and the profile load, each called only when reached.
+ * @param prompt - The ranking prompt (NOT the truncated display copy).
+ * @param topChunks - Maximum chunks to retrieve (≤ 0 → no-op, and neither load runs).
+ */
+export function retrieveSemanticChunksFrom(
+  pages: LivePageReads,
+  loads: LazyContextLoads,
+  prompt: string,
+  topChunks: number,
+): Promise<SemanticRetrievalOutcome> {
+  return retrieveChunksLazily({
+    embeddings: () => loads.embeddings(),
+    profile: () => loads.profile(),
+    chunks: (store, k, profile) => findRelevantChunksV3From(pages, store, "context", prompt, k, profile),
+  }, topChunks);
+}
+
+/**
+ * The one retrieval both forms share. The order is the contract: a non-positive
+ * limit returns before any call; the store load is awaited OUTSIDE the `try`, so
+ * its failure rejects; a missing store returns before the profile is loaded; the
+ * profile load and the lookup are INSIDE the `try`, so their failures become a
+ * warning.
+ */
+async function retrieveChunksLazily(steps: SemanticSteps, topChunks: number): Promise<SemanticRetrievalOutcome> {
   if (topChunks <= 0) return emptyOutcome(null);
-  const outcome = await loadEmbeddingsForContext(root);
+  const outcome = await steps.embeddings();
   if (!outcome.store) return emptyOutcome(mapLoadWarning(outcome.warnings[0]?.code));
 
   try {
     const k = Math.min(topChunks, CHUNK_TOP_K);
-    const profile = await loadProfile(root);
-    const { hits, stalePageIds } = await findRelevantChunksV3(root, outcome.store, "context", prompt, k, profile);
+    const profile = await steps.profile();
+    const { hits, stalePageIds } = await steps.chunks(outcome.store, k, profile);
     const staleEntriesDetected = stalePageIds.length > 0;
     if (hits.length === 0) return emptyOutcome("embedding-store-missing", staleEntriesDetected);
     return { hits: hits.map(toSemanticChunkHit), warning: null, staleEntriesDetected };

@@ -4,12 +4,18 @@
  * counters, per-mutation/compensation/projection outcomes, completion warnings,
  * notices, residual findings, and any pending cancel advisory. Read-only; exits
  * non-zero only when the target cannot be resolved or its run leaf is unreadable.
+ *
+ * ONE BODY. {@link operationInspectCommandWith} decides over
+ * {@link OperationInspectSteps}, none of which takes a project root: the
+ * resolution refusal, then the advisory read keyed on the RESOLVED identity, then
+ * the report.
  */
 
 import * as output from "../../utils/output.js";
 import { readCancelRequest, type CancelRequestRead } from "../../operation-bundles/cancel-request.js";
+import type { OperationRunId } from "../../operation-bundles/ids.js";
 import type { OperationRun } from "../../operation-bundles/run-types.js";
-import { resolveTargetRun } from "./resolve.js";
+import { resolveTargetRun, resolveTargetRunFrom, type TargetRun, type TargetRunReads } from "./resolve.js";
 import { emitJson, reportFailure } from "./render.js";
 
 /** CLI options for `operation inspect`. */
@@ -64,6 +70,27 @@ function renderHuman(run: OperationRun, cancel: CancelRequestRead): void {
   renderCancelLine(cancel);
 }
 
+/** What `operation inspect` asks of the project. No member takes a project root. */
+export interface OperationInspectSteps {
+  /** The named target and its authenticated run, or a bounded error. */
+  resolve(target: string): Promise<TargetRun>;
+  /** The resolved run's cancel advisory. */
+  readCancel(workspaceId: string, runId: OperationRunId): Promise<CancelRequestRead>;
+}
+
+/** LOCAL DISK. The incumbent resolution and advisory read for `root`, each called when asked. */
+function diskOperationInspectSteps(root: string): OperationInspectSteps {
+  return {
+    resolve: (target) => resolveTargetRun(root, target),
+    readCancel: (workspaceId, runId) => readCancelRequest(root, workspaceId, runId),
+  };
+}
+
+/** The resolution over its own body and reads, with the caller's advisory read. Building it does no I/O. */
+export function operationInspectStepsOver(reads: TargetRunReads, readCancel: OperationInspectSteps["readCancel"]): OperationInspectSteps {
+  return { resolve: (target) => resolveTargetRunFrom(reads, target), readCancel };
+}
+
 /**
  * Inspect one operation run by run id or bundle id.
  *
@@ -73,9 +100,14 @@ function renderHuman(run: OperationRun, cancel: CancelRequestRead): void {
  * @returns 0 on a successful read, 1 when the target is unknown/unreadable.
  */
 export async function operationInspectCommand(root: string, target: string, options: OperationInspectOptions = {}): Promise<number> {
-  const outcome = await resolveTargetRun(root, target);
+  return operationInspectCommandWith(diskOperationInspectSteps(root), target, options);
+}
+
+/** {@link operationInspectCommand} over {@link OperationInspectSteps}: THE ONE BODY. */
+export async function operationInspectCommandWith(steps: OperationInspectSteps, target: string, options: OperationInspectOptions = {}): Promise<number> {
+  const outcome = await steps.resolve(target);
   if ("error" in outcome) return reportFailure(outcome.error);
-  const cancel = await readCancelRequest(root, outcome.resolved.workspaceId, outcome.resolved.runId);
+  const cancel = await steps.readCancel(outcome.resolved.workspaceId, outcome.resolved.runId);
   if (options.json) emitJson(runEnvelope(outcome.run, cancel));
   else renderHuman(outcome.run, cancel);
   return 0;

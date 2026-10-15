@@ -15,7 +15,7 @@
  *      is rejected even though `realpath` resolved it cleanly.
  */
 
-import { realpath } from "fs/promises";
+import { locationRealPath } from "../storage/disk-locations.js";
 import path from "path";
 import {
   CONCEPTS_DIR,
@@ -79,8 +79,8 @@ export async function resolveUnderRoot(
     }
   }
   const joined = path.join(root, ...safeSegments);
-  const realRoot = await realpath(root);
-  const realTarget = await realpath(joined);
+  const realRoot = await locationRealPath(root);
+  const realTarget = await locationRealPath(joined);
   const rootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
   if (realTarget !== realRoot && !realTarget.startsWith(rootWithSep)) {
     throw new PathSafetyError("resolved path escapes project root");
@@ -131,7 +131,7 @@ export async function assertViewerSubtree(root: string, resolvedPath: string): P
  */
 async function canonicalizeOrFallback(candidate: string): Promise<string> {
   try {
-    return await realpath(candidate);
+    return await locationRealPath(candidate);
   } catch {
     return candidate.endsWith(path.sep) ? candidate.slice(0, -1) : candidate;
   }

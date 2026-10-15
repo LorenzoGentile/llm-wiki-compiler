@@ -39,11 +39,22 @@
  * the timestamp as the fixed clock a resumed create must reproduce, so a
  * caller-supplied one would let a caller author a durable identity and pin a
  * bundle's creation instant.
+ *
+ * ONE BODY. {@link handoffPreparationOperationWith} decides the operation over
+ * {@link HandoffOperationSteps}, none of which takes a project root: the request
+ * capture, the obligation capture and its refusal, the readiness refusal, the run
+ * resolution refusal, the startable-state refusal and the mapping of the
+ * substrate's typed refusal. The clock and the self-locking substrate flow are
+ * MECHANISM steps. The root form keeps its signature and builds the local steps
+ * per call, so the capture still runs in the synchronous prologue.
  */
 
 import type { BundleId, OperationRunId } from "../operation-bundles/ids.js";
 import type { OperationDigest, PreparationEvidenceRef } from "../operation-bundles/types.js";
-import { HANDOFF_STARTABLE_RUN_STATES, HandoffError, handoffPreparation } from "./handoff.js";
+import {
+  HANDOFF_STARTABLE_RUN_STATES, HandoffError, handoffPreparation, handoffPreparationWith,
+  type HandoffSteps, type PreparationHandoffRequestV1, type PreparationHandoffResultV1,
+} from "./handoff.js";
 import type { HandoffBundleAuthoritiesV1 } from "./handoff-bundle.js";
 import type { HandoffId } from "./ids.js";
 import type { OperationAdapterMap } from "../operation-bundles/adapter-registry.js";
@@ -52,9 +63,11 @@ import { preparationRunActor } from "./principals.js";
 import type { PreparationPrincipal } from "./principals.js";
 import type { PreparationRunBinding } from "./run-types.js";
 import { capturedOr, deepCaptureData, tryCaptureOwnDataRecord } from "../utils/runtime-capture.js";
-import { resolveHostReadiness } from "./service-readiness.js";
+import { resolveHostReadiness, resolveHostReadinessFrom, type HostReadinessV1, type PreparationReadinessReads } from "./service-readiness.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
-import { resolvePreparationRun } from "./service-run-lookup.js";
+import {
+  resolvePreparationRun, resolvePreparationRunFrom, type PreparationRunLookupReads, type PreparationRunLookupV1,
+} from "./service-run-lookup.js";
 
 /**
  * The host-authored material one bundle is assembled from.
@@ -246,6 +259,40 @@ function captureObligationRecord(
   };
 }
 
+/** What the `handoff` operation asks of the project and its host. No member takes a project root. */
+export interface HandoffOperationSteps {
+  /** Whether the project's own configuration and key can be read. */
+  readiness(): Promise<HostReadinessV1>;
+  /** The named run and its authenticated binding, or why neither was reached. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
+  /** MECHANISM: the self-locking substrate flow. Its typed refusal is a `HandoffError`. */
+  handoff(request: PreparationHandoffRequestV1): Promise<PreparationHandoffResultV1>;
+  /** CLOCK: the instant a resumed create must reproduce, sampled once per call. */
+  now(): string;
+}
+
+/** LOCAL DISK. The incumbent readiness, run lookup and substrate flow for `root`, each called when asked. */
+function diskHandoffOperationSteps(root: string): HandoffOperationSteps {
+  return {
+    readiness: () => resolveHostReadiness(root),
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+    handoff: (request) => handoffPreparation(root, request),
+    now: () => new Date().toISOString(),
+  };
+}
+
+/** The readiness, lookup and substrate bodies over their own seams, with the caller's clock. Building it does no I/O. */
+export function handoffOperationStepsOver(
+  seams: { readiness: PreparationReadinessReads; runs: PreparationRunLookupReads; handoff: HandoffSteps }, now: () => string,
+): HandoffOperationSteps {
+  return {
+    readiness: () => resolveHostReadinessFrom(seams.readiness),
+    resolveRun: (runId) => resolvePreparationRunFrom(seams.runs, runId),
+    handoff: (request) => handoffPreparationWith(seams.handoff, request),
+    now,
+  };
+}
+
 /**
  * Stage one settled preparation into its Milestone A bundle.
  *
@@ -259,6 +306,13 @@ function captureObligationRecord(
  */
 export async function handoffPreparationOperation(
   root: string, principal: PreparationPrincipal, request: HandoffRequestV1,
+): Promise<HandoffResultV1> {
+  return handoffPreparationOperationWith(diskHandoffOperationSteps(root), principal, request);
+}
+
+/** {@link handoffPreparationOperation} over {@link HandoffOperationSteps}: THE ONE BODY. */
+export async function handoffPreparationOperationWith(
+  steps: HandoffOperationSteps, principal: PreparationPrincipal, request: HandoffRequestV1,
 ): Promise<HandoffResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE (D-10-9). The run id is read once and
   // threaded to both the action and the result; the obligations are copied here
@@ -276,15 +330,15 @@ export async function handoffPreparationOperation(
   const runId = captured.runId;
   const supplied = captured.obligations;
   const obligations = supplied === undefined ? null : captureObligations(supplied);
-  const at = new Date().toISOString();
+  const at = steps.now();
   if (obligations === null) {
     return { status: "refused", reason: "the handoff obligation set is incomplete" };
   }
   // READINESS FIRST. The run binding is key-epoch-bound, so a project whose own
   // key cannot be read is not one this operation can act in.
-  const ready = await resolveHostReadiness(root);
+  const ready = await steps.readiness();
   if (!ready.ready) return { status: "refused", reason: ready.reason ?? "the project is not ready" };
-  const resolved = await resolvePreparationRun(root, runId);
+  const resolved = await steps.resolveRun(runId);
   if (!resolved.ok) return { status: "refused", reason: resolved.reason };
   // Through the substrate's OWN exported set, so this pre-check can never refuse
   // a run `handoffPreparation` would accept, nor take its lock only to throw.
@@ -294,16 +348,16 @@ export async function handoffPreparationOperation(
       reason: `only a settled run can be handed off; this run is ${resolved.run.state}`,
     };
   }
-  return driveHandoff(root, principal, resolved.binding, runId, obligations, at);
+  return driveHandoff(steps, principal, resolved.binding, runId, obligations, at);
 }
 
 /** Invoke the self-locking substrate flow and map its typed refusal. */
 async function driveHandoff(
-  root: string, principal: PreparationPrincipal,
+  steps: HandoffOperationSteps, principal: PreparationPrincipal,
   binding: PreparationRunBinding, runId: string, obligations: PreparationHandoffObligationsV1, at: string,
 ): Promise<HandoffResultV1> {
   try {
-    const settled = await handoffPreparation(root, {
+    const settled = await steps.handoff({
       binding, actor: preparationRunActor(principal), at,
       compilation: obligations.compilation, authorities: obligations.authorities,
       preparationEvidence: obligations.preparationEvidence, payloads: obligations.payloads,

@@ -13,36 +13,61 @@
  * escaping page is treated as absent rather than followed. When the page does not
  * yet exist (a create) it returns `undefined`, which the validator treats as "not
  * a transition".
+ *
+ * ONE BODY for the frontmatter read: {@link readConfinedEntityFrontmatter} runs
+ * {@link readConfinedEntityFrontmatterFrom} over local-disk
+ * {@link EntityPageReads}. What a page that cannot be read, is not there, or
+ * carries malformed frontmatter MEANS is decided in that body; the read only
+ * looks. The confined path resolver above it still takes the root.
+ *
+ * ONE BODY for the previous-state read too: {@link readPrevLifecycleStateFrom}
+ * over {@link PrevLifecyclePageReads}, whose local members are the two physical
+ * calls the write side always made — {@link resolveConfinedEntityPage}, then a
+ * `safeReadFile` that answers `""` for ANY read failure. That is deliberately NOT
+ * {@link EntityPageReads}: the hardened endpoint read tells unreadable and
+ * malformed apart, and the previous-state read never has.
  */
 
 import path from "path";
 import { confinedRegularFile, safeRealpath } from "../utils/path-confine.js";
-import { readConfinedPageOutcome } from "../utils/confined-read.js";
-import { parseFrontmatter, parseFrontmatterStatus, safeReadFile } from "../utils/markdown.js";
+import { readConfinedPageOutcome, type ConfinedPageRead } from "../utils/confined-read.js";
+import { parseFrontmatter, parseFrontmatterStatus } from "../utils/markdown.js";
 import type { EntityTypeDef } from "./types.js";
 
 /**
- * Read the previous lifecycle-field value of an entity page from disk, or
- * `undefined` when the page does not exist (a create) or carries no value for the
- * lifecycle field. The page is resolved under `<root>/<def.directory>` via
- * {@link confinedRegularFile}, so a symlinked / out-of-tree page is treated as
- * absent (returns `undefined`) — never followed.
+ * The two physical looks the previous-state read takes. No member takes a
+ * project root, and neither carries meaning: parsing and the field choice stay
+ * in {@link readPrevLifecycleStateFrom}.
+ */
+export interface PrevLifecyclePageReads {
+  /** The confined real path of the entity page, or `null` when absent or escaping. Local: `resolveConfinedEntityPage(root, def, slug)`. */
+  resolvePage(def: EntityTypeDef, slug: string): Promise<string | null>;
+  /** The page text at `real`; `""` on ANY read failure. Local: `safeReadFile(real)`. */
+  readPage(real: string): Promise<string>;
+}
+
+/**
+ * Read the previous lifecycle-field value of an entity page, or `undefined` when
+ * the page does not exist (a create) or carries no string value for the
+ * lifecycle field. Locally the page is resolved under `<root>/<def.directory>`
+ * via {@link confinedRegularFile}, so a symlinked / out-of-tree page is treated
+ * as absent (returns `undefined`) — never followed. THE ONE BODY.
  *
- * @param root - Absolute project root.
+ * @param reads - The resolve-then-read looks.
  * @param def - The resolved entity type definition (supplies the directory).
  * @param slug - The page slug (the filename stem).
  * @param field - The lifecycle field name whose prior value is read.
  * @returns The prior lifecycle-field value as a string, or `undefined`.
  */
-export async function readPrevLifecycleState(
-  root: string,
+export async function readPrevLifecycleStateFrom(
+  reads: PrevLifecyclePageReads,
   def: EntityTypeDef,
   slug: string,
   field: string,
 ): Promise<string | undefined> {
-  const real = await resolveConfinedEntityPage(root, def, slug);
+  const real = await reads.resolvePage(def, slug);
   if (real === null) return undefined;
-  const { meta } = parseFrontmatter(await safeReadFile(real));
+  const { meta } = parseFrontmatter(await reads.readPage(real));
   const value = meta[field];
   return typeof value === "string" ? value : undefined;
 }
@@ -90,6 +115,41 @@ export type EntityFrontmatterRead =
   | { kind: "unreadable"; cause: NodeJS.ErrnoException };
 
 /**
+ * The one look the frontmatter reader takes at an entity page. OWNED BY THIS
+ * READER: a narrow seam with one disk implementation; not `ProjectStore`, not a
+ * hosted or access-control contract, and it selects no backend. It carries NO
+ * meaning: parsing, "malformed is absent" and every use of the result stay with
+ * the caller.
+ */
+export interface EntityPageReads {
+  /**
+   * The page `<slug>.md` of the entity directory `directory` (relative to the
+   * project, as the profile spells it): its text, `absent` (not there, or not
+   * provably the regular file at its confined place), or `unreadable` with the
+   * raw I/O fault. Never rejects for those.
+   */
+  readEntityPage(directory: string, slug: string): Promise<ConfinedPageRead>;
+}
+
+/**
+ * LOCAL DISK. The entity-page look for the project at `root`. Building it does
+ * no I/O and no path work. The look is the three calls the reader always made,
+ * in the same order: the canonical entity directory, the confined regular-file
+ * look, then the handle-bound no-follow page read. In no package index.
+ */
+export function diskEntityPageReads(root: string): EntityPageReads {
+  return {
+    readEntityPage: async (directory, slug) => {
+      const canonicalRoot = (await safeRealpath(root)) ?? path.resolve(root);
+      const dir = path.join(canonicalRoot, directory);
+      const real = await confinedRegularFile(dir, `${slug}.md`);
+      if (real === null) return { kind: "absent" };
+      return readConfinedPageOutcome(real, dir);
+    },
+  };
+}
+
+/**
  * Read + parse the FRONTMATTER of a confined entity page as a discriminated
  * {@link EntityFrontmatterRead}. The path resolves via {@link confinedRegularFile}
  * and the bytes come from the handle-bound, no-follow {@link readConfinedPageOutcome}
@@ -110,10 +170,20 @@ export async function readConfinedEntityFrontmatter(
   def: EntityTypeDef,
   slug: string,
 ): Promise<EntityFrontmatterRead> {
-  const dir = await confinedEntityDir(root, def);
-  const real = await confinedRegularFile(dir, `${slug}.md`);
-  if (real === null) return { kind: "absent" };
-  const read = await readConfinedPageOutcome(real, dir);
+  return readConfinedEntityFrontmatterFrom(diskEntityPageReads(root), def, slug);
+}
+
+/**
+ * {@link readConfinedEntityFrontmatter} over {@link EntityPageReads}: THE ONE
+ * BODY. One look at the page; an unreadable page keeps its cause, an absent one
+ * and one whose frontmatter is malformed are both `absent`.
+ */
+export async function readConfinedEntityFrontmatterFrom(
+  pages: EntityPageReads,
+  def: EntityTypeDef,
+  slug: string,
+): Promise<EntityFrontmatterRead> {
+  const read = await pages.readEntityPage(def.directory, slug);
   if (read.kind === "unreadable") return { kind: "unreadable", cause: read.cause };
   if (read.kind === "absent") return { kind: "absent" };
   const parsed = parseFrontmatterStatus(read.body);

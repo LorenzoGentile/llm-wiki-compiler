@@ -27,7 +27,9 @@
  * here; it goes through `collectRawWikiPages`, which keeps raw stems.
  */
 
-import { scanEntityDir, type RawEntityScan } from "../wiki/collect.js";
+import { diskLocalEntityScans } from "../storage/disk-local-reads.js";
+import type { LegacyLocalEntityScans } from "../storage/legacy-local-reads.js";
+import { scanEntityDirFrom, type RawEntityScan } from "../wiki/collect.js";
 import { isDefaultProfile } from "./default.js";
 import { isSlugSafe, assertSlugSafe, entityId, suggestSlugFromBasename } from "./identity.js";
 import { validateEntityFields } from "./field-contract.js";
@@ -271,13 +273,13 @@ function pushInvalidDirectory(
 
 /** Collect one entity type's pages, appending pages and problems in place. */
 async function collectOneEntity(
-  root: string,
+  source: LegacyLocalEntityScans,
   entityType: string,
   def: EntityTypeDef,
   pages: EntityPage[],
   problems: EntityProblem[],
 ): Promise<void> {
-  const { scans, dirStatus } = await scanEntityDir(root, def.directory);
+  const { scans, dirStatus } = await scanEntityDirFrom(source, def.directory);
   if (dirStatus === "invalid") {
     pushInvalidDirectory(entityType, def, problems);
     return;
@@ -302,12 +304,12 @@ async function collectOneEntity(
  * invalid pages remain visible via `problems` / `problemTotal`.
  */
 async function summarizeOneEntity(
-  root: string,
+  source: LegacyLocalEntityScans,
   entityType: string,
   def: EntityTypeDef,
   problems: EntityProblem[],
 ): Promise<number> {
-  const { scans, dirStatus } = await scanEntityDir(root, def.directory, { includeBody: false });
+  const { scans, dirStatus } = await scanEntityDirFrom(source, def.directory, { includeBody: false });
   if (dirStatus === "invalid") {
     pushInvalidDirectory(entityType, def, problems);
     return 0;
@@ -338,8 +340,20 @@ async function summarizeOneEntity(
  *   plus a problem per invalid directory / bad page / field-contract violation.
  * @throws {EntityCollectError} ONLY when the default profile is passed.
  */
-export async function collectEntityPages(
+export function collectEntityPages(
   root: string,
+  profile: ProfilePack,
+): Promise<EntityCollectResult> {
+  return collectEntityPagesFrom(diskLocalEntityScans(root), profile);
+}
+
+/**
+ * {@link collectEntityPages} over an entity-scan binding: THE ONE BODY. The
+ * default profile throws BEFORE any scan; otherwise each declared entity
+ * directory is scanned in declaration order, one at a time.
+ */
+export async function collectEntityPagesFrom(
+  source: LegacyLocalEntityScans,
   profile: ProfilePack,
 ): Promise<EntityCollectResult> {
   if (isDefaultProfile(profile)) {
@@ -350,7 +364,7 @@ export async function collectEntityPages(
   const pages: EntityPage[] = [];
   const problems: EntityProblem[] = [];
   for (const [entityType, def] of Object.entries(profile.entities) as [string, EntityTypeDef][]) {
-    await collectOneEntity(root, entityType, def, pages, problems);
+    await collectOneEntity(source, entityType, def, pages, problems);
   }
   return { pages, problems };
 }
@@ -376,6 +390,19 @@ export async function collectEntitySummary(
   root: string,
   profile: ProfilePack,
 ): Promise<EntitySummaryResult> {
+  // `async` so that a throw while the disk scans are built REJECTS, as this function always did.
+  return collectEntitySummaryFrom(diskLocalEntityScans(root), profile);
+}
+
+/**
+ * {@link collectEntitySummary} over an entity-scan binding: THE ONE BODY. The
+ * default profile throws BEFORE any scan; otherwise each declared entity
+ * directory is scanned frontmatter-only, in declaration order, one at a time.
+ */
+export async function collectEntitySummaryFrom(
+  source: LegacyLocalEntityScans,
+  profile: ProfilePack,
+): Promise<EntitySummaryResult> {
   if (isDefaultProfile(profile)) {
     throw new EntityCollectError(
       "collectEntitySummary is for non-default profiles only; use collectRawWikiPages for the default profile.",
@@ -384,7 +411,7 @@ export async function collectEntitySummary(
   const counts: Record<string, number> = {};
   const problems: EntityProblem[] = [];
   for (const [entityType, def] of Object.entries(profile.entities) as [string, EntityTypeDef][]) {
-    counts[entityType] = await summarizeOneEntity(root, entityType, def, problems);
+    counts[entityType] = await summarizeOneEntity(source, entityType, def, problems);
   }
   return { counts, problems };
 }

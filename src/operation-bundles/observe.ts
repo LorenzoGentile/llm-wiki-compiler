@@ -13,12 +13,19 @@
  * parsed record against the full run binding (run id + bundle id + manifest digest
  * + key epoch), so a tampered or foreign run refuses rather than reporting a
  * false "applied".
+ *
+ * ONE BODY. {@link observeOperationBundleWith} owns the ladder (inventory
+ * faults are uncertainty, an unknown digest is absent, then the key, the
+ * authenticated run, the outcome projection and the page samples) over
+ * {@link OperationObservationReads}, none of which takes a project root. The
+ * public {@link observeOperationBundle} keeps its signature and passes the local
+ * reads, which call the incumbent root forms when asked.
  */
 
-import { scanOperationInventory } from "./capacity.js";
+import { scanOperationInventory, type OperationInventory } from "./capacity.js";
 import { resolveTarget } from "./bundle-target.js";
-import { readOperationKey } from "./key-epoch.js";
-import { readOperationRun } from "./run-store.js";
+import { readOperationKey, type OperationKeyRead } from "./key-epoch.js";
+import { readOperationRun, type OperationRunRead } from "./run-store.js";
 import { operationRunPredecessor } from "./run-integrity.js";
 import { operationNeverStarted } from "./never-started.js";
 import { readPageDigest, type LeafDigest } from "./adapters/shared.js";
@@ -92,6 +99,28 @@ function canonicalMutationTarget(mutation: OperationMutation): string {
   }
 }
 
+/** What one observation reads. No member takes a project root. */
+export interface OperationObservationReads {
+  /** The whole operation inventory. */
+  scanInventory(): Promise<OperationInventory>;
+  /** The current operation key epoch. */
+  readKey(): Promise<OperationKeyRead>;
+  /** The authenticated run at its exact binding. */
+  readRun(binding: OperationRunBinding): Promise<OperationRunRead>;
+  /** One page mutation's current confined bytes, as a digest. */
+  readPageDigest(mutation: PageOperationMutation): Promise<LeafDigest>;
+}
+
+/** LOCAL DISK. The incumbent inventory scan, key, run and page readers for `root`, each called when asked. */
+function diskOperationObservationReads(root: string): OperationObservationReads {
+  return {
+    scanInventory: () => scanOperationInventory(root),
+    readKey: () => readOperationKey(root),
+    readRun: (binding) => readOperationRun(root, binding),
+    readPageDigest: (mutation) => readPageDigest(root, mutation),
+  };
+}
+
 /**
  * Observe the operation bundle identified by `bundleManifestDigest` (the exact
  * digest `product invoke` hands off): resolve it to its run binding, read the
@@ -103,23 +132,30 @@ function canonicalMutationTarget(mutation: OperationMutation): string {
 export async function observeOperationBundle(
   root: string, bundleManifestDigest: string,
 ): Promise<OperationBundleObservationV1> {
-  try { return await observeReadableBundle(root, bundleManifestDigest); }
+  return observeOperationBundleWith(diskOperationObservationReads(root), bundleManifestDigest);
+}
+
+/** {@link observeOperationBundle} over {@link OperationObservationReads}: THE ONE BODY. Any fault is uncertainty. */
+export async function observeOperationBundleWith(
+  reads: OperationObservationReads, bundleManifestDigest: string,
+): Promise<OperationBundleObservationV1> {
+  try { return await observeReadableBundle(reads, bundleManifestDigest); }
   catch { return { status: "unavailable", detail: "operation observation unavailable" }; }
 }
 
 /** Preserve inventory faults as uncertainty rather than declaring an absent effect. */
-async function observeReadableBundle(root: string, bundleManifestDigest: string): Promise<OperationBundleObservationV1> {
-  const inventory = await scanOperationInventory(root);
+async function observeReadableBundle(reads: OperationObservationReads, bundleManifestDigest: string): Promise<OperationBundleObservationV1> {
+  const inventory = await reads.scanInventory();
   if (inventory.problems.length) return { status: "unavailable", detail: "operation inventory unavailable" };
   const resolved = resolveTarget(inventory, bundleManifestDigest);
   if (resolved === null) return { status: "absent" };
-  const key = await readOperationKey(root);
+  const key = await reads.readKey();
   if (key.status !== "ok") return { status: "unavailable", detail: `operation key ${key.status}` };
   const binding: OperationRunBinding = {
     runId: resolved.runId, bundleId: resolved.bundleId, manifestDigest: resolved.manifestDigest,
     workspaceId: resolved.workspaceId, keyEpochId: key.keyEpochId,
   };
-  const read = await readOperationRun(root, binding);
+  const read = await reads.readRun(binding);
   if (read.status === "absent") return { status: "absent" };
   if (read.status !== "ok") return { status: "unavailable", detail: read.detail ?? read.status };
   // Join each durable outcome to its manifest mutation's target (both keyed by the
@@ -133,15 +169,15 @@ async function observeReadableBundle(root: string, bundleManifestDigest: string)
     target: targetById.get(String(outcome.mutationId)) ?? `mutation:${String(outcome.mutationId)}`,
   }));
   const appliedTargets = [...new Set(mutations.filter((mutation) => APPLIED_MUTATION_STATUSES.has(mutation.status)).map((mutation) => mutation.target))];
-  const pages = await observePages(root, resolved.manifest.mutations);
+  const pages = await observePages(reads, resolved.manifest.mutations);
   return { status: "observed", runState: read.run.state, applied: APPLIED_TERMINAL_STATES.has(read.run.state), mutations, appliedTargets,
     binding, predecessor: operationRunPredecessor(read.run),
     applicationStarted: !operationNeverStarted(read.run), pages };
 }
 
 /** Rehash actual confined page bytes; declarations remain the authenticated manifest's. */
-async function observePages(root: string, mutations: readonly OperationMutation[]): Promise<OperationPageObservationV1[]> {
+async function observePages(reads: OperationObservationReads, mutations: readonly OperationMutation[]): Promise<OperationPageObservationV1[]> {
   return Promise.all(mutations.filter((mutation): mutation is PageOperationMutation => mutation.kind === "page")
     .map(async mutation => ({ mutationId: mutation.mutationId, target: mutation.target,
-      precondition: mutation.precondition, postcondition: mutation.postcondition, current: await readPageDigest(root, mutation) })));
+      precondition: mutation.precondition, postcondition: mutation.postcondition, current: await reads.readPageDigest(mutation) })));
 }

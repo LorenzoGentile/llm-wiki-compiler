@@ -7,17 +7,41 @@
  * `JsonExportProfileBlock` carrying the content-bearing `EntityPage`s from the
  * shared collector. The built-in is gated through the shared
  * {@link loadNonDefaultProfile} primitive.
+ *
+ * ONE BODY, {@link buildExportProfileBlockFrom}, over the profile summary's
+ * existing sources without the event store ({@link ExportProfileSources}):
+ * the profile, the entity scans, the relation store, the endpoint pages, the
+ * artifact store's and the preparation store's leaf reads, and the real-path
+ * look. Each step is its reader's own one body over those sources, never a
+ * finished answer. `buildExportProfileBlock(root)` hands it the local disk's
+ * sources from the summary's one disk builder, built per call. Naming the
+ * sources selects no backend and rules on no mechanism; the preparation
+ * store's lifecycle read and proof stay root-bound disk authority, unchanged.
  */
 
-import { loadNonDefaultProfile, collectEntityPagesWithMessages, relationReadProblem } from "../profile/block.js";
-import { collectStandingRelationProblems } from "../profile/relation-standing.js";
-import { artifactProblemViews } from "../profile/artifact-lint.js";
+import {
+  loadNonDefaultProfileFrom, collectEntityPagesWithMessagesFrom, relationReadProblem, diskProfileSummarySources, type ProfileSummarySources,
+} from "../profile/block.js";
+import { collectStandingRelationProblemsFrom } from "../profile/relation-standing.js";
+import { artifactProblemViewsFrom } from "../profile/artifact-lint.js";
 import { toEntityPageView } from "../profile/types.js";
 import { PROFILE_BLOCK_VERSION } from "./json-export.js";
 import type { JsonExportProfileBlock, RelationView } from "./json-export.js";
 import type { EntityProblemView, LoadedProfile } from "../profile/types.js";
-import { readLiveValidRelations } from "../relations/live-valid.js";
+import { readLiveValidRelationsFrom } from "../relations/live-valid.js";
 import type { RelationRef } from "../relations/types.js";
+import type { GraphStoreReads } from "../utils/jsonl-store.js";
+
+/**
+ * Everything {@link buildExportProfileBlockFrom} reads: the profile summary's
+ * sources without the event store, which the export never reads. The
+ * effective profile is loaded FIRST and the built-in default ends the block;
+ * `profile.activeProduct.root` is the root as given, the label problem paths
+ * fall back to when the real path is unknown. The real-path look is asked
+ * once after the entity collection, ALWAYS, and once more by artifact health
+ * only when it has a finding.
+ */
+export type ExportProfileSources = Omit<ProfileSummarySources, "events">;
 
 /**
  * Map an internal {@link RelationRef} to its public, path-safe {@link RelationView}:
@@ -56,13 +80,13 @@ interface ExportRelationResult {
  * invalid) are OMITTED from this live snapshot but retained on disk; lint flags
  * them as `relation-profile-invalid`.
  */
-async function exportRelationViews(root: string, loaded: LoadedProfile): Promise<ExportRelationResult> {
+async function exportRelationViews(graph: GraphStoreReads, loaded: LoadedProfile): Promise<ExportRelationResult> {
   // Read the store even when the profile declares NO `relations` block: a
   // relation-less project's store is empty (→ `{}`, byte-identical), but
   // a project whose `relations` block was removed while records remain must
   // surface only those still valid (here: none) rather than stale ones.
   try {
-    const valid = await readLiveValidRelations(root, loaded.profile);
+    const valid = await readLiveValidRelationsFrom(graph, loaded.profile);
     return valid.length > 0 ? { relations: valid.map(toRelationView) } : {};
   } catch (error) {
     return { problem: relationReadProblem(error) }; // rethrows a non-store error
@@ -79,19 +103,34 @@ async function exportRelationViews(root: string, loaded: LoadedProfile): Promise
 export async function buildExportProfileBlock(
   root: string,
 ): Promise<JsonExportProfileBlock | undefined> {
-  const loaded = await loadNonDefaultProfile(root);
+  // `async` so that a throw while the disk sources are built REJECTS.
+  return buildExportProfileBlockFrom(diskProfileSummarySources(root));
+}
+
+/**
+ * {@link buildExportProfileBlock} over {@link ExportProfileSources}: THE ONE
+ * BODY. One step after another, never together: the profile; the entity pages
+ * with bodies, then the real-path look; the relation store; the standing
+ * check; artifact health. `loaded` is used as given by every step.
+ */
+export async function buildExportProfileBlockFrom(
+  sources: ExportProfileSources,
+): Promise<JsonExportProfileBlock | undefined> {
+  const loaded = await loadNonDefaultProfileFrom(sources.profile);
   if (loaded === undefined) return undefined;
-  const { pages, problems } = await collectEntityPagesWithMessages(root, loaded);
-  const { relations, problem } = await exportRelationViews(root, loaded);
+  const asGiven = sources.profile.activeProduct.root;
+  const realRoot = (): Promise<string | null> => sources.realRoot();
+  const { pages, problems } = await collectEntityPagesWithMessagesFrom({ scans: sources.scans, realRoot, root: asGiven }, loaded);
+  const { relations, problem } = await exportRelationViews(sources.graph, loaded);
   // Re-evaluate every page CURRENTLY in a gated lifecycle state against the live
   // relation graph (READ-ONLY, LOCK-FREE) so a precondition that has drifted since
   // write time surfaces on the export too — exactly like status/viewer. A
   // non-gated/default profile adds none, so the block stays byte-identical.
-  const standing = await collectStandingRelationProblems(root, loaded.profile);
+  const standing = await collectStandingRelationProblemsFrom(sources, loaded.profile);
   // Every hash-pinned artifactRef (page field or live relation attribute)
   // resolved against the ACTUAL bytes — same collector lint/status/viewer use,
   // reshaped path-safe. An artifact-less profile does no extra work.
-  const artifacts = await artifactProblemViews(root, pages, loaded.profile);
+  const artifacts = await artifactProblemViewsFrom(sources, pages, loaded.profile, { realRoot, asGiven });
   // Merge the fail-closed relation-store problem (if any) and the standing
   // problems alongside the entity problems so a broken/drifted store is reported
   // VISIBLY, not silently omitted. When the store is healthy/relation-less/default

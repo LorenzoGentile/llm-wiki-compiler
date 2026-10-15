@@ -83,7 +83,7 @@ import type { PreparationLifecyclePendingState } from "./recovery.js";
 import type { PreparationExecutionOwnerV1, PreparationRunV1 } from "./run-types.js";
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
 import { resolveHostReadiness } from "./service-readiness.js";
-import { resolvePreparationRun } from "./service-run-lookup.js";
+import { resolvePreparationRun, type PreparationRunLookupV1 } from "./service-run-lookup.js";
 
 /** Request for the `recovery` operation. Carries no actor, surface or grant. */
 export interface RecoveryRequestV1 {
@@ -117,6 +117,32 @@ export type RecoveryResultV1 =
   }
   | { readonly status: "refused"; readonly reason: string; readonly lifecycle: RecoveryLifecycleV1 };
 
+/**
+ * What the diagnosis asks of the project and the host. No member takes a project
+ * root. `ownerProcessIsLive` is a HOST probe of a recorded executor's liveness,
+ * not project storage, and is named here so the decision never probes ambiently.
+ */
+export interface RecoveryDiagnosisSteps {
+  /** The lifecycle maintenance state reported with every outcome. Local: `resolvePreparationLifecyclePending(root)`. */
+  readLifecyclePending(): Promise<PreparationLifecyclePendingState>;
+  /** The named run, located and authenticated. Local: `resolvePreparationRun(root, runId)`. */
+  resolveRun(runId: string): Promise<PreparationRunLookupV1>;
+  /** Whether a recorded owner's process is still running. Local: `ownerProcessIsLive`. */
+  ownerProcessIsLive(owner: PreparationExecutionOwnerV1): boolean;
+  /** The durable owner-fenced park. Local: `parkAttemptForRecoveryLocked({ root, ... })`. */
+  parkAttempt(input: Omit<Parameters<typeof parkAttemptForRecoveryLocked>[0], "root">): Promise<void>;
+}
+
+/** The local diagnosis steps for one root, built per call. In no package index. */
+function localRecoveryDiagnosisSteps(root: string): RecoveryDiagnosisSteps {
+  return {
+    readLifecyclePending: () => resolvePreparationLifecyclePending(root),
+    resolveRun: (runId) => resolvePreparationRun(root, runId),
+    ownerProcessIsLive: (owner) => ownerProcessIsLive(owner),
+    parkAttempt: (input) => parkAttemptForRecoveryLocked({ root, ...input }),
+  };
+}
+
 /** The derived park target, or why this run has none. */
 type ParkTarget =
   | { readonly ok: false; readonly reason: string }
@@ -133,7 +159,7 @@ type ParkTarget =
  * operator told "not stranded — a live executor holds it" waits, and an operator
  * told "no phase records this attempt" has a different problem entirely.
  */
-function parkTarget(run: PreparationRunV1): ParkTarget {
+function parkTarget(run: PreparationRunV1, isLive: (owner: PreparationExecutionOwnerV1) => boolean): ParkTarget {
   // THE SET IS DERIVED, and widening it is this slice's whole reason for
   // touching recovery. `running` alone left a `paused` run whose owner died with
   // NO exit by any shipped verb: the advisory custody leg subtracts owner-active
@@ -152,7 +178,7 @@ function parkTarget(run: PreparationRunV1): ParkTarget {
   }
   // LIVENESS, NOT PRESENCE. A recorded owner whose process is still running is a
   // BUSY run, not a stranded one, and clearing its fence would be damage.
-  if (ownerProcessIsLive(owner)) {
+  if (isLive(owner)) {
     return {
       ok: false,
       reason: `this run is held by a live executor (pid ${owner.pid}); it is not stranded, so it is left alone`,
@@ -164,21 +190,24 @@ function parkTarget(run: PreparationRunV1): ParkTarget {
     : { ok: true, owner, phaseInstanceId: phase.phaseInstanceId };
 }
 
-/** Diagnose and, when the run is stranded, park it. The caller holds the lock. */
-async function recoverLocked(
-  root: string, runId: string, principal: PreparationPrincipal,
+/**
+ * Diagnose and, when the run is stranded, park it: the one decision body over
+ * {@link RecoveryDiagnosisSteps}. The caller holds the lock.
+ */
+export async function recoverLockedWith(
+  steps: RecoveryDiagnosisSteps, runId: string, principal: PreparationPrincipal,
 ): Promise<RecoveryResultV1> {
-  const lifecycle = await resolvePreparationLifecyclePending(root);
-  const resolved = await resolvePreparationRun(root, runId);
+  const lifecycle = await steps.readLifecyclePending();
+  const resolved = await steps.resolveRun(runId);
   if (!resolved.ok) return { status: "refused", reason: resolved.reason, lifecycle };
   // ALREADY THERE IS NOT A FAILURE. `recovery-required` is the state this
   // operation drives to, so a second call reports the same outcome honestly
   // rather than refusing an idempotent retry.
   if (resolved.run.state === "recovery-required") return { status: "already-parked", runId, lifecycle };
-  const target = parkTarget(resolved.run);
+  const target = parkTarget(resolved.run, (owner) => steps.ownerProcessIsLive(owner));
   if (!target.ok) return { status: "refused", reason: target.reason, lifecycle };
-  await parkAttemptForRecoveryLocked({
-    root, binding: resolved.binding, run: resolved.run, phaseInstanceId: target.phaseInstanceId,
+  await steps.parkAttempt({
+    binding: resolved.binding, run: resolved.run, phaseInstanceId: target.phaseInstanceId,
     attemptId: target.owner.attemptId, leaseNonce: target.owner.leaseNonce,
     principal: preparationRunActor(principal), at: new Date().toISOString(),
   });
@@ -222,7 +251,7 @@ export async function recoverPreparationOperation(
   // what the declared `refused` arm is for.
   if (!acquired) return { status: "refused", reason: "project lock is busy", lifecycle: null };
   try {
-    return await recoverLocked(root, runId, principal);
+    return await recoverLockedWith(localRecoveryDiagnosisSteps(root), runId, principal);
   } finally {
     await releaseLock(root);
   }

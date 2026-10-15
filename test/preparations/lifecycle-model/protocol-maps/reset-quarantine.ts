@@ -177,7 +177,7 @@ export const RESET_QUARANTINE_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-R11", "reset",
     "A healthy active key at rerun is trusted ONLY when it byte-matches this unit's staged pending key, authenticated under the secret; any other key refuses rather than quarantining live authority",
-    [at("assessResetKey", "src/preparations/reset.ts"), at("readAuthenticatedPendingKey", "src/preparations/reset.ts"), at("verifyPendingResetKey", "src/preparations/receipts.ts")],
+    [at("assessResetKey", "src/preparations/reset.ts"), at("readAuthenticatedPendingKeyFrom", "src/preparations/reset.ts"), at("verifyPendingResetKey", "src/preparations/receipts.ts")],
     // note: verifyPendingResetKey
     "authorize",
     "none — refusal",
@@ -189,7 +189,7 @@ export const RESET_QUARANTINE_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-R12", "reset",
     "KNOWN GAP: a crash after the mint with the continuation token lost leaves the unit holding both crash leaves while the key is healthy — every exit refuses and staging throws",
-    [at("materializeResetKey", "src/preparations/reset.ts")],
+    [at("materializeResetKeyWith", "src/preparations/reset.ts")],
     // note: its publish leg, with the token unavailable
     "apply/resume",
     "none — the state is already durable; no step can advance it",
@@ -202,7 +202,7 @@ export const RESET_QUARANTINE_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-R13", "reset",
     "The forced flow moves the unreadable key leaf into unit custody byte-for-byte BEFORE minting, or fails closed; only a PROVED absence means a prior attempt already moved it",
-    [at("moveOldKeyIntoUnit", "src/preparations/reset.ts"), at("moveOldPreparationKey", "src/preparations/lifecycle-fs/reset-operations.ts")],
+    [at("moveOldKeyIntoUnitWith", "src/preparations/reset.ts"), at("moveOldPreparationKey", "src/preparations/lifecycle-fs/reset-operations.ts")],
     "apply/resume",
     "renames the key leaf to bytes/old-key; fsyncs both parents",
     "key present but unreadable",
@@ -213,7 +213,7 @@ export const RESET_QUARANTINE_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-R14", "reset",
     "The fresh key MATERIAL is staged unit-bound and HMAC-authenticated under the continuation secret BEFORE it is ever published, so a crash leaves the exact key recoverable",
-    [at("stagePendingResetKey", "src/preparations/reset.ts"), at("signPendingResetKey", "src/preparations/receipts.ts"), at("writeResetUnitLeaf", "src/preparations/lifecycle-fs/reset-operations.ts")],
+    [at("stagePendingResetKeyWith", "src/preparations/reset.ts"), at("signPendingResetKey", "src/preparations/receipts.ts"), at("writeResetUnitLeaf", "src/preparations/lifecycle-fs/reset-operations.ts")],
     // note: signPendingResetKey; writeResetUnitLeaf(pending-key)
     "plan",
     "writes pending-reset-key.json create-only, mode 0600 — PLAINTEXT key bytes",
@@ -225,7 +225,7 @@ export const RESET_QUARANTINE_PROTOCOL_MAP: readonly ProtocolMapRowV1[] = [
 
   mapRow("PLA-MAP-R15", "reset",
     "The staged key is published to the active slot create-only; a collision is tolerated ONLY when the installed key is this exact staged key",
-    [at("publishActiveResetKey", "src/preparations/reset.ts"), at("publishActivePreparationKey", "src/preparations/lifecycle-fs/reset-operations.ts")],
+    [at("publishActiveResetKeyWith", "src/preparations/reset.ts"), at("publishActivePreparationKey", "src/preparations/lifecycle-fs/reset-operations.ts")],
     "apply/resume",
     "writes the active key leaf create-only, mode 0600",
     "key absent",

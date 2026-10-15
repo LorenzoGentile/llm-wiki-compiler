@@ -5,13 +5,24 @@
  * recovery state. Read-only: it never acquires the lock or mutates a byte, and
  * always exits 0 on a successful inspection (problems are shown, not signalled
  * via the exit code).
+ *
+ * ONE BODY. {@link operationListCommandWith} decides over
+ * {@link OperationListSteps}, none of which takes a project root: the inventory,
+ * the recovery state, then the key epoch (no key makes every row
+ * `integrity-key-unavailable`) and each manifest's run (absent is `run-absent`).
+ * They are the target-resolution reads plus the recovery state, so the
+ * composition reuses {@link targetRunReadsOver}.
  */
 
 import * as output from "../../utils/output.js";
-import { resolveOperationRecoveryState } from "../../operation-bundles/lock-gate.js";
+import {
+  resolveOperationRecoveryState, resolveOperationRecoveryStateFrom, type OperationRecoveryReadState, type OperationRecoveryReads,
+} from "../../operation-bundles/lock-gate.js";
 import type { OperationRunState } from "../../operation-bundles/run-types.js";
 import type { OperationBundleManifest, OperationDigest } from "../../operation-bundles/types.js";
-import { loadOperationInventory, readKeyEpoch, readRunForTarget, resolvedFromManifest } from "./resolve.js";
+import {
+  loadOperationInventory, readKeyEpoch, readRunForTarget, resolvedFromManifest, targetRunReadsOver, type TargetRunReads,
+} from "./resolve.js";
 import { emitJson } from "./render.js";
 
 /** CLI options for `operation list`. */
@@ -29,13 +40,36 @@ interface OperationRow {
   detail: string | null;
 }
 
+/** What `operation list` asks of the project: the target-resolution reads plus the recovery state. No member takes a project root. */
+export interface OperationListSteps extends TargetRunReads {
+  /** The whole-workspace recovery state. */
+  recoveryState(): Promise<OperationRecoveryReadState>;
+}
+
+/** LOCAL DISK. The incumbent inventory, key, run and recovery reads for `root`, each called when asked. */
+function diskOperationListSteps(root: string): OperationListSteps {
+  return {
+    inventory: () => loadOperationInventory(root),
+    recoveryState: () => resolveOperationRecoveryState(root),
+    keyEpoch: () => readKeyEpoch(root),
+    run: (resolved, keyEpochId) => readRunForTarget(root, resolved, keyEpochId),
+  };
+}
+
+/** The reads over their own bodies: the target-resolution leaves and the recovery reads. Building it does no I/O. */
+export function operationListStepsOver(
+  leaves: Parameters<typeof targetRunReadsOver>[0], recovery: OperationRecoveryReads,
+): OperationListSteps {
+  return { ...targetRunReadsOver(leaves), recoveryState: () => resolveOperationRecoveryStateFrom(recovery) };
+}
+
 /** Build one row by reading the manifest's run leaf under the key epoch. */
 async function buildRow(
-  root: string,
+  steps: OperationListSteps,
   manifest: OperationBundleManifest,
   keyEpochId: OperationDigest,
 ): Promise<OperationRow> {
-  const read = await readRunForTarget(root, resolvedFromManifest(manifest), keyEpochId);
+  const read = await steps.run(resolvedFromManifest(manifest), keyEpochId);
   const base = { workspaceId: manifest.workspaceId, bundleId: manifest.bundleId, runId: manifest.runId };
   if (read.status === "ok") return { ...base, state: read.run.state, detail: null };
   if (read.status === "absent") return { ...base, state: null, detail: "run-absent" };
@@ -43,10 +77,10 @@ async function buildRow(
 }
 
 /** Read every manifest's run row (or an empty list when no key epoch is present). */
-async function collectRows(root: string, manifests: readonly OperationBundleManifest[]): Promise<OperationRow[]> {
-  const keyEpochId = await readKeyEpoch(root);
+async function collectRows(steps: OperationListSteps, manifests: readonly OperationBundleManifest[]): Promise<OperationRow[]> {
+  const keyEpochId = await steps.keyEpoch();
   if (keyEpochId === null) return manifests.map((manifest) => ({ workspaceId: manifest.workspaceId, bundleId: manifest.bundleId, runId: manifest.runId, state: null, detail: "integrity-key-unavailable" }));
-  return Promise.all(manifests.map((manifest) => buildRow(root, manifest, keyEpochId)));
+  return Promise.all(manifests.map((manifest) => buildRow(steps, manifest, keyEpochId)));
 }
 
 /** Render one bundle/run row. */
@@ -75,11 +109,16 @@ function renderHuman(recoveryState: string, rows: readonly OperationRow[], probl
  * @returns Exit code 0 (a successful inspection always exits 0).
  */
 export async function operationListCommand(root: string, options: OperationListOptions = {}): Promise<number> {
+  return operationListCommandWith(diskOperationListSteps(root), options);
+}
+
+/** {@link operationListCommand} over {@link OperationListSteps}: THE ONE BODY. */
+export async function operationListCommandWith(steps: OperationListSteps, options: OperationListOptions = {}): Promise<number> {
   if (options.json) output.setQuiet(true);
   try {
-    const inventory = await loadOperationInventory(root);
-    const recoveryState = await resolveOperationRecoveryState(root);
-    const rows = await collectRows(root, inventory.manifests);
+    const inventory = await steps.inventory();
+    const recoveryState = await steps.recoveryState();
+    const rows = await collectRows(steps, inventory.manifests);
     if (options.json) {
       emitJson({ recoveryState, inventoryProblems: inventory.problems.length, bundles: rows });
     } else {

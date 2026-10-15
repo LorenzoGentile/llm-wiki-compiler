@@ -19,24 +19,48 @@
  *     stale/orphaned counts (one state read + one hash pass over sources/)
  *   - `countCandidates` for the pending-reviews count
  *   - selected source discovery for the source-file count and read allowlist
+ *
+ * Disk access: {@link buildViewerSnapshot} builds a private local-disk
+ * {@link ViewerSnapshotSources} from the project root and runs the one body,
+ * {@link buildViewerSnapshotFrom}. EIGHT of the nine inputs are read through
+ * what the sources bind (pages, compile state, the pending count, the source
+ * entries, the index file, source freshness, the journal warning and typed
+ * pages). The ninth, the profile summary, is read through sources too. Its
+ * artifact health resolves refs over the artifact store's leaf reads and
+ * verifies provenance over the preparation store's leaf reads, whose
+ * lifecycle authority still reads a project root on disk. That is not nine of
+ * nine. See the type.
  */
 
-import { realpath } from "fs/promises";
+import { locationRealPath } from "../storage/disk-locations.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import { diskLocalRecordDirs } from "../storage/disk-local-record-dirs.js";
+import { diskLocalRecords } from "../storage/disk-local-records.js";
+import type { LegacyLocalEntityScans, LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import type { LegacyLocalRecordDirs } from "../storage/legacy-local-record-dirs.js";
+import type { LegacyLocalRecords } from "../storage/legacy-local-records.js";
 import path from "path";
-import { listSelectedSourceEntries } from "../sources/scan.js";
-import { countCandidates } from "../compiler/candidates.js";
-import { readStateClassified, isPlainObject } from "../utils/state.js";
+import { listSelectedSourceEntriesFrom } from "../sources/scan.js";
+import { countCandidatesFrom } from "../compiler/candidate-read.js";
+import { readStateClassifiedFrom, isPlainObject } from "../utils/state.js";
 import { readCappedNoFollow } from "../utils/confined-read.js";
 import type { ClassifiedState } from "../utils/state.js";
-import { collectViewerPages, decorateEntityPages, resolveBareSlugList } from "./collect.js";
+import { collectViewerPagesFrom, decorateEntityPages, resolveBareSlugList } from "./collect.js";
 import { extractWikilinkSlugs } from "../wiki/collect.js";
 import { isMalformedCitationEntry, splitCitationMarker } from "../utils/markdown.js";
 import { buildGraphData } from "./graph.js";
 import { pageTimestamp } from "./page-fields.js";
-import { buildFreshnessSnapshot, computeFreshness } from "../freshness/index.js";
-import { collectProfileSummary } from "../profile/block.js";
-import { journalHealthWarning } from "../trust/journal-health-warning.js";
-import { collectTypedViewerInputs } from "./typed-pages.js";
+import { buildFreshnessSnapshotFrom, computeFreshness, diskSourceFreshnessSources } from "../freshness/index.js";
+import type { SourceFreshnessSources } from "../freshness/index.js";
+import { collectProfileSummaryFrom, diskProfileSummarySources, type ProfileSummarySources } from "../profile/block.js";
+import type { EntityPageReads } from "../profile/lifecycle-read.js";
+import type { EventReadSources } from "../events/store-read.js";
+import { diskJournalReadSources } from "../trust/journal-classify.js";
+import type { JournalReadSources } from "../trust/journal-classify.js";
+import { journalHealthWarningFrom } from "../trust/journal-health-warning.js";
+import { collectTypedViewerInputsFrom } from "./typed-pages.js";
+import type { EffectiveProfileSources } from "../profile/load.js";
+import type { GraphStoreReads } from "../utils/jsonl-store.js";
 import { attachEntityContexts } from "./entity-context.js";
 import type { FreshnessSnapshot } from "../freshness/types.js";
 import { UNRESOLVED_CITATION_CODE } from "./types.js";
@@ -55,23 +79,134 @@ const RECENT_PAGES_LIMIT = 8;
 const INDEX_HREF = "/#/index";
 
 /**
+ * Everything {@link buildViewerSnapshotFrom} reads: the display root, and
+ * `bindings`.
+ *
+ * `bindings` are what is bound here: four storage bindings, and narrow
+ * capabilities owned by their consumers (the index file's, declared here;
+ * source freshness's, declared by freshness; the journal's, declared by the
+ * journal classifier; the effective profile's, declared by the profile loader,
+ * with the graph-store read; and for the profile summary the event store's,
+ * the entity-page read, the root's real path, the artifact store's leaf reads
+ * and the preparation store's leaf reads). Typed pages and the summary
+ * scan through the same `scans` the default pages use, and load the profile
+ * through the same `profile`. So a snapshot resolves the profile twice,
+ * exactly as it always read it twice, and reads the relation store more than
+ * once; this type does not make any two reads agree, and a snapshot built from
+ * it is NOT thereby profile-consistent.
+ * `artifacts` is the artifact store's leaf reads, which the summary's
+ * artifact health hands to the resolver; `provenance` is the preparation
+ * store's leaf reads, which it hands to the provenance verifier. STILL
+ * DISK-ONLY UNDERNEATH: the lifecycle read and its proof, carried in
+ * `provenance`, are the real capture and check for the root.
+ * NOTHING TIES ANY TWO BINDINGS TO ONE PROJECT. A caller could pass bindings
+ * for two different projects and nothing here would notice; production never
+ * does, because it builds everything from one root. This is not
+ * `ProjectStore`, not a hosted or access-control contract, and it selects no
+ * backend.
+ */
+export interface ViewerSnapshotSources {
+  /** The root as the caller holds it. DISPLAY ONLY: the snapshot's `root` and its project header. */
+  root: string;
+  /** What is bound: four storage bindings, then the index file, source freshness, the journal, typed pages, and the profile summary's own reads. */
+  bindings: {
+    /** Default pages: `wiki/concepts`, then `wiki/queries`. */
+    scans: LegacyLocalEntityScans;
+    /** The compile state record. */
+    records: LegacyLocalRecords;
+    /** The pending review queue, counted through the tolerant list. */
+    candidateDirs: LegacyLocalRecordDirs;
+    /** Source entries, and the project configuration that selects them. */
+    reads: LegacyLocalReads;
+    /**
+     * The text of `wiki/index.md`, or `null` when nothing is at exactly its
+     * expected place (the index, or `wiki`, is a link). REJECTS with the raw
+     * error when resolving or reading fails, a missing index included. Called once.
+     */
+    readIndexText(): Promise<string | null>;
+    /** Where the sources the compile state names are found and read; the body runs the real freshness over it. */
+    freshness: SourceFreshnessSources;
+    /** Where the project's journal is found; the body runs the real health read and warning mapping over it. */
+    journal: JournalReadSources;
+    /** The effective profile, for typed pages and again for the profile summary: the body runs the real loader over it, once for each. */
+    profile: EffectiveProfileSources;
+    /** The relation store, for typed pages' edges and for the summary, through the graph-store read. */
+    graph: GraphStoreReads;
+    /** The event store and its head anchor, for the summary's event count. */
+    events: EventReadSources;
+    /** One confined page per distinct relation endpoint, for the summary's standing check. */
+    pages: EntityPageReads;
+    /** What a pinned artifact ref resolves to, for the summary's artifact health. Asked only for a non-default profile that declares artifact types. */
+    artifacts: ProfileSummarySources["artifacts"];
+    /** The preparation store's leaf reads, for whether a run vouches for a gated page's pinned artifact, in the same check. */
+    provenance: ProfileSummarySources["provenance"];
+    /** The project root's real path, or `null`: the summary relativises problem paths against it. Asked last. */
+    realRoot(): Promise<string | null>;
+  };
+}
+
+/**
  * Build the immutable startup snapshot for a project root. Reads pages,
  * counts, source state, candidates, and the optional `wiki/index.md`
  * exactly once and returns a fully populated `ViewerSnapshot`. Callers
  * must NOT re-derive any of these from disk on a per-request path —
  * `readLintCache` in `src/viewer/health.ts` is the sole exception.
  */
-export async function buildViewerSnapshot(root: string): Promise<ViewerSnapshot> {
+export function buildViewerSnapshot(root: string): Promise<ViewerSnapshot> {
+  return buildViewerSnapshotFrom(diskViewerSnapshotSources(root));
+}
+
+/**
+ * LOCAL DISK. The sources for the project at `root`. Building them does no
+ * I/O. Everything the profile summary reads comes from THE ONE summary
+ * builder, artifact health's two store reads included, so the snapshot and
+ * `collectProfileSummary(root)` are wired by the same code.
+ */
+function diskViewerSnapshotSources(root: string): ViewerSnapshotSources {
+  const summary = diskProfileSummarySources(root);
+  return {
+    root,
+    bindings: {
+      scans: summary.scans,
+      records: diskLocalRecords(root),
+      candidateDirs: diskLocalRecordDirs(root),
+      reads: diskLocalReads(root),
+      readIndexText: () => readDiskIndexText(root),
+      freshness: diskSourceFreshnessSources(root),
+      journal: diskJournalReadSources(root),
+      profile: summary.profile,
+      graph: summary.graph,
+      events: summary.events,
+      pages: summary.pages,
+      artifacts: summary.artifacts,
+      provenance: summary.provenance,
+      realRoot: summary.realRoot,
+    },
+  };
+}
+
+/**
+ * {@link buildViewerSnapshot} over {@link ViewerSnapshotSources}. The six first
+ * reads START TOGETHER, in this order: pages, compile state, pending count,
+ * source entries, the index file, typed inputs. Then, one after another:
+ * freshness (the real one, over the bound sources, given the classified state),
+ * the journal warning (the real one, over the bound journal), the profile
+ * summary (the real one, over the bound sources). The index read is the one input
+ * with a failure meaning of its own (see {@link readIndex}); nothing else is
+ * caught here, and a rejection from any other input rejects the build.
+ */
+export async function buildViewerSnapshotFrom(sources: ViewerSnapshotSources): Promise<ViewerSnapshot> {
+  const { root, bindings } = sources;
   const [defaultPages, classified, pendingReviews, sourceFilenames, index, typed] =
     await Promise.all([
-      collectViewerPages(root),
-      readStateClassified(root),
-      countCandidates(root),
-      listSelectedSourceEntries(root),
-      readIndexFile(root),
-      collectTypedViewerInputs(root),
+      collectViewerPagesFrom(bindings.scans),
+      readStateClassifiedFrom(bindings.records),
+      countCandidatesFrom(bindings.candidateDirs),
+      listSelectedSourceEntriesFrom(bindings.reads),
+      readIndex(bindings),
+      collectTypedViewerInputsFrom({ profile: bindings.profile, scans: bindings.scans, graph: bindings.graph }),
     ]);
-  const freshnessSnapshot = await buildFreshnessSnapshot(root, classified);
+  const freshnessSnapshot = await buildFreshnessSnapshotFrom(bindings.freshness, classified);
   const decorate = buildPageDecorator(sourceFilenames, freshnessSnapshot);
   const annotatedDefault = defaultPages.map(decorate);
   const annotatedTyped = decorateEntityPages(typed?.pages ?? [], defaultPages).map(decorate);
@@ -79,8 +214,11 @@ export async function buildViewerSnapshot(root: string): Promise<ViewerSnapshot>
   // Surface a pending/unavailable compile journal so the viewer never renders
   // partial post-crash or tampered state as silently healthy. ABSENT when the
   // journal is ok, so the default snapshot is byte-identical (parity-safe).
-  const journalWarning = await journalHealthWarning(root);
-  const profile = await collectProfileSummary(root);
+  const journalWarning = await journalHealthWarningFrom(bindings.journal);
+  const profile = await collectProfileSummaryFrom({
+    profile: bindings.profile, scans: bindings.scans, graph: bindings.graph, events: bindings.events, pages: bindings.pages,
+    artifacts: bindings.artifacts, provenance: bindings.provenance, realRoot: () => bindings.realRoot(),
+  });
   return {
     root,
     generatedAt: new Date().toISOString(),
@@ -259,9 +397,25 @@ function buildProject(root: string): ViewerProject {
 }
 
 /**
- * Read `wiki/index.md` if present. Missing index is not an error: many
- * projects compile without an index page, and the viewer renders an
- * "index unavailable" placeholder for the `/#/index` route.
+ * The index file as the snapshot carries it. Missing index is not an error:
+ * many projects compile without an index page, and the viewer renders an
+ * "index unavailable" placeholder for the `/#/index` route. So `null` and ANY
+ * rejection from the reader mean the same thing here: unavailable, empty body.
+ */
+async function readIndex(source: { readIndexText(): Promise<string | null> }): Promise<{ available: boolean; body: string }> {
+  try {
+    const body = await source.readIndexText();
+    return body === null ? { available: false, body: "" } : { available: true, body };
+  } catch {
+    return { available: false, body: "" };
+  }
+}
+
+/**
+ * LOCAL DISK. Read `wiki/index.md` under `root`: resolve the root, resolve the
+ * index, require the resolved path to be the expected one, then read it once.
+ * `null` when it is not exactly in place or the read is not `ok`; rejects raw
+ * when a resolve fails.
  *
  * Stricter than "stays under project root": `realpath(wiki/index.md)`
  * must equal the literal canonical path `<root>/wiki/index.md`. A
@@ -277,26 +431,13 @@ function buildProject(root: string): ViewerProject {
  * while the viewer runs: a stuck read would stall every later refresh.
  * The index has no size limit of its own, hence the infinite cap.
  */
-async function readIndexFile(root: string): Promise<{ available: boolean; body: string }> {
-  let canonicalRoot: string;
-  try {
-    canonicalRoot = await realpath(root);
-  } catch {
-    return { available: false, body: "" };
-  }
+async function readDiskIndexText(root: string): Promise<string | null> {
+  const canonicalRoot = await locationRealPath(root);
   const expectedIndex = path.join(canonicalRoot, "wiki", "index.md");
-  let resolved: string;
-  try {
-    resolved = await realpath(expectedIndex);
-  } catch {
-    return { available: false, body: "" };
-  }
-  if (resolved !== expectedIndex) {
-    return { available: false, body: "" };
-  }
+  const resolved = await locationRealPath(expectedIndex);
+  if (resolved !== expectedIndex) return null;
   const read = await readCappedNoFollow(resolved, Number.POSITIVE_INFINITY);
-  if (read.kind !== "ok") return { available: false, body: "" };
-  return { available: true, body: read.body };
+  return read.kind === "ok" ? read.body : null;
 }
 
 /**

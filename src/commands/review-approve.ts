@@ -21,11 +21,27 @@
  * re-running `approve` (idempotent) or a `refresh` (which re-derives the index,
  * MOC, embeddings, and source state). The whole operation is NOT a single atomic
  * transaction; only the page write is.
+ *
+ * ONE BODY, EXPLICIT COLLABORATORS. {@link approveUnderLockWith} is the body of
+ * the under-lock approval. It is handed {@link ReviewApproveSteps}, each a whole
+ * DOMAIN step of its own owner, none a storage port: the custody-aware candidate
+ * re-read, the target precondition, the candidate-store access check, the
+ * publication/answer check and the typed promotion are AUTHORITY collaborators
+ * that stay root-bound; the planner, the executor, the review tail and the
+ * candidate deletion are the write collaborators. The root
+ * {@link reviewApproveCommand} path passes {@link localReviewApproveSteps}, which
+ * call the incumbents at call time with exactly their old arguments, so every
+ * module spy and mock on them still intercepts. The body keeps every decision:
+ * the order read → connector pin → target → store access → publication → typed
+ * or default write → tail → delete, every refusal message and `process.exitCode`,
+ * the default-page validation, the answer-plan check, and deletion ONLY after
+ * the tail succeeded. The lock and its recovery gate stay with
+ * `runReviewUnderLock`, outside this body.
  */
 
 import path from "path";
 import { validateWikiPage } from "../utils/markdown.js";
-import { planPageMutation, type PagePlannedMutation } from "../trust/planner.js";
+import { planPageMutation, type PagePlannedMutation, type PlanPageInput, type PlanResult } from "../trust/planner.js";
 import { applyApprovedMutationsLocked } from "../trust/executor.js";
 import {
   applyTypedCandidate,
@@ -64,6 +80,41 @@ export interface ReviewApproveOptions {
   draftContentHash?: string;
 }
 
+/** The collaborators one under-lock approval composes; none is storage. */
+export interface ReviewApproveSteps {
+  /** AUTHORITY. The custody-aware re-read; reports and returns null when gone. Local: `readCandidateUnderLock(root, id)`. */
+  readCandidate(root: string, id: string): Promise<ReviewCandidate | null>;
+  /** AUTHORITY. Local: `targetUnchangedSincePropose(root, candidate)`. */
+  targetUnchanged(root: string, candidate: ReviewCandidate): Promise<boolean>;
+  /** AUTHORITY. Throws when the candidate store is unavailable or ambiguous. Local: `assertCandidateMutationAccess(root, false)`. */
+  assertMutationAccess(root: string): Promise<void>;
+  /** AUTHORITY. Reports its own refusal. Local: `checkCandidatePublication(root, candidate)`. */
+  checkPublication(root: string, candidate: ReviewCandidate): Promise<boolean>;
+  /** AUTHORITY + write. Local: `applyTypedCandidate(root, candidate)`. */
+  applyTyped(root: string, candidate: ReviewCandidate): Promise<string>;
+  /** The planner. Local: `planPageMutation(input)`. */
+  plan(input: PlanPageInput): Promise<PlanResult>;
+  /** The held-lock executor. Local: `applyApprovedMutationsLocked(root, planned)`. */
+  applyPlanned(root: string, planned: PagePlannedMutation[]): Promise<unknown>;
+  /** The review tail. Local: `finalizeReviewApprovals(root, candidates)`. */
+  finalize(root: string, candidates: ReviewCandidate[]): Promise<void>;
+  /** Candidate deletion with custody. Local: `deleteCandidate(root, id)`. */
+  deleteCandidate(root: string, id: string): Promise<unknown>;
+}
+
+/** LOCAL. The incumbent collaborators, called at call time with their old arguments; frozen. In no package index. */
+const localReviewApproveSteps: ReviewApproveSteps = Object.freeze({
+  readCandidate: (root: string, id: string) => readCandidateUnderLock(root, id),
+  targetUnchanged: (root: string, candidate: ReviewCandidate) => targetUnchangedSincePropose(root, candidate),
+  assertMutationAccess: (root: string) => assertCandidateMutationAccess(root, false),
+  checkPublication: (root: string, candidate: ReviewCandidate) => checkCandidatePublication(root, candidate),
+  applyTyped: (root: string, candidate: ReviewCandidate) => applyTypedCandidate(root, candidate),
+  plan: (input: PlanPageInput) => planPageMutation(input),
+  applyPlanned: (root: string, planned: PagePlannedMutation[]) => applyApprovedMutationsLocked(root, planned),
+  finalize: (root: string, candidates: ReviewCandidate[]) => finalizeReviewApprovals(root, candidates),
+  deleteCandidate: (root: string, id: string) => deleteCandidate(root, id),
+});
+
 /** Approve a pending candidate by promoting its body into wiki/concepts/. */
 export default async function reviewApproveCommand(
   id: string,
@@ -89,7 +140,17 @@ async function approveUnderLock(
   id: string,
   options: ReviewApproveOptions,
 ): Promise<void> {
-  const candidate = await readCandidateUnderLock(root, id);
+  return approveUnderLockWith(localReviewApproveSteps, root, id, options);
+}
+
+/** THE ONE BODY of the under-lock approval, over the collaborators it is handed. The caller holds the lock. */
+export async function approveUnderLockWith(
+  steps: ReviewApproveSteps,
+  root: string,
+  id: string,
+  options: ReviewApproveOptions,
+): Promise<void> {
+  const candidate = await steps.readCandidate(root, id);
   if (!candidate) return;
   if (!connectorPinMatches(candidate, options.draftContentHash)) {
     output.status(
@@ -102,27 +163,27 @@ async function approveUnderLock(
     process.exitCode = 1;
     return;
   }
-  if (!(await targetUnchangedSincePropose(root, candidate))) {
+  if (!(await steps.targetUnchanged(root, candidate))) {
     output.status("!", output.error(staleTargetRefusal(candidate)));
     process.exitCode = 1;
     return;
   }
-  if (!(await candidateNamespacesPermitApproval(root, id))) return;
+  if (!(await candidateNamespacesPermitApproval(steps, root, id))) return;
 
-  if (!await checkCandidatePublication(root, candidate)) return;
-  const pagePath = await routeApprovedPageWrite(root, candidate, id);
+  if (!await steps.checkPublication(root, candidate)) return;
+  const pagePath = await routeApprovedPageWrite(steps, root, candidate, id);
   if (!pagePath) return;
   output.status("+", output.success(`Approved → ${output.source(pagePath)}`));
 
-  await finalizeReviewApprovals(root, [candidate]);
-  await deleteCandidate(root, id);
+  await steps.finalize(root, [candidate]);
+  await steps.deleteCandidate(root, id);
   output.status("✓", output.dim(`Candidate ${id} cleared.`));
 }
 
 /** Refuse an unavailable or ambiguous review store before the first live effect. */
-async function candidateNamespacesPermitApproval(root: string, id: string): Promise<boolean> {
+async function candidateNamespacesPermitApproval(steps: ReviewApproveSteps, root: string, id: string): Promise<boolean> {
   try {
-    await assertCandidateMutationAccess(root, false);
+    await steps.assertMutationAccess(root);
     return true;
   } catch (error) {
     if (!(error instanceof CandidateCustodyUnavailableError) &&
@@ -168,14 +229,15 @@ export function connectorPinMatches(candidate: ReviewCandidate, supplied: string
  * ALREADY-HELD review lock (no nested-lock deadlock).
  */
 async function routeApprovedPageWrite(
+  steps: ReviewApproveSteps,
   root: string,
   candidate: ReviewCandidate,
   id: string,
 ): Promise<string | null> {
   if (candidate.targetEntityType) {
-    return routeTypedPageWrite(root, candidate, id);
+    return routeTypedPageWrite(steps, root, candidate, id);
   }
-  return routeDefaultPageWrite(root, candidate, id);
+  return routeDefaultPageWrite(steps, root, candidate, id);
 }
 
 /**
@@ -188,12 +250,13 @@ async function routeApprovedPageWrite(
  * `wiki/<entityType>/<slug>.md` path on success.
  */
 async function routeTypedPageWrite(
+  steps: ReviewApproveSteps,
   root: string,
   candidate: ReviewCandidate,
   id: string,
 ): Promise<string | null> {
   try {
-    const relPath = await applyTypedCandidate(root, candidate);
+    const relPath = await steps.applyTyped(root, candidate);
     noteTypedReadIntegration(relPath);
     return path.join(root, relPath);
   } catch (err) {
@@ -258,6 +321,7 @@ function noteTypedReadIntegration(relPath: string): void {
  * `null` on a failed validation / blocked plan.
  */
 async function routeDefaultPageWrite(
+  steps: ReviewApproveSteps,
   root: string,
   candidate: ReviewCandidate,
   id: string,
@@ -267,14 +331,14 @@ async function routeDefaultPageWrite(
     process.exitCode = 1;
     return null;
   }
-  const planned = await planDefaultCandidateWrite(root, candidate);
+  const { planned } = await steps.plan(defaultCandidatePlanInput(root, candidate));
   if (planned.length === 0) {
     output.status("!", output.error(`Candidate ${id} blocked by the write planner; not approved.`));
     process.exitCode = 1;
     return null;
   }
   if (!checkAnswerPlan(candidate, planned)) return null;
-  await applyApprovedMutationsLocked(root, planned);
+  await steps.applyPlanned(root, planned);
   const dir = candidate.targetDirectory === "queries" ? QUERIES_DIR : CONCEPTS_DIR;
   return path.join(root, dir, `${candidate.slug}.md`);
 }
@@ -284,14 +348,19 @@ export async function planDefaultCandidateWrite(
   root: string,
   candidate: ReviewCandidate,
 ): Promise<PagePlannedMutation[]> {
+  const { planned } = await planPageMutation(defaultCandidatePlanInput(root, candidate));
+  return planned;
+}
+
+/** The planner input for a default candidate: one definition for both review commands. */
+function defaultCandidatePlanInput(root: string, candidate: ReviewCandidate): PlanPageInput {
   const directory = candidate.targetDirectory === "queries" ? "queries" : "concepts";
-  const { planned } = await planPageMutation({
+  return {
     root,
     target: { kind: "raw", directory, slug: candidate.slug },
     body: candidate.body,
     origin: "review",
     reviewRouted: false,
     allowOverwrite: true,
-  });
-  return planned;
+  };
 }

@@ -30,10 +30,21 @@
  * All blocks emit a STABLE `code` so downstream routing/telemetry can key on the
  * specific floor that was hit. None of these blocks request `quarantine` —
  * quarantine is reserved for untrusted-content isolation, a separate concern.
+ *
+ * STORAGE. The two path-bound checks have ONE BODY each,
+ * {@link checkPathConfinementFrom} and {@link checkTargetCollisionFrom}, over
+ * the raw target probes ({@link PageTargetProbes}); the floor runs them through
+ * {@link runMandatoryPageChecksFrom}. The exported checks, the public
+ * {@link mandatoryPageChecks} array and {@link runMandatoryPageChecks} are the
+ * root forms over the local disk's probes ({@link diskPageTargetProbes}). What
+ * a probe failure MEANS (a confinement failure blocks, an existence fault reads
+ * as free), the messages and the order stay in the bodies; the probes are the
+ * incumbent disk primitives and decide nothing. They are not `ProjectStore`,
+ * not a hosted or access-controlled store, and not public API.
  */
 
 import path from "path";
-import { lstat } from "fs/promises";
+import { leafPresent } from "../storage/disk-guarded-leaves.js";
 import { confineUnderRoot } from "../utils/path-confine.js";
 import { parseFrontmatterStatus } from "../utils/markdown.js";
 import { MAX_SOURCE_CHARS, GENERATED_PAGE_MAX_CHARS } from "../utils/constants.js";
@@ -98,6 +109,27 @@ export interface PageWriteContext {
 /** A single mandatory check over a page mutation. */
 export type MandatoryPageCheck = (ctx: PageWriteContext) => Promise<TrustCheckResult>;
 
+/**
+ * The raw physical probes of a page target: one existing disk primitive each.
+ * Neither decides anything; the caller decides what a rejection means.
+ */
+export interface PageTargetProbes {
+  /**
+   * The target confined under `root`, as an absolute native path, WITHOUT
+   * requiring it to exist. REJECTS when it, or a linked ancestor, escapes.
+   * Disk: `confineUnderRoot(targetPath, root, { mustExist: false })`.
+   */
+  confineTarget(targetPath: string, root: string): Promise<string>;
+  /** Whether `name` is present in `dir`, a final link NOT followed. REJECTS raw. Disk: `leafPresent(dir, name)`. */
+  leafPresent(dir: string, name: string): Promise<boolean>;
+}
+
+/** LOCAL DISK. The incumbent confinement and presence primitives; no state, frozen. In no package index. */
+export const diskPageTargetProbes: PageTargetProbes = Object.freeze({
+  confineTarget: (targetPath: string, root: string) => confineUnderRoot(targetPath, root, { mustExist: false }),
+  leafPresent: (dir: string, name: string) => leafPresent(dir, name),
+});
+
 /** Helper: build a passing result for a named check. */
 function pass(code: string, message: string): TrustCheckResult {
   return { code, verdict: "pass", message };
@@ -108,15 +140,18 @@ function pass(code: string, message: string): TrustCheckResult {
  * ancestor. Delegates to {@link confineUnderRoot} (with `mustExist:false`, since
  * the page file itself may not exist yet) and treats a throw as the escape.
  */
-export const checkPathConfinement: MandatoryPageCheck = async (ctx) => {
+export const checkPathConfinement: MandatoryPageCheck = async (ctx) => checkPathConfinementFrom(diskPageTargetProbes, ctx);
+
+/** {@link checkPathConfinement} over `probes`: THE ONE BODY. Any confinement rejection is the escape. */
+async function checkPathConfinementFrom(probes: PageTargetProbes, ctx: PageWriteContext): Promise<TrustCheckResult> {
   const code = "path-escape";
   try {
-    await confineUnderRoot(ctx.targetPath, ctx.root, { mustExist: false });
+    await probes.confineTarget(ctx.targetPath, ctx.root);
     return pass(code, "target path stays within the project root");
   } catch {
     return { code, verdict: "block", message: `target path escapes the project root: ${ctx.targetPath}` };
   }
-};
+}
 
 /**
  * Block when the confined target already exists AND the caller declared no
@@ -126,22 +161,29 @@ export const checkPathConfinement: MandatoryPageCheck = async (ctx) => {
  * escapes root is blocked here (a non-confinable target is not a safe write
  * destination).
  */
-export const checkTargetCollision: MandatoryPageCheck = async (ctx) => {
+export const checkTargetCollision: MandatoryPageCheck = async (ctx) => checkTargetCollisionFrom(diskPageTargetProbes, ctx);
+
+/**
+ * {@link checkTargetCollision} over `probes`: THE ONE BODY. A confinement
+ * rejection blocks; a presence fault reads as free; the confined native path is
+ * split here, as before, into its parent and leaf name for the presence probe.
+ */
+async function checkTargetCollisionFrom(probes: PageTargetProbes, ctx: PageWriteContext): Promise<TrustCheckResult> {
   const code = "target-exists";
   let abs: string;
   try {
-    abs = await confineUnderRoot(ctx.targetPath, ctx.root, { mustExist: false });
+    abs = await probes.confineTarget(ctx.targetPath, ctx.root);
   } catch {
     return { code, verdict: "block", message: `target path escapes the project root: ${ctx.targetPath}` };
   }
   try {
-    await lstat(abs);
+    if (!(await probes.leafPresent(path.dirname(abs), path.basename(abs)))) return pass(code, "target path is free");
   } catch {
     return pass(code, "target path is free");
   }
   if (ctx.allowOverwrite) return pass(code, `target exists; intended overwrite (update): ${path.basename(abs)}`);
   return { code, verdict: "block", message: `target already exists (create-only): ${path.basename(abs)}` };
-};
+}
 
 /**
  * Block a body whose character length exceeds its applicable content cap.
@@ -211,6 +253,9 @@ export const checkFrontmatter: MandatoryPageCheck = async (ctx) => {
 /**
  * The four Invariant-3 mandatory checks, in evaluation order. A profile may
  * append checks elsewhere, but this array is the floor — it is never filtered.
+ * It is the ONE registration of the floor: both {@link runMandatoryPageChecks}
+ * and {@link runMandatoryPageChecksFrom} execute exactly these entries, in this
+ * order, through {@link mandatoryPageChecksFrom}.
  */
 export const mandatoryPageChecks: readonly MandatoryPageCheck[] = [
   checkPathConfinement,
@@ -218,6 +263,25 @@ export const mandatoryPageChecks: readonly MandatoryPageCheck[] = [
   checkResourceLimit,
   checkFrontmatter,
 ];
+
+/**
+ * The probe-bound form of each registered check that asks the target probes,
+ * keyed by its root form's identity. A registered check absent here asks no
+ * probe and runs unchanged.
+ */
+const PROBE_BOUND_CHECKS: ReadonlyMap<MandatoryPageCheck, (probes: PageTargetProbes) => MandatoryPageCheck> = new Map([
+  [checkPathConfinement, (probes: PageTargetProbes): MandatoryPageCheck => (ctx) => checkPathConfinementFrom(probes, ctx)],
+  [checkTargetCollision, (probes: PageTargetProbes): MandatoryPageCheck => (ctx) => checkTargetCollisionFrom(probes, ctx)],
+]);
+
+/**
+ * {@link mandatoryPageChecks}, entry for entry and in the same order, with each
+ * probe-asking check bound to `probes`. Derived from the one registration, so
+ * nothing can be added, removed or reordered here.
+ */
+export function mandatoryPageChecksFrom(probes: PageTargetProbes): readonly MandatoryPageCheck[] {
+  return mandatoryPageChecks.map((check) => PROBE_BOUND_CHECKS.get(check)?.(probes) ?? check);
+}
 
 /**
  * Run EVERY mandatory check over the proposed page mutation and return one
@@ -231,5 +295,19 @@ export const mandatoryPageChecks: readonly MandatoryPageCheck[] = [
  * @returns One {@link TrustCheckResult} per mandatory check.
  */
 export async function runMandatoryPageChecks(ctx: PageWriteContext): Promise<TrustCheckResult[]> {
-  return Promise.all(mandatoryPageChecks.map((check) => check(ctx)));
+  return runMandatoryPageChecksFrom(diskPageTargetProbes, ctx);
+}
+
+/**
+ * {@link runMandatoryPageChecks} over `probes`: THE ONE BODY. Every check is
+ * started in registration order through `Promise.all`, and the results keep that
+ * order. No check rejects, since each maps its own probe failures to a verdict.
+ * Like the root form it takes no profile, predicate or skip parameter.
+ *
+ * @param probes - The raw target probes the two path-bound checks ask.
+ * @param ctx - The proposed page-write context.
+ * @returns One {@link TrustCheckResult} per mandatory check.
+ */
+export async function runMandatoryPageChecksFrom(probes: PageTargetProbes, ctx: PageWriteContext): Promise<TrustCheckResult[]> {
+  return Promise.all(mandatoryPageChecksFrom(probes).map((check) => check(ctx)));
 }

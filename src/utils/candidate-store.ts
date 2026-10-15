@@ -3,15 +3,18 @@
  *
  * Both the concept review queue (`compiler/candidates.ts`) and the rule
  * candidate queue (`compiler/rule-candidates.ts`) persist one JSON file per
- * candidate under a directory, list those files, and move rejected records
- * into an archive subdirectory. These two operations were identical across the
- * queues; extracting them here removes the duplication while keeping each
- * queue's own id/shape logic local to its module.
+ * candidate under a directory and list those files through the functions
+ * here. The archive move below is used by the rule queue only
+ * (`archiveRuleCandidate`); the concept queue archives rejected records
+ * through its custody-guarded move instead. Each queue's own id/shape logic
+ * stays local to its module.
  */
 
-import { readdir, rename, unlink, writeFile, mkdir } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
+import { makeDirectoryTree, removeLeaf, renameLeafUnguarded } from "../storage/disk-guarded-leaves.js";
+import { locationExistsSync, overwriteLocationText } from "../storage/disk-locations.js";
+import { diskRecordDirectory } from "../storage/disk-local-record-dirs.js";
+import type { LocalRecordDirectory } from "../storage/legacy-local-record-dirs.js";
 import { safeReadFile } from "./markdown.js";
 
 /** Extension used for all candidate JSON files. */
@@ -37,12 +40,21 @@ export function candidateFileId(candidateId: string): string {
  * empty list when the directory does not exist.
  * @param dir - Absolute path to the candidate directory.
  */
-export async function listCandidateFileIds(dir: string): Promise<string[]> {
-  if (!existsSync(dir)) return [];
-  const entries = await readdir(dir, { withFileTypes: true });
+export function listCandidateFileIds(dir: string): Promise<string[]> {
+  return listCandidateFileIdsFrom(diskRecordDirectory(dir));
+}
+
+/**
+ * {@link listCandidateFileIds} for a directory that is already resolved, with
+ * the existence check and the listing made through `directory`. Ids come back
+ * in the backend's listing order; no caller-visible sort happens here.
+ */
+export async function listCandidateFileIdsFrom(directory: LocalRecordDirectory): Promise<string[]> {
+  if (!(await directory.exists())) return [];
+  const entries = await directory.listEntries();
   const ids: string[] = [];
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(CANDIDATE_JSON_EXT)) continue;
+    if (entry.kind !== "file" || !entry.name.endsWith(CANDIDATE_JSON_EXT)) continue;
     ids.push(entry.name.slice(0, -CANDIDATE_JSON_EXT.length));
   }
   return ids;
@@ -50,8 +62,10 @@ export async function listCandidateFileIds(dir: string): Promise<string[]> {
 
 /**
  * Move a candidate JSON file into an archive location, creating the archive
- * directory if needed. Falls back to copy + unlink when `rename` fails across
- * filesystems. Returns false when the source file does not exist.
+ * directory if needed. Falls back to copy + unlink when `rename` fails for ANY
+ * reason, not only across filesystems; a source that cannot be read in that
+ * fallback is archived as an empty file. Returns false when the source file
+ * does not exist.
  * @param sourcePath - Absolute path of the pending candidate file.
  * @param targetPath - Absolute archive destination path.
  */
@@ -59,14 +73,14 @@ export async function moveCandidateToArchive(
   sourcePath: string,
   targetPath: string,
 ): Promise<boolean> {
-  if (!existsSync(sourcePath)) return false;
-  await mkdir(path.dirname(targetPath), { recursive: true });
+  if (!locationExistsSync(sourcePath)) return false;
+  await makeDirectoryTree(path.dirname(targetPath));
   try {
-    await rename(sourcePath, targetPath);
+    await renameLeafUnguarded(sourcePath, targetPath);
   } catch {
     const raw = await safeReadFile(sourcePath);
-    await writeFile(targetPath, raw, "utf-8");
-    await unlink(sourcePath);
+    await overwriteLocationText(targetPath, raw);
+    await removeLeaf(sourcePath);
   }
   return true;
 }

@@ -15,10 +15,18 @@
  * Candidate reads are race-tolerant: this collector delegates to
  * `countCandidates`, which skips malformed/partial candidate JSON the
  * same way `review list` does.
+ *
+ * Disk access: {@link collectProjectState} builds local-disk
+ * {@link ProjectStateSources} from the root (`./state-sources.ts`, which
+ * holds the seam and its one disk implementation) and runs the one body,
+ * {@link collectProjectStateFrom}. Every decision (what a failed probe means,
+ * what counts as a page, how the lint cache is parsed, both staleness
+ * comparisons, warning order) is in that body; the sources only look.
  */
 
-import { stat, readdir, readFile } from "fs/promises";
-import path from "path";
+import type { LegacyLocalRecordDirs } from "../storage/legacy-local-record-dirs.js";
+import { diskProjectStateSources } from "./state-sources.js";
+import type { ProjectStateProbes, ProjectStateSources } from "./state-sources.js";
 import {
   SOURCES_DIR,
   CONCEPTS_DIR,
@@ -27,15 +35,16 @@ import {
   LAST_LINT_FILE,
   INDEX_FILE,
 } from "../utils/constants.js";
-import { countCandidates } from "../compiler/candidates.js";
-import { listSelectedSourceFiles } from "../sources/scan.js";
+import { countCandidatesFrom } from "../compiler/candidate-read.js";
+import { listSelectedSourceFilesFrom } from "../sources/scan.js";
 import { LINT_CACHE_TIMESTAMP_PATTERN } from "../linter/cache.js";
 import type { LintCacheEntry } from "../linter/cache.js";
-import { readStateClassified } from "../utils/state.js";
+import { readStateClassifiedFrom } from "../utils/state.js";
 import type { StateStatus } from "../utils/state.js";
 
 /** Markdown extension treated as a wiki page for counting purposes. */
 const MARKDOWN_EXT = ".md";
+const WIKI_DIR = "wiki";
 
 /** Warning codes the v1 collector may emit. Pinned by tests. */
 type ProjectStateWarningCode =
@@ -87,15 +96,27 @@ export interface ProjectState {
  * Returns a `project-unreadable` warning when the root itself cannot be
  * stat-ed; callers escalate that to the `broken-project` primary state.
  */
-export async function collectProjectState(root: string): Promise<ProjectState> {
-  const rootReadable = await isDirectory(root);
+export function collectProjectState(root: string): Promise<ProjectState> {
+  return collectProjectStateFrom(diskProjectStateSources(root));
+}
+
+/**
+ * {@link collectProjectState} over {@link ProjectStateSources}: THE ONE BODY.
+ * The root is looked at first; if it is not a directory nothing else is read.
+ * Then, in order: presence, counts, the lint cache, the two times, the compile
+ * state's status. A failed look is a quiet `false`, `0` or `null`. The source
+ * listing is the exception: its rejection rejects the collector.
+ */
+export async function collectProjectStateFrom(sources: ProjectStateSources): Promise<ProjectState> {
+  const { root, probes } = sources;
+  const rootReadable = (await probes.probeRoot())?.isDirectory ?? false;
   if (!rootReadable) return brokenProjectState(root);
-  const dirs = await collectDirPresence(root);
-  const counts = await collectPageCounts(root, dirs);
-  const lint = await collectLintCacheStatus(root);
-  const mtimes = await collectMtimes(root, dirs);
+  const dirs = await collectDirPresence(probes);
+  const counts = await collectPageCounts(sources, dirs);
+  const lint = await collectLintCacheStatus(probes);
+  const mtimes = await collectMtimes(probes, dirs);
   // Read-only; never writes a .bak file — safe for the cheap orientation command.
-  const stateStatus = (await readStateClassified(root)).status;
+  const stateStatus = (await readStateClassifiedFrom(sources.records)).status;
   return assembleState({ root, dirs, counts, lint, mtimes, stateStatus });
 }
 
@@ -146,50 +167,49 @@ interface MtimePair {
 }
 
 /** Probe the three structural directories without listing their contents. */
-async function collectDirPresence(root: string): Promise<DirPresence> {
+async function collectDirPresence(probes: ProjectStateProbes): Promise<DirPresence> {
   const [hasSourcesDir, hasWikiDir, hasInternalDir] = await Promise.all([
-    isDirectory(path.join(root, SOURCES_DIR)),
-    isDirectory(path.join(root, "wiki")),
-    isDirectory(path.join(root, LLMWIKI_DIR)),
+    isDirectory(probes, SOURCES_DIR),
+    isDirectory(probes, WIKI_DIR),
+    isDirectory(probes, LLMWIKI_DIR),
   ]);
   return { hasSourcesDir, hasWikiDir, hasInternalDir };
 }
 
 /** Compute page counts plus the wiki/index.md presence flag. */
-async function collectPageCounts(root: string, dirs: DirPresence): Promise<PageCounts> {
+async function collectPageCounts(from: ProjectStateSources, dirs: DirPresence): Promise<PageCounts> {
   const [sources, conceptCount, queryCount, pendingCandidates, hasIndex] = await Promise.all([
-    listSelectedSourceFiles(root),
-    dirs.hasWikiDir ? countMarkdownFiles(path.join(root, CONCEPTS_DIR)) : 0,
-    dirs.hasWikiDir ? countMarkdownFiles(path.join(root, QUERIES_DIR)) : 0,
-    dirs.hasInternalDir ? safeCountCandidates(root) : 0,
-    dirs.hasWikiDir ? isFile(path.join(root, INDEX_FILE)) : false,
+    listSelectedSourceFilesFrom(from.reads),
+    dirs.hasWikiDir ? countMarkdownFiles(from.probes, CONCEPTS_DIR) : 0,
+    dirs.hasWikiDir ? countMarkdownFiles(from.probes, QUERIES_DIR) : 0,
+    dirs.hasInternalDir ? safeCountCandidates(from.candidateDirs) : 0,
+    dirs.hasWikiDir ? isFile(from.probes, INDEX_FILE) : false,
   ]);
   return { sourceCount: sources.length, conceptCount, queryCount, pendingCandidates, hasIndex };
 }
 
 /** Read directory mtimes only when the directories exist; absent dirs report null. */
-async function collectMtimes(root: string, dirs: DirPresence): Promise<MtimePair> {
+async function collectMtimes(probes: ProjectStateProbes, dirs: DirPresence): Promise<MtimePair> {
   const [latestWikiMtimeMs, latestSourceMtimeMs] = await Promise.all([
-    dirs.hasWikiDir ? safeMtime(path.join(root, "wiki")) : Promise.resolve(null),
-    dirs.hasSourcesDir ? safeMtime(path.join(root, SOURCES_DIR)) : Promise.resolve(null),
+    dirs.hasWikiDir ? safeMtime(probes, WIKI_DIR) : Promise.resolve(null),
+    dirs.hasSourcesDir ? safeMtime(probes, SOURCES_DIR) : Promise.resolve(null),
   ]);
   return { latestWikiMtimeMs, latestSourceMtimeMs };
 }
 
 /** Read and validate the lint cache, distinguishing missing from corrupt. */
-async function collectLintCacheStatus(root: string): Promise<LintCacheStatus> {
-  const cachePath = path.join(root, LAST_LINT_FILE);
-  const exists = await isFile(cachePath);
+async function collectLintCacheStatus(probes: ProjectStateProbes): Promise<LintCacheStatus> {
+  const exists = await isFile(probes, LAST_LINT_FILE);
   if (!exists) return { present: false, entry: null };
-  const entry = await readLintCacheEntry(cachePath);
+  const entry = await readLintCacheEntry(probes);
   return { present: true, entry };
 }
 
 /** Strict parse + validate, returning null for any unreadable/corrupt cache file. */
-async function readLintCacheEntry(cachePath: string): Promise<LintCacheEntry | null> {
+async function readLintCacheEntry(probes: ProjectStateProbes): Promise<LintCacheEntry | null> {
   let raw: string;
   try {
-    raw = await readFile(cachePath, "utf-8");
+    raw = await probes.readText(LAST_LINT_FILE);
   } catch {
     return null;
   }
@@ -382,43 +402,28 @@ function isLintCacheStale(entry: LintCacheEntry, latestWikiMtimeMs: number | nul
   return latestWikiMtimeMs > lintMs;
 }
 
-/** True when `target` is a directory; false for missing paths or any other type. */
-async function isDirectory(target: string): Promise<boolean> {
-  try {
-    const stats = await stat(target);
-    return stats.isDirectory();
-  } catch {
-    return false;
-  }
+/** True when the place is a directory; false for a failed look or any other type. ONE look. */
+async function isDirectory(probes: ProjectStateProbes, relPath: string): Promise<boolean> {
+  return (await probes.probe(relPath))?.isDirectory ?? false;
 }
 
-/** True when `target` is a regular file; false for missing paths or directories. */
-async function isFile(target: string): Promise<boolean> {
-  try {
-    const stats = await stat(target);
-    return stats.isFile();
-  } catch {
-    return false;
-  }
+/** True when the place is a regular file; false for a failed look or a directory. ONE look. */
+async function isFile(probes: ProjectStateProbes, relPath: string): Promise<boolean> {
+  return (await probes.probe(relPath))?.isFile ?? false;
 }
 
-/** Directory mtime in ms epoch, or null when the directory cannot be stat-ed. */
-async function safeMtime(target: string): Promise<number | null> {
-  try {
-    const stats = await stat(target);
-    return stats.mtimeMs;
-  } catch {
-    return null;
-  }
+/** The directory's own modification time in ms epoch, or null when the look fails. ONE look. */
+async function safeMtime(probes: ProjectStateProbes, relPath: string): Promise<number | null> {
+  return (await probes.probe(relPath))?.modifiedMs ?? null;
 }
 
 /** Count `.md` files in a directory; 0 for missing dirs or any other error. */
-async function countMarkdownFiles(dir: string): Promise<number> {
+async function countMarkdownFiles(probes: ProjectStateProbes, relDir: string): Promise<number> {
   try {
-    const entries = await readdir(dir, { withFileTypes: true });
+    const entries = await probes.listEntries(relDir);
     let count = 0;
     for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith(MARKDOWN_EXT)) count += 1;
+      if (entry.isFile && entry.name.endsWith(MARKDOWN_EXT)) count += 1;
     }
     return count;
   } catch {
@@ -426,10 +431,10 @@ async function countMarkdownFiles(dir: string): Promise<number> {
   }
 }
 
-/** Race-tolerant candidate count; defers to `countCandidates` and swallows IO errors. */
-async function safeCountCandidates(root: string): Promise<number> {
+/** Race-tolerant candidate count; defers to `countCandidatesFrom` and swallows IO errors. */
+async function safeCountCandidates(dirs: LegacyLocalRecordDirs): Promise<number> {
   try {
-    return await countCandidates(root);
+    return await countCandidatesFrom(dirs);
   } catch {
     return 0;
   }

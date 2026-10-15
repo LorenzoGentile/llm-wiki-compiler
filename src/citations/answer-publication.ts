@@ -61,8 +61,18 @@ function projectPublishedQuery(index: AnswerCitationIndex, slug: string, meta: R
 export async function validateCitationPublication(
   root: string, document: string, mode: CitationPublicationMode, targetSlug: string,
 ): Promise<AnswerCitationReport> {
+  return validateCitationPublicationWith(() => collectAnswerCitationIndex(root), document, mode, targetSlug);
+}
+
+/**
+ * {@link validateCitationPublication} over any way of collecting the fresh index:
+ * THE ONE BODY. The document is parsed before the index is collected, as always.
+ */
+export async function validateCitationPublicationWith(
+  collectIndex: () => Promise<AnswerCitationIndex>, document: string, mode: CitationPublicationMode, targetSlug: string,
+): Promise<AnswerCitationReport> {
   const { meta, body } = parseFrontmatter(document);
-  const index = projectPublishedQuery(await collectAnswerCitationIndex(root), targetSlug, meta);
+  const index = projectPublishedQuery(await collectIndex(), targetSlug, meta);
   const report = classifyAnswerCitations(body, index);
   assertCitationPublication(report, mode);
   return report;

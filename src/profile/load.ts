@@ -28,23 +28,31 @@
  * `O_NOFOLLOW` so a symlinked `.llmwiki` dir OR a symlinked `profile.json` leaf
  * FAILS CLOSED (never reads out-of-tree bytes). An `fstat`-based size cap guards
  * against reading a multi-GB or `/dev/zero`-backed target before `JSON.parse`.
+ * The open, the size check, the read and the close are one local-disk storage
+ * read (`readLeafTextNoFollowCapped`); what each outcome MEANS is decided here.
+ *
+ * ONE BODY: {@link loadProfile} runs {@link loadProfileFrom} over local-disk
+ * {@link EffectiveProfileSources}. Mode precedence, "missing is the default",
+ * "present but broken is an error", every error class and message and the
+ * logical `loadedFrom` are decided in this file; the sources only look. Nothing
+ * is remembered between calls: every call reads again.
  *
  * ACYCLIC RULE: this module imports `products/binding`, never the reverse. The
  * binding resolver loads the knowledge-profile member and validates it directly
  * via `validateProfile`/`profileDigest`; it must never call back into `loadProfile`.
  */
 
-import { constants as fsConstants } from "node:fs";
-import { openFileNoFollow } from "../utils/no-follow-open.js";
-import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { readLeafTextNoFollowCapped, type CappedTextNoFollowRead } from "../storage/disk-handle-leaves.js";
 import { PROFILE_FILE, MAX_PROFILE_BYTES } from "../utils/constants.js";
-import { resolveExistingConfinedPrivateDir, PrivateDirConfinementError } from "../utils/private-dir.js";
+import { PrivateDirConfinementError } from "../utils/private-dir.js";
 import { DEFAULT_PROFILE } from "./default.js";
 import { validateProfile } from "./validate.js";
 import { profileDigest } from "./digest.js";
 import type { LoadedProfile } from "./types.js";
-import { resolveActiveProduct } from "../products/binding/resolve.js";
+import {
+  diskActiveProductSources, resolveActiveProductFrom, type ActiveProductSources,
+} from "../products/binding/resolve.js";
 import { ActiveProductUnavailableError, ProductAuthorityConflictError } from "../products/binding/problems.js";
 
 /** Error raised when a present profile file cannot be loaded or validated. */
@@ -53,6 +61,35 @@ export class ProfileLoadError extends Error {
     super(message);
     this.name = "ProfileLoadError";
   }
+}
+
+/**
+ * Everything {@link loadProfileFrom} reads. OWNED BY THE PROFILE LOADER: a narrow
+ * seam with one disk implementation; not `ProjectStore`, not a hosted or
+ * access-control contract, and it selects no backend.
+ */
+export interface EffectiveProfileSources {
+  /**
+   * The active-product sources, resolved FIRST. Their `root` is also the one
+   * origin of the legacy `loadedFrom` path, and their `binding.resolvePrivateDir`
+   * is the private-directory look the legacy loader uses.
+   */
+  activeProduct: ActiveProductSources;
+  /**
+   * One leaf of a resolved private directory, opened WITHOUT following a link
+   * and read as text only when within `maxBytes`. A failed open is a VALUE
+   * carrying the raw error; a leaf over the cap is a value and is never read; a
+   * failed read REJECTS raw.
+   */
+  readPrivateLeafText(dir: string, name: string, maxBytes: number): Promise<CappedTextNoFollowRead>;
+}
+
+/** LOCAL DISK. The sources for the project at `root`. Building them does no I/O. In no package index. */
+export function diskEffectiveProfileSources(root: string): EffectiveProfileSources {
+  return {
+    activeProduct: diskActiveProductSources(root),
+    readPrivateLeafText: (dir, name, maxBytes) => readLeafTextNoFollowCapped(path.join(dir, name), maxBytes),
+  };
 }
 
 /** The LoadedProfile for the built-in default profile (no source file). */
@@ -65,20 +102,17 @@ function defaultLoadedProfile(): LoadedProfile {
 }
 
 /**
- * Open `profile.json` with `O_NOFOLLOW` so a symlinked leaf fails the `open`
- * call with `ELOOP` — never reading out-of-tree bytes. Returns `null` when
- * absent (ENOENT → caller yields default). Throws `ProfileLoadError` on
- * symlink (`ELOOP`) or any other unexpected open error.
+ * Decide what a FAILED no-follow open of `profile.json` means. The storage read
+ * opens the leaf with `O_NOFOLLOW`, so a symlinked leaf fails the `open` call
+ * with `ELOOP` — never reading out-of-tree bytes — and hands the raw open error
+ * back here. Returns (absent) only for ENOENT → caller yields default. Throws
+ * `ProfileLoadError` on symlink (`ELOOP`) or any other unexpected open error.
  */
-async function openProfileNoFollow(filePath: string): Promise<FileHandle | null> {
-  try {
-    return await openFileNoFollow(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return null;
-    if (code === "ELOOP") throw new ProfileLoadError(`${PROFILE_FILE} is a symlink — refusing to follow`);
-    throw new ProfileLoadError(`Failed to read ${PROFILE_FILE}: ${describe(err)}`);
-  }
+function assertProfileOpenFailureIsAbsence(err: unknown): void {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") return;
+  if (code === "ELOOP") throw new ProfileLoadError(`${PROFILE_FILE} is a symlink — refusing to follow`);
+  throw new ProfileLoadError(`Failed to read ${PROFILE_FILE}: ${describe(err)}`);
 }
 
 /**
@@ -86,9 +120,9 @@ async function openProfileNoFollow(filePath: string): Promise<FileHandle | null>
  * {@link ProfileLoadError} — the pre-existing read-path confinement contract. A
  * clean project (no `.llmwiki`) resolves to `null` WITHOUT creating the directory.
  */
-async function resolveConfinedProfileDir(root: string): Promise<string | null> {
+async function resolveConfinedProfileDir(sources: EffectiveProfileSources): Promise<string | null> {
   try {
-    return await resolveExistingConfinedPrivateDir(root);
+    return await sources.activeProduct.binding.resolvePrivateDir();
   } catch (err) {
     if (err instanceof PrivateDirConfinementError) {
       throw new ProfileLoadError(`${PROFILE_FILE} directory is a symlink — refusing to follow`);
@@ -108,28 +142,23 @@ async function resolveConfinedProfileDir(root: string): Promise<string | null> {
  * @returns The resolved, validated legacy profile with its source path and digest.
  * @throws {ProfileLoadError} When a present file is unparseable, invalid, or confined.
  */
-async function loadLegacyProfile(root: string): Promise<LoadedProfile> {
-  const dir = await resolveConfinedProfileDir(root);
+async function loadLegacyProfile(sources: EffectiveProfileSources): Promise<LoadedProfile> {
+  const dir = await resolveConfinedProfileDir(sources);
   // Absent .llmwiki dir means no profile file — yield the built-in default without
   // creating the directory (read-only contract: a clean project stays clean).
   if (dir === null) return defaultLoadedProfile();
   // Use the realpath-resolved confined path for the open (confinement) but keep the
   // original logical path for `loadedFrom` so callers see a stable, user-facing path.
-  const confinedFilePath = path.join(dir, path.basename(PROFILE_FILE));
-  const logicalFilePath = path.join(root, PROFILE_FILE);
-  const handle = await openProfileNoFollow(confinedFilePath);
-  if (handle === null) return defaultLoadedProfile();
-  let raw: string;
-  try {
-    const size = (await handle.stat()).size;
-    if (size > MAX_PROFILE_BYTES) {
-      throw new ProfileLoadError(`${PROFILE_FILE} is ${size} bytes — exceeds the ${MAX_PROFILE_BYTES}-byte cap`);
-    }
-    raw = await handle.readFile("utf-8");
-  } finally {
-    await handle.close();
+  const logicalFilePath = path.join(sources.activeProduct.root, PROFILE_FILE);
+  const read = await sources.readPrivateLeafText(dir, path.basename(PROFILE_FILE), MAX_PROFILE_BYTES);
+  if (read.kind === "not-opened") {
+    assertProfileOpenFailureIsAbsence(read.error);
+    return defaultLoadedProfile();
   }
-  const parsed = parseOrThrow(raw, logicalFilePath);
+  if (read.kind === "oversize") {
+    throw new ProfileLoadError(`${PROFILE_FILE} is ${read.size} bytes — exceeds the ${MAX_PROFILE_BYTES}-byte cap`);
+  }
+  const parsed = parseOrThrow(read.text, logicalFilePath);
   const { profile } = validateProfile(parsed);
   return { profile, loadedFrom: logicalFilePath, digest: profileDigest(profile) };
 }
@@ -141,8 +170,8 @@ async function loadLegacyProfile(root: string): Promise<LoadedProfile> {
  * error. When the dir resolves cleanly (or is absent) this returns and the caller
  * raises the binding-specific {@link ActiveProductUnavailableError}.
  */
-async function assertPrivateDirNotConfinementFault(root: string): Promise<void> {
-  await resolveConfinedProfileDir(root);
+async function assertPrivateDirNotConfinementFault(sources: EffectiveProfileSources): Promise<void> {
+  await resolveConfinedProfileDir(sources);
 }
 
 /**
@@ -165,11 +194,22 @@ async function assertPrivateDirNotConfinementFault(root: string): Promise<void> 
  * @throws {ProfileLoadError} When the legacy `profile.json` is present but broken/confined.
  */
 export async function loadProfile(root: string): Promise<LoadedProfile> {
-  const resolution = await resolveActiveProduct(root);
-  if (resolution.mode === "legacy") return loadLegacyProfile(root);
+  // `async` so that a throw while the disk sources are built REJECTS, as this function always did.
+  return loadProfileFrom(diskEffectiveProfileSources(root));
+}
+
+/**
+ * {@link loadProfile} over {@link EffectiveProfileSources}: THE ONE BODY. The
+ * product is resolved first; the four modes are mapped exactly as documented
+ * above; an unavailable binding re-resolves the private directory BEFORE it
+ * throws, so a confinement fault there outranks it. It NEVER falls back.
+ */
+export async function loadProfileFrom(sources: EffectiveProfileSources): Promise<LoadedProfile> {
+  const resolution = await resolveActiveProductFrom(sources.activeProduct);
+  if (resolution.mode === "legacy") return loadLegacyProfile(sources);
   if (resolution.mode === "product") return resolution.loaded;
   if (resolution.mode === "conflict") throw new ProductAuthorityConflictError();
-  await assertPrivateDirNotConfinementFault(root);
+  await assertPrivateDirNotConfinementFault(sources);
   throw new ActiveProductUnavailableError(resolution.detail);
 }
 

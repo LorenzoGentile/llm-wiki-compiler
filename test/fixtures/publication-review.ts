@@ -1,6 +1,12 @@
 /**
  * Offline publication/approval fixtures use real candidate files and planner
  * writes, replacing only embedding refresh. Documents retain canonical bytes.
+ *
+ * BOTH embedding cores are replaced, each where its caller reaches it: a direct
+ * `query --save` calls the ROOT `updateEmbeddingsLockedCore`, while approval's
+ * refresh calls the core's body `updateEmbeddingsLockedCoreFrom` with bound
+ * sources. Each spy resolves without calling through, so neither path reaches
+ * the other and no call is counted twice.
  */
 import { afterEach, beforeEach, expect, vi } from "vitest";
 import { readFile, writeFile } from "node:fs/promises";
@@ -22,6 +28,7 @@ export function usePublicationRoot() {
     process.exitCode = 0;
     await stageCitationWorkspace(root.dir);
     vi.spyOn(embeddings, "updateEmbeddingsLockedCore").mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
+    vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom").mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
   afterEach(() => { process.exitCode = 0; });

@@ -18,6 +18,12 @@
  * or adapters. A present legacy `profile.json` is refused up front so activation
  * never manufactures a product-authority conflict (design section 8.2 migration
  * ordering); deep corpus-migration planning is deferred to a later slice.
+ *
+ * ONE BODY: {@link activateUnderLockWith} keeps steps (1)-(8) and every refusal
+ * over {@link ProductActivationSteps}. {@link activateProductLocked} keeps its
+ * signature, snapshots the principal and options BEFORE awaiting the lock, and
+ * passes {@link localProductActivationSteps}, whose members call the incumbent
+ * package, member, profile, binding and resolution functions when asked.
  */
 
 import { acquireMutationLockBlocking } from "../../operation-bundles/lock-gate.js";
@@ -28,7 +34,8 @@ import {
   MAX_COMPOSITION_LOCK_BYTES, MAX_KNOWLEDGE_PROFILE_BYTES, MAX_ROOT_OPERATIONS_PACK_BYTES,
 } from "../constants.js";
 import { readInstalledProductPackage } from "../packages/store.js";
-import type { ProductPackageManifestV1, Sha256Digest } from "../types.js";
+import type { PackageMemberRefV1, ProductPackageManifestV1, Sha256Digest } from "../types.js";
+import type { LoadedProfile } from "../../profile/types.js";
 import { assessStructuralCompatibility } from "../compatibility.js";
 import type { StructuralCompatibilityInputsV1 } from "../compatibility.js";
 import {
@@ -72,6 +79,35 @@ function packContractInputs(pack: WorkspaceOperationsPackV2): PackContractInputs
   };
 }
 
+/** What activation asks of the project, under the caller's lock. No member takes a project root. */
+export interface ProductActivationSteps {
+  /** The exact installed package, read offline. */
+  readInstalledPackage(packageDigest: Sha256Digest): ReturnType<typeof readInstalledProductPackage>;
+  /** Whether a legacy `profile.json` is present beside the binding. */
+  profileJsonPresent(): Promise<boolean>;
+  /** One installed member's text, strictly decoded within `maxBytes`; rejects on any fault. */
+  readMemberText(packageDigest: Sha256Digest, member: PackageMemberRefV1, maxBytes: number): Promise<string>;
+  /** Load the knowledge-profile member text as the installed member it is; rejects when unloadable. */
+  loadKnowledgeProfile(packageDigest: Sha256Digest, memberDigest: Sha256Digest, text: string): LoadedProfile;
+  /** Durably write the new binding (the fault seams pass through). */
+  writeBinding(binding: ActiveProductBindingV1, faults?: ActiveBindingWriteFaultsV1): Promise<void>;
+  /** A fresh resolution of the active product. */
+  resolveActive(): ReturnType<typeof resolveActiveProduct>;
+}
+
+/** LOCAL DISK: the incumbent functions for one root, built per call, each called when asked. In no package index. */
+export function localProductActivationSteps(root: string): ProductActivationSteps {
+  return {
+    readInstalledPackage: (packageDigest) => readInstalledProductPackage(root, packageDigest),
+    profileJsonPresent: () => profileJsonPresent(root),
+    readMemberText: (packageDigest, member, maxBytes) => readStoredMemberText(root, packageDigest, member, maxBytes),
+    loadKnowledgeProfile: (packageDigest, memberDigest, text) =>
+      loadKnowledgeProfileMember(text, knowledgeProfileMemberPath(root, packageDigest, memberDigest)),
+    writeBinding: (binding, faults) => writeActiveProductBinding(root, binding, faults),
+    resolveActive: () => resolveActiveProduct(root),
+  };
+}
+
 /** The contract-pin inputs a pack that fails to parse reduces to: nothing recognized. */
 const UNRECOGNIZED_CONTRACT_INPUTS: PackContractInputs = {
   packSchemaVersion: UNSUPPORTED_SCHEMA,
@@ -106,27 +142,26 @@ export interface ActivateResultV1 {
 
 /** Resolve the exact installed package offline, or refuse structurally. */
 async function resolveInstalledManifest(
-  root: string, packageDigest: Sha256Digest,
+  steps: ProductActivationSteps, packageDigest: Sha256Digest,
 ): Promise<ProductPackageManifestV1> {
-  const pkg = await readInstalledProductPackage(root, packageDigest);
+  const pkg = await steps.readInstalledPackage(packageDigest);
   if (pkg.status !== "ok") throw new ProductActivationError(`installed package is ${pkg.status}`);
   return pkg.manifest;
 }
 
 /** Refuse activation while a legacy profile.json would create a conflict. */
-async function assertNoLegacyProfile(root: string): Promise<void> {
-  if (await profileJsonPresent(root)) {
+async function assertNoLegacyProfile(steps: ProductActivationSteps): Promise<void> {
+  if (await steps.profileJsonPresent()) {
     throw new ProductActivationError("a legacy profile.json is present; run migration before activation");
   }
 }
 
 /** Whether the composition graph recomputes and its stored lock matches exactly. */
 async function isCompositionValid(
-  root: string, manifest: ProductPackageManifestV1, pack: WorkspaceOperationsPackV2,
+  steps: ProductActivationSteps, manifest: ProductPackageManifestV1, pack: WorkspaceOperationsPackV2,
 ): Promise<boolean> {
   try {
-    const lockText = await readStoredMemberText(
-      root, manifest.packageDigest, manifest.compositionLock, MAX_COMPOSITION_LOCK_BYTES);
+    const lockText = await steps.readMemberText(manifest.packageDigest, manifest.compositionLock, MAX_COMPOSITION_LOCK_BYTES);
     verifyCompositionLock(pack, lockText);
     return true;
   } catch {
@@ -136,28 +171,25 @@ async function isCompositionValid(
 
 /** Resolve the operations-pack structural facts, refusing to sentinels on failure. */
 async function readPackStructure(
-  root: string, manifest: ProductPackageManifestV1,
+  steps: ProductActivationSteps, manifest: ProductPackageManifestV1,
 ): Promise<PackContractInputs & Pick<StructuralCompatibilityInputsV1, "compositionValid">> {
   let pack: WorkspaceOperationsPackV2;
   try {
-    const opsText = await readStoredMemberText(
-      root, manifest.packageDigest, manifest.rootOperationsPack, MAX_ROOT_OPERATIONS_PACK_BYTES);
+    const opsText = await steps.readMemberText(manifest.packageDigest, manifest.rootOperationsPack, MAX_ROOT_OPERATIONS_PACK_BYTES);
     pack = parseOperationsPack(opsText);
   } catch {
     return { ...UNRECOGNIZED_CONTRACT_INPUTS, compositionValid: false };
   }
-  return { ...packContractInputs(pack), compositionValid: await isCompositionValid(root, manifest, pack) };
+  return { ...packContractInputs(pack), compositionValid: await isCompositionValid(steps, manifest, pack) };
 }
 
 /** Resolve the knowledge-profile structural facts, refusing to sentinels on failure. */
 async function readProfileStructure(
-  root: string, manifest: ProductPackageManifestV1,
+  steps: ProductActivationSteps, manifest: ProductPackageManifestV1,
 ): Promise<Pick<StructuralCompatibilityInputsV1, "knowledgeProfileSchemaVersion" | "knowledgeProfileLoadable">> {
   try {
-    const kpText = await readStoredMemberText(
-      root, manifest.packageDigest, manifest.knowledgeProfile, MAX_KNOWLEDGE_PROFILE_BYTES);
-    const memberPath = knowledgeProfileMemberPath(root, manifest.packageDigest, manifest.knowledgeProfile.digest);
-    const loaded = loadKnowledgeProfileMember(kpText, memberPath);
+    const kpText = await steps.readMemberText(manifest.packageDigest, manifest.knowledgeProfile, MAX_KNOWLEDGE_PROFILE_BYTES);
+    const loaded = steps.loadKnowledgeProfile(manifest.packageDigest, manifest.knowledgeProfile.digest, kpText);
     return { knowledgeProfileSchemaVersion: loaded.profile.schemaVersion, knowledgeProfileLoadable: true };
   } catch {
     return { knowledgeProfileSchemaVersion: UNSUPPORTED_SCHEMA, knowledgeProfileLoadable: false };
@@ -166,9 +198,9 @@ async function readProfileStructure(
 
 /** Gather every structural compatibility fact from the installed package. */
 async function assessInstalledStructure(
-  root: string, manifest: ProductPackageManifestV1,
+  steps: ProductActivationSteps, manifest: ProductPackageManifestV1,
 ): Promise<StructuralCompatibilityInputsV1> {
-  return { ...(await readPackStructure(root, manifest)), ...(await readProfileStructure(root, manifest)) };
+  return { ...(await readPackStructure(steps, manifest)), ...(await readProfileStructure(steps, manifest)) };
 }
 
 /** Build the new binding from the manifest, so its component digests are exact. */
@@ -186,8 +218,8 @@ function buildBinding(
 }
 
 /** Report success only after a fresh load resolves the expected product mode. */
-async function assertReadback(root: string, packageDigest: Sha256Digest): Promise<string> {
-  const resolution = await resolveActiveProduct(root);
+async function assertReadback(steps: ProductActivationSteps, packageDigest: Sha256Digest): Promise<string> {
+  const resolution = await steps.resolveActive();
   if (resolution.mode !== "product" || resolution.binding.packageDigest !== packageDigest) {
     throw new ProductActivationError("activation did not resolve to the expected product on readback");
   }
@@ -195,19 +227,19 @@ async function assertReadback(root: string, packageDigest: Sha256Digest): Promis
 }
 
 /** Run the design section 8.3 activation steps under the already-acquired lock. */
-async function activateUnderLock(
-  root: string, packageDigest: Sha256Digest, principal: PrincipalRefV1, options: ActivateProductOptionsV1,
+export async function activateUnderLockWith(
+  steps: ProductActivationSteps, packageDigest: Sha256Digest, principal: PrincipalRefV1, options: ActivateProductOptionsV1,
 ): Promise<ActivateResultV1> {
-  const manifest = await resolveInstalledManifest(root, packageDigest);
-  await assertNoLegacyProfile(root);
-  const report = assessStructuralCompatibility(await assessInstalledStructure(root, manifest));
+  const manifest = await resolveInstalledManifest(steps, packageDigest);
+  await assertNoLegacyProfile(steps);
+  const report = assessStructuralCompatibility(await assessInstalledStructure(steps, manifest));
   if (!report.structurallyCompatible) {
     throw new ProductActivationError(`structural incompatibility: ${report.refusals.join("; ")}`);
   }
   const binding = buildBinding(
     manifest, principal, options.activatedAt ?? new Date().toISOString(), options.parityCertificateDigest);
-  await writeActiveProductBinding(root, binding, options.faults);
-  const profileDigest = await assertReadback(root, packageDigest);
+  await steps.writeBinding(binding, options.faults);
+  const profileDigest = await assertReadback(steps, packageDigest);
   return {
     status: "activated", productId: binding.productId, productVersion: binding.productVersion,
     packageDigest: binding.packageDigest, binding, profileDigest,
@@ -252,7 +284,7 @@ export async function activateProductLocked(
   const auditOptions = snapshotOptions(options);
   await acquireMutationLockBlocking(root, "ordinary");
   try {
-    return await activateUnderLock(root, packageDigest, auditPrincipal, auditOptions);
+    return await activateUnderLockWith(localProductActivationSteps(root), packageDigest, auditPrincipal, auditOptions);
   } finally {
     await releaseLock(root);
   }

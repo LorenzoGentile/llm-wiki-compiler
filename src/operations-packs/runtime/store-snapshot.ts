@@ -39,6 +39,12 @@
  * NON-FINITE numbers (YAML `.inf`/`.nan`, which the canonical serializer
  * refuses) are OMITTED deterministically rather than serialized, so two runs
  * over one page always see the same projection.
+ *
+ * ONE BODY: {@link packStoreSnapshotFrom} keeps every refusal, the re-scan count
+ * (a listing that fails counts as zero entries), the scalar projection and the
+ * digest of the page's ACTUAL bytes over {@link PackStoreSnapshotReads}. The root
+ * form passes {@link diskPackStoreSnapshotReads}, the incumbent profile load,
+ * collector, scan, directory listing and page read, each called when asked.
  */
 
 import { readdir } from "node:fs/promises";
@@ -54,6 +60,31 @@ import {
 } from "../../products/binding/problems.js";
 import { scanEntityDir } from "../../wiki/collect.js";
 import type { PackEvidenceItemV1, PackEvidenceScalarV1 } from "../handlers/types.js";
+
+/** What the snapshot asks of the project. No member takes a project root. */
+export interface PackStoreSnapshotReads {
+  /** The effective non-default profile, or none; rejects with the load-failure classes. */
+  loadProfile(): Promise<LoadedProfile | undefined>;
+  /** Every entity page of that profile, with collection problems. */
+  collectPages(loaded: LoadedProfile): ReturnType<typeof collectEntityPagesWithMessages>;
+  /** The collector's own scan of one entity directory. */
+  scanDir(directory: string): ReturnType<typeof scanEntityDir>;
+  /** The names in one entity directory; rejects when it cannot be listed. */
+  listDir(directory: string): Promise<string[]>;
+  /** One collected page's actual bytes. */
+  readPageBytes(page: EntityPage): Promise<Buffer>;
+}
+
+/** LOCAL DISK: the incumbent reads for one root, built per call, each called when asked. In no package index. */
+function diskPackStoreSnapshotReads(root: string): PackStoreSnapshotReads {
+  return {
+    loadProfile: () => loadNonDefaultProfile(root),
+    collectPages: (loaded) => collectEntityPagesWithMessages(root, loaded),
+    scanDir: (directory) => scanEntityDir(root, directory),
+    listDir: (directory) => readdir(path.join(root, directory)),
+    readPageBytes: (page) => readFile(page.filePath),
+  };
+}
 
 /** One snapshot: the compared type's current items, or why it could not be taken. */
 export type PackStoreSnapshotV1 =
@@ -93,8 +124,8 @@ export const CURRENT_DIGEST_FIELD = "current-digest";
 export const CURRENT_BYTES_FIELD = "current-byte-count";
 
 /** One entity page as the closed evidence item the reconcile handler compares. */
-async function snapshotItem(page: EntityPage): Promise<PackEvidenceItemV1> {
-  const bytes = await readFile(page.filePath);
+async function snapshotItem(reads: PackStoreSnapshotReads, page: EntityPage): Promise<PackEvidenceItemV1> {
+  const bytes = await reads.readPageBytes(page);
   return {
     itemId: page.slug,
     fields: {
@@ -114,12 +145,12 @@ async function snapshotItem(page: EntityPage): Promise<PackEvidenceItemV1> {
  * refuse. This is the collector's own scan primitive, re-run, not a second
  * enumeration rule.
  */
-async function scanHealthProblem(root: string, directory: string): Promise<string | null> {
-  const { scans, dirStatus } = await scanEntityDir(root, directory);
+async function scanHealthProblem(reads: PackStoreSnapshotReads, directory: string): Promise<string | null> {
+  const { scans, dirStatus } = await reads.scanDir(directory);
   if (dirStatus === "invalid") return "the compared entity directory is invalid";
   let entryCount = 0;
   try {
-    entryCount = (await readdir(path.join(root, directory))).filter((file) => file.endsWith(".md")).length;
+    entryCount = (await reads.listDir(directory)).filter((file) => file.endsWith(".md")).length;
   } catch {
     entryCount = 0; // absent directory: zero entries, zero scans — healthy.
   }
@@ -134,17 +165,17 @@ async function scanHealthProblem(root: string, directory: string): Promise<strin
 
 /** Collect the compared type's pages, refusing a collection with ANY problem. */
 async function collectSnapshot(
-  root: string, loaded: LoadedProfile, entityType: string,
+  reads: PackStoreSnapshotReads, loaded: LoadedProfile, entityType: string,
 ): Promise<PackStoreSnapshotV1> {
-  const { pages, problems } = await collectEntityPagesWithMessages(root, loaded);
+  const { pages, problems } = await reads.collectPages(loaded);
   if (problems.length > 0) {
     return { kind: "refused", detail: `the entity-page snapshot is incomplete (${problems.length} collection problems)` };
   }
   const directory = loaded.profile.entities[entityType]!.directory;
-  const unhealthy = await scanHealthProblem(root, directory);
+  const unhealthy = await scanHealthProblem(reads, directory);
   if (unhealthy !== null) return { kind: "refused", detail: unhealthy };
   const items = await Promise.all(
-    pages.filter((page) => page.entityType === entityType).map(snapshotItem));
+    pages.filter((page) => page.entityType === entityType).map((page) => snapshotItem(reads, page)));
   return { kind: "ok", items };
 }
 
@@ -160,9 +191,14 @@ async function collectSnapshot(
  *   is unreadable.
  */
 export async function packStoreSnapshot(root: string, entityType: string): Promise<PackStoreSnapshotV1> {
+  return packStoreSnapshotFrom(diskPackStoreSnapshotReads(root), entityType);
+}
+
+/** {@link packStoreSnapshot} over {@link PackStoreSnapshotReads}: THE ONE BODY. */
+export async function packStoreSnapshotFrom(reads: PackStoreSnapshotReads, entityType: string): Promise<PackStoreSnapshotV1> {
   let loaded: LoadedProfile | undefined;
   try {
-    loaded = await loadNonDefaultProfile(root);
+    loaded = await reads.loadProfile();
   } catch (cause) {
     if (isProfileLoadFailure(cause)) return { kind: "refused", detail: "the project profile is unreadable" };
     throw cause;
@@ -173,5 +209,5 @@ export async function packStoreSnapshot(root: string, entityType: string): Promi
   if (loaded.profile.entities[entityType] === undefined) {
     return { kind: "refused", detail: `compared evidence class ${JSON.stringify(entityType)} is not a declared entity type` };
   }
-  return collectSnapshot(root, loaded, entityType);
+  return collectSnapshot(reads, loaded, entityType);
 }

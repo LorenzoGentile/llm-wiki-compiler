@@ -3,8 +3,14 @@
  * limit. Includes exhausted entries retained in pending when quarantine is full;
  * deduplicates interrupted settlements and uses the same confined marker reader
  * as retry processing. Never repairs, requeues, or creates project files.
+ *
+ * ONE BODY, {@link quarantinedEmbeddingsWarningFrom}, over the marker reads.
+ * Its callers, the status composition and the pending-embeddings lint rule,
+ * hand it marker reads; on the local disk those are
+ * `diskEmbeddingMarkerReads(root)`; there is no root-taking form.
  */
-import { readPendingMarker } from "../utils/pending-embeddings.js";
+import { readPendingMarkerFrom } from "../utils/pending-embeddings.js";
+import type { EmbeddingMarkerReads } from "../utils/pending-embeddings.js";
 import { MAX_PENDING_EMBEDDING_ATTEMPTS, PENDING_EMBEDDINGS_FILE, QUARANTINED_EMBEDDINGS_FILE } from "../utils/constants.js";
 import type { ReadSurfaceWarning } from "./journal-health-warning.js";
 
@@ -13,11 +19,11 @@ interface QuarantineWarning extends ReadSurfaceWarning {
   file: string;
 }
 
-/** Surface stopped retries or unreadable quarantine data, without provider calls or writes. */
-export async function quarantinedEmbeddingsWarning(root: string): Promise<QuarantineWarning | null> {
+/** Surface stopped retries or unreadable quarantine data, without provider calls or writes: THE ONE BODY. Both markers are read, started together, quarantine first. */
+export async function quarantinedEmbeddingsWarningFrom(reads: EmbeddingMarkerReads): Promise<QuarantineWarning | null> {
   const [quarantine, pending] = await Promise.all([
-    readPendingMarker(root, QUARANTINED_EMBEDDINGS_FILE),
-    readPendingMarker(root),
+    readPendingMarkerFrom(reads, QUARANTINED_EMBEDDINGS_FILE),
+    readPendingMarkerFrom(reads),
   ]);
   if (quarantine.status === "unavailable") {
     return {

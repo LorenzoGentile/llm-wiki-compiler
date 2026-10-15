@@ -8,22 +8,27 @@
  * Uses deterministic hash-based sampling so the same N citations are evaluated
  * on every run (reproducible). Results are cached in .llmwiki/eval/citation-cache.jsonl
  * so subsequent runs skip already-judged pairs.
+ *
+ * The pair extraction has ONE body, {@link extractCitationPairsFrom}, over the
+ * page collection's sources and the source resolver's reads. The judge has ONE
+ * body too, {@link createCitationJudgeFrom}, over the raw reads and writes of
+ * its cache file. The evaluator has ONE body as well,
+ * {@link evaluateCitationSupportFrom}, over those two together.
  */
 
 import { createHash } from "crypto";
-import { readFile, appendFile, mkdir } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
-import { collectAllPages } from "../linter/rules.js";
+import { diskEvalFileReads, type EvalFileReads } from "./file-reads.js";
+import { diskEvalFileWrites, type EvalFileWrites } from "./file-writes.js";
+import { collectAllPagesFrom, diskLintPageSources, type LintPageSources } from "../linter/rules-shared.js";
 import { parseFrontmatter, extractClaimCitations, splitProseParagraphs } from "../utils/markdown.js";
 import { callClaude } from "../utils/llm.js";
 import {
-  SOURCES_DIR,
   DEFAULT_PROVIDER,
   PROVIDER_MODELS,
   normalizeProviderName,
 } from "../utils/constants.js";
-import { resolveSourceFile } from "./source-path.js";
+import { diskSourceFileReads, resolveSourceFileFrom, type SourceFileReads } from "./source-path.js";
 import type { LLMTool } from "../utils/provider.js";
 import type { CitationJudgement, CitationSupportResult } from "./types.js";
 import type { SourceSpan } from "../utils/types.js";
@@ -84,8 +89,8 @@ function makeCacheKey(contentHash: string, model: string): string {
 }
 
 /** Extract the text of specific lines from a file (1-indexed, inclusive). */
-async function readSourceLines(filePath: string, start: number, end: number): Promise<string> {
-  const content = await readFile(filePath, "utf-8");
+async function readSourceLines(sources: SourceFileReads, filePath: string, start: number, end: number): Promise<string> {
+  const content = await sources.readText(filePath);
   return content
     .split("\n")
     .slice(start - 1, end)
@@ -102,12 +107,12 @@ async function buildSpanPair(
   slug: string,
   claimText: string,
   span: SourceSpan,
-  sourcesDir: string,
+  sources: SourceFileReads,
 ): Promise<CitationPair | null> {
   if (!span.lines) return null;
-  const sourceFile = await resolveSourceFile(sourcesDir, span.file);
+  const sourceFile = await resolveSourceFileFrom(sources.locations, span.file);
   if (sourceFile === null) return null;
-  const spanText = await readSourceLines(sourceFile, span.lines.start, span.lines.end);
+  const spanText = await readSourceLines(sources, sourceFile, span.lines.start, span.lines.end);
   return {
     claimHash: hashPair(claimText, spanText),
     pageSlug: slug,
@@ -123,13 +128,13 @@ async function buildSpanPair(
 async function extractParagraphPairs(
   slug: string,
   para: string,
-  sourcesDir: string,
+  sources: SourceFileReads,
 ): Promise<CitationPair[]> {
   const citations = extractClaimCitations(para);
   if (citations.length === 0) return [];
   const claimText = stripCitationMarkers(para);
   const spans = citations.flatMap((c) => c.spans);
-  const pairs = await Promise.all(spans.map((s) => buildSpanPair(slug, claimText, s, sourcesDir)));
+  const pairs = await Promise.all(spans.map((s) => buildSpanPair(slug, claimText, s, sources)));
   return pairs.filter((p): p is CitationPair => p !== null);
 }
 
@@ -137,11 +142,19 @@ async function extractParagraphPairs(
 async function extractPagePairs(
   slug: string,
   body: string,
-  sourcesDir: string,
+  sources: SourceFileReads,
 ): Promise<CitationPair[]> {
   const paragraphs = splitProseParagraphs(body);
-  const results = await Promise.all(paragraphs.map((p) => extractParagraphPairs(slug, p, sourcesDir)));
+  const results = await Promise.all(paragraphs.map((p) => extractParagraphPairs(slug, p, sources)));
   return results.flat();
+}
+
+/** What the pair extraction asks of the project: every page first, then one resolution and one whole-text read per cited span with a line range. */
+export interface CitationPairSources {
+  /** The page collection's sources. */
+  pages: LintPageSources;
+  /** The source resolver's reads. Nothing is kept between spans: a file cited twice is resolved and read twice. */
+  sources: SourceFileReads;
 }
 
 /**
@@ -150,13 +163,25 @@ async function extractPagePairs(
  * @param root - Absolute path to the project root.
  */
 export async function extractCitationPairs(root: string): Promise<CitationPair[]> {
-  const pages = await collectAllPages(root);
-  const sourcesDir = path.join(root, SOURCES_DIR);
+  return extractCitationPairsFrom({ pages: diskLintPageSources(root), sources: diskSourceFileReads(root) });
+}
+
+/**
+ * {@link extractCitationPairs} over {@link CitationPairSources}: THE ONE BODY.
+ * Pages are taken one after another; within a page every paragraph and span
+ * is started together. A span that does not resolve yields no pair; a source
+ * read that fails rejects the extraction. The cited lines are sliced as given.
+ *
+ * @param from - The pages and the source resolver's reads.
+ * @returns The pairs in page order, then paragraph order, then span order.
+ */
+export async function extractCitationPairsFrom(from: CitationPairSources): Promise<CitationPair[]> {
+  const pages = await collectAllPagesFrom(from.pages);
   const all: CitationPair[] = [];
   for (const { filePath, content } of pages) {
     const { body } = parseFrontmatter(content);
     const slug = path.basename(filePath, ".md");
-    const pairs = await extractPagePairs(slug, body, sourcesDir);
+    const pairs = await extractPagePairs(slug, body, from.sources);
     all.push(...pairs);
   }
   return all;
@@ -193,10 +218,9 @@ export function selectDeterministicSample(
 }
 
 /** Load previously cached judgements keyed by claimHash. */
-async function loadCachedJudgements(root: string): Promise<Map<string, CitationJudgement>> {
-  const cachePath = path.join(root, CACHE_FILE);
-  if (!existsSync(cachePath)) return new Map();
-  const content = await readFile(cachePath, "utf-8");
+async function loadCachedJudgements(reads: EvalFileReads): Promise<Map<string, CitationJudgement>> {
+  if (!reads.existsSync(CACHE_FILE)) return new Map();
+  const content = await reads.readText(CACHE_FILE);
   const map = new Map<string, CitationJudgement>();
   for (const line of content.trim().split("\n").filter(Boolean)) {
     try {
@@ -210,9 +234,9 @@ async function loadCachedJudgements(root: string): Promise<Map<string, CitationJ
 }
 
 /** Append a single judgement to the cache file. */
-async function appendCachedJudgement(root: string, judgement: CitationJudgement): Promise<void> {
-  await mkdir(path.join(root, CACHE_DIR), { recursive: true });
-  await appendFile(path.join(root, CACHE_FILE), JSON.stringify(judgement) + "\n");
+async function appendCachedJudgement(writes: EvalFileWrites, judgement: CitationJudgement): Promise<void> {
+  await writes.makeDirectoryTree(CACHE_DIR);
+  await writes.appendText(CACHE_FILE, JSON.stringify(judgement) + "\n");
 }
 
 /** Resolve the current model identifier for recording in judgements. */
@@ -275,9 +299,9 @@ function aggregateJudgements(judgements: CitationJudgement[]): Pick<
  */
 async function judgeNewPairs(
   sample: CitationPair[],
-  root: string,
+  cache: CitationJudgeCacheFiles,
 ): Promise<{ judgements: CitationJudgement[]; judgeErrors: number }> {
-  const judge = await createCitationJudge(root);
+  const judge = await createCitationJudgeFrom(cache);
   const judgements: CitationJudgement[] = [];
   let judgeErrors = 0;
   let newPairsAttempted = 0;
@@ -303,10 +327,38 @@ async function judgeNewPairs(
   return { judgements, judgeErrors };
 }
 
+/**
+ * What the judge asks of the project for its cache: the raw reads and writes of
+ * one file under `.llmwiki/eval`. It holds no parsed cache, judgement or
+ * verdict; the judge loads, checks, memoizes and appends by itself. The judge
+ * never asks `writes.removeFile`.
+ */
+export interface CitationJudgeCacheFiles {
+  /** Whether the cache file is there, answered at once, and its whole text. */
+  reads: EvalFileReads;
+  /** The directory tree, then one appended line per new verdict. */
+  writes: EvalFileWrites;
+}
+
 /** Share the existing judge and cache with alternate document selections. */
 export async function createCitationJudge(root: string, options: { namespace?: string; model?: string; persist?: boolean } = {}) {
+  return createCitationJudgeFrom({ reads: diskEvalFileReads(root), writes: diskEvalFileWrites(root) }, options);
+}
+
+/**
+ * {@link createCitationJudge} over {@link CitationJudgeCacheFiles}: THE ONE
+ * BODY. The options are resolved when the judge is made. With `persist` the
+ * cache is read once, then; without it no file is asked about, read or
+ * written. A verdict is appended before it is remembered, so a failed append
+ * leaves the judge without it.
+ *
+ * @param files - The cache file's raw reads and writes.
+ * @param options - The cache namespace, the model recorded and keyed on, and whether the cache file is used.
+ * @returns The judge: one pair in, its judgement and whether it came from the cache out.
+ */
+export async function createCitationJudgeFrom(files: CitationJudgeCacheFiles, options: { namespace?: string; model?: string; persist?: boolean } = {}) {
   const { namespace = "", model = resolveJudgementModel(), persist = true } = options;
-  const cache = persist ? await loadCachedJudgements(root) : new Map<string, CitationJudgement>();
+  const cache = persist ? await loadCachedJudgements(files.reads) : new Map<string, CitationJudgement>();
   return async (pair: CitationPair) => {
     const cacheKey = makeCacheKey(pair.claimHash + namespace, model);
     const cached = cache.get(cacheKey);
@@ -315,10 +367,22 @@ export async function createCitationJudge(root: string, options: { namespace?: s
       return { cached: true, judgement: { ...cached, ...pair, claimHash: cacheKey } };
     }
     const judgement = await callJudge(pair, cacheKey, model);
-    if (persist) await appendCachedJudgement(root, judgement);
+    if (persist) await appendCachedJudgement(files.writes, judgement);
     cache.set(cacheKey, judgement);
     return { cached: false, judgement };
   };
+}
+
+/**
+ * What the evaluator asks of the project: the pair extraction's sources, then
+ * the judge's cache file. It holds no pair, sample, verdict or report; each is
+ * worked out in {@link evaluateCitationSupportFrom} from what these return.
+ */
+export interface CitationSupportSources {
+  /** The pages and the source resolver's reads the pairs are extracted from. */
+  pairs: CitationPairSources;
+  /** The judge's cache file. Not asked about at all when no pair is found. */
+  cache: CitationJudgeCacheFiles;
 }
 
 /**
@@ -333,11 +397,33 @@ export async function evaluateCitationSupport(
   sampleSize = 20,
   previousHashes: string[] = [],
 ): Promise<CitationSupportResult | null> {
-  const allPairs = await extractCitationPairs(root);
+  return evaluateCitationSupportFrom({
+    pairs: { pages: diskLintPageSources(root), sources: diskSourceFileReads(root) },
+    cache: { reads: diskEvalFileReads(root), writes: diskEvalFileWrites(root) },
+  }, sampleSize, previousHashes);
+}
+
+/**
+ * {@link evaluateCitationSupport} over {@link CitationSupportSources}: THE ONE
+ * BODY. Every pair is extracted first; with none, the answer is null and the
+ * cache is never asked. Otherwise the sample is chosen, one judge is made, and
+ * the sampled pairs are judged one after another in sample order.
+ *
+ * @param from - The pair extraction's sources and the judge's cache file.
+ * @param sampleSize - Number of citation pairs to judge per run.
+ * @param previousHashes - Hashes sampled in the prior run; retained to prevent sample churn.
+ * @returns The sampled judgements with their totals, or null when the wiki has no citable pair.
+ */
+export async function evaluateCitationSupportFrom(
+  from: CitationSupportSources,
+  sampleSize: number,
+  previousHashes: string[],
+): Promise<CitationSupportResult | null> {
+  const allPairs = await extractCitationPairsFrom(from.pairs);
   if (allPairs.length === 0) return null;
 
   const sample = selectDeterministicSample(allPairs, sampleSize, previousHashes);
-  const { judgements, judgeErrors } = await judgeNewPairs(sample, root);
+  const { judgements, judgeErrors } = await judgeNewPairs(sample, from.cache);
 
   return {
     sampledCount: judgements.length,

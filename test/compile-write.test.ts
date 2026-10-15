@@ -84,7 +84,7 @@ describe("applyCompilePageWritesLocked — allowed writes", () => {
   });
 
   it("applies all allowed pages as ONE journalled batch", async () => {
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
     const items = [
       { namespace: "concepts" as const, slug: "one", body: GOOD_BODY },
       { namespace: "concepts" as const, slug: "two", body: GOOD_BODY },
@@ -122,7 +122,7 @@ describe("applyCompilePageWritesLocked — atomicity under fault injection", () 
 
 describe("applyCompilePageWritesLocked — empty no-op", () => {
   it("opens NO journal batch and returns empty skipped for empty items", async () => {
-    const openSpy = vi.spyOn(journal, "openBatch");
+    const openSpy = vi.spyOn(journal, "openBatchFrom");
     const { skipped } = await underLock(() => applyCompilePageWritesLocked(root, []));
     expect(skipped).toEqual([]);
     expect(openSpy).not.toHaveBeenCalled();

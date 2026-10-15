@@ -4,6 +4,14 @@
  * output is confined to one recipe-owned workspace root and paired with a
  * canonical format-neutral sidecar. The marker is published before output so
  * an interrupted create or replacement can be resumed without adopting bytes.
+ *
+ * ONE OBSERVE BODY AND ONE WRITE BODY over {@link ProjectionLeaves}: read the
+ * output/marker pair, and publish one leaf with a revalidation callback the leaf
+ * writer runs at its last pre-rename seam. The bodies own normalization,
+ * classification, snapshots, marker-before-output order and verification; the
+ * local-disk factory keeps the confined single-link reads and the strictly durable
+ * exact-parent 0600 replacement, passing revalidation as the incumbent
+ * `afterParentCheckForTest` hook.
  */
 
 import { createHash } from "node:crypto";
@@ -12,7 +20,7 @@ import { TextDecoder } from "node:util";
 import { canonicalBytes } from "../profile/templates/signing/canonical.js";
 import { parseBoundedUniqueJson } from "../profile/templates/signing/json.js";
 import { atomicWrite, type AtomicWriteOptions } from "../utils/atomic-write.js";
-import { readConfinedLeafBuffer } from "../utils/confined-read.js";
+import { readConfinedLeafBuffer, type CappedLeafReadBuffer } from "../utils/confined-read.js";
 import { MAX_PROJECTION_BYTES } from "./constants.js";
 import { count, digest, exact, record, textValue } from "./manifest-values.js";
 import {
@@ -65,6 +73,21 @@ type ProjectionLeafSnapshot =
 
 type ProjectionLeafWriteOptions = Pick<AtomicWriteOptions,
   "afterParentCheckForTest" | "beforeDirectorySyncForTest">;
+
+type ProjectionPair = { outputRead: CappedLeafReadBuffer; markerRead: CappedLeafReadBuffer };
+
+/** What the projection bodies ask of the store. No member takes a project root. */
+export interface ProjectionLeaves {
+  /** The output and marker leaves of one normalized target; may reject for an unusable path. */
+  readPair(target: ProjectionTarget): Promise<ProjectionPair>;
+  /** Strictly replace the marker leaf; `revalidate` runs at the writer's last pre-rename seam. */
+  writeMarker(target: ProjectionTarget, bytes: Buffer, revalidate: () => Promise<void>): Promise<void>;
+  /** Strictly replace the output leaf likewise; `beforeDirectorySync` is a test seam only. */
+  writeOutput(
+    target: ProjectionTarget, bytes: Buffer, revalidate: () => Promise<void>,
+    beforeDirectorySync?: AtomicWriteOptions["beforeDirectorySyncForTest"],
+  ): Promise<void>;
+}
 
 /** Rebuild target fields before any filesystem await or directory creation. */
 function normalizeTarget(target: ProjectionTarget): ProjectionTarget {
@@ -138,7 +161,7 @@ function markerOwnsTarget(marker: ProjectionMarker, target: ProjectionTarget): b
 }
 
 /** Read one output and its marker through the exact nested output parent. */
-async function readProjectionPair(root: string, target: ProjectionTarget) {
+async function readProjectionPair(root: string, target: ProjectionTarget): Promise<ProjectionPair> {
   const output = projectionOutputPath(root, target), parent = path.dirname(output);
   const marker = projectionMarkerPath(root, target);
   const [outputRead, markerRead] = await Promise.all([
@@ -151,7 +174,7 @@ async function readProjectionPair(root: string, target: ProjectionTarget) {
 /** Parse and authorize one present marker, preserving read-fault taxonomy. */
 function classifyProjectionMarker(
   target: ProjectionTarget,
-  pair: Awaited<ReturnType<typeof readProjectionPair>>,
+  pair: ProjectionPair,
 ): ProjectionMarker | ProjectionObservation {
   if (pair.markerRead.kind === "unavailable") return { status: "unavailable", detail: "projection leaf is unavailable" };
   if (pair.markerRead.kind === "absent") return { status: "conflict", detail: "projection marker is missing" };
@@ -165,7 +188,7 @@ function classifyProjectionMarker(
 /** Classify one already-confined pair against the requested target. */
 function classifyProjection(
   target: ProjectionTarget,
-  pair: Awaited<ReturnType<typeof readProjectionPair>>,
+  pair: ProjectionPair,
 ): ProjectionObservation {
   if (pair.outputRead.kind === "unavailable") return { status: "unavailable", detail: "projection leaf is unavailable" };
   if (pair.outputRead.kind === "absent" && pair.markerRead.kind === "absent") return { status: "absent" };
@@ -180,10 +203,15 @@ function classifyProjection(
 
 /** Observe exact applied, recoverable, conflicting, absent, or unreadable state. */
 export async function observeProjection(root: string, rawTarget: ProjectionTarget): Promise<ProjectionObservation> {
-  let target: ProjectionTarget, pair: Awaited<ReturnType<typeof readProjectionPair>>;
+  return observeProjectionFrom(diskProjectionLeaves(root), rawTarget);
+}
+
+/** {@link observeProjection} over the projection leaves: the one observe body. */
+async function observeProjectionFrom(leaves: ProjectionLeaves, rawTarget: ProjectionTarget): Promise<ProjectionObservation> {
+  let target: ProjectionTarget, pair: ProjectionPair;
   try {
     target = normalizeTarget(rawTarget);
-    pair = await readProjectionPair(root, target);
+    pair = await leaves.readPair(target);
   } catch {
     return { status: "unavailable", detail: "projection path is unavailable" };
   }
@@ -212,9 +240,23 @@ async function writeProjectionLeaf(
   });
 }
 
+/** The local-disk projection leaves for one root, built per call. In no package index. */
+function diskProjectionLeaves(root: string): ProjectionLeaves {
+  return {
+    readPair: (target) => readProjectionPair(root, target),
+    writeMarker: (target, bytes, revalidate) =>
+      writeProjectionLeaf(root, projectionMarkerPath(root, target), bytes, { afterParentCheckForTest: revalidate }),
+    writeOutput: (target, bytes, revalidate, beforeDirectorySync) =>
+      writeProjectionLeaf(root, projectionOutputPath(root, target), bytes, {
+        afterParentCheckForTest: revalidate,
+        ...(beforeDirectorySync === undefined ? {} : { beforeDirectorySyncForTest: beforeDirectorySync }),
+      }),
+  };
+}
+
 /** Snapshot exact output bytes before this writer publishes its marker. */
 function snapshotProjectionOutput(
-  pair: Awaited<ReturnType<typeof readProjectionPair>>,
+  pair: ProjectionPair,
 ): ProjectionLeafSnapshot {
   if (pair.outputRead.kind === "absent") return { kind: "absent" };
   if (pair.outputRead.kind === "unavailable") throw new Error("projection output is unavailable");
@@ -223,7 +265,7 @@ function snapshotProjectionOutput(
 
 /** Snapshot exact marker bytes before this writer publishes its replacement. */
 function snapshotProjectionMarker(
-  pair: Awaited<ReturnType<typeof readProjectionPair>>,
+  pair: ProjectionPair,
 ): ProjectionLeafSnapshot {
   if (pair.markerRead.kind === "absent") return { kind: "absent" };
   if (pair.markerRead.kind === "unavailable") throw new Error("projection marker is unavailable");
@@ -232,7 +274,7 @@ function snapshotProjectionMarker(
 
 /** Compare one confined read result with its exact initial snapshot. */
 function projectionLeafMatches(
-  read: Awaited<ReturnType<typeof readProjectionPair>>["markerRead"],
+  read: CappedLeafReadBuffer,
   expected: ProjectionLeafSnapshot,
 ): boolean {
   return expected.kind === "absent"
@@ -242,12 +284,12 @@ function projectionLeafMatches(
 
 /** Refuse marker publication when either initial leaf changed. */
 async function assertProjectionPairUnchanged(
-  root: string,
+  leaves: ProjectionLeaves,
   target: ProjectionTarget,
   expectedOutput: ProjectionLeafSnapshot,
   expectedMarker: ProjectionLeafSnapshot,
 ): Promise<void> {
-  const pair = await readProjectionPair(root, target).catch(() => undefined);
+  const pair = await leaves.readPair(target).catch(() => undefined);
   const markerMatches = pair !== undefined && projectionLeafMatches(pair.markerRead, expectedMarker);
   const outputMatches = pair !== undefined && projectionLeafMatches(pair.outputRead, expectedOutput);
   if (!markerMatches || !outputMatches) {
@@ -257,12 +299,12 @@ async function assertProjectionPairUnchanged(
 
 /** Require marker ownership and output bytes to remain exact before rename. */
 async function assertProjectionUnchanged(
-  root: string,
+  leaves: ProjectionLeaves,
   target: ProjectionTarget,
   expectedOutput: ProjectionLeafSnapshot,
   expectedMarker: Buffer,
 ): Promise<void> {
-  const pair = await readProjectionPair(root, target).catch(() => undefined);
+  const pair = await leaves.readPair(target).catch(() => undefined);
   const markerMatches = pair?.markerRead.kind === "ok" && pair.markerRead.body.equals(expectedMarker);
   const outputMatches = pair !== undefined && projectionLeafMatches(pair.outputRead, expectedOutput);
   if (!markerMatches || !outputMatches) throw new Error("projection changed concurrently before output publication");
@@ -270,21 +312,19 @@ async function assertProjectionUnchanged(
 
 /** Publish and verify the marker that authorizes one projection output. */
 async function publishProjectionMarker(
-  root: string,
+  leaves: ProjectionLeaves,
   prepared: ReturnType<typeof prepareProjection>,
   expectedOutput: ProjectionLeafSnapshot,
   expectedMarker: ProjectionLeafSnapshot,
   options: ProjectionWriteOptions,
 ): Promise<Buffer> {
   const markerBytes = canonicalBytes(markerFor(prepared.target, prepared.bytes.byteLength));
-  await writeProjectionLeaf(root, projectionMarkerPath(root, prepared.target), markerBytes, {
-    afterParentCheckForTest: async () => {
-      await options.beforeMarkerPublicationForTest?.();
-      await assertProjectionPairUnchanged(root, prepared.target, expectedOutput, expectedMarker);
-    },
+  await leaves.writeMarker(prepared.target, markerBytes, async () => {
+    await options.beforeMarkerPublicationForTest?.();
+    await assertProjectionPairUnchanged(leaves, prepared.target, expectedOutput, expectedMarker);
   });
   await options.afterMarkerWriteForTest?.();
-  const committedMarker = await observeProjection(root, prepared.target);
+  const committedMarker = await observeProjectionFrom(leaves, prepared.target);
   if (committedMarker.status !== "replaceable" && committedMarker.status !== "same") {
     throw new Error(`projection marker did not retain ownership: ${committedMarker.status}`);
   }
@@ -298,9 +338,19 @@ export async function writeProjectionLocked(
   rawBytes: Buffer,
   options: ProjectionWriteOptions = {},
 ): Promise<ProjectionWriteResult> {
+  return writeProjectionWith(diskProjectionLeaves(root), rawTarget, rawBytes, options);
+}
+
+/** {@link writeProjectionLocked} over the projection leaves: marker, then output, then verification. */
+export async function writeProjectionWith(
+  leaves: ProjectionLeaves,
+  rawTarget: ProjectionTarget,
+  rawBytes: Buffer,
+  options: ProjectionWriteOptions = {},
+): Promise<ProjectionWriteResult> {
   const prepared = prepareProjection(rawTarget, rawBytes);
-  let pair: Awaited<ReturnType<typeof readProjectionPair>>;
-  try { pair = await readProjectionPair(root, prepared.target); }
+  let pair: ProjectionPair;
+  try { pair = await leaves.readPair(prepared.target); }
   catch { throw new Error("projection is unavailable: projection path is unavailable"); }
   const initial = classifyProjection(prepared.target, pair);
   if (initial.status === "unavailable" || initial.status === "conflict") {
@@ -309,16 +359,12 @@ export async function writeProjectionLocked(
   const expectedOutput = snapshotProjectionOutput(pair);
   const expectedMarker = snapshotProjectionMarker(pair);
   const markerBytes = await publishProjectionMarker(
-    root, prepared, expectedOutput, expectedMarker, options,
+    leaves, prepared, expectedOutput, expectedMarker, options,
   );
-  await writeProjectionLeaf(root, projectionOutputPath(root, prepared.target), prepared.bytes, {
-    afterParentCheckForTest: () => assertProjectionUnchanged(
-      root, prepared.target, expectedOutput, markerBytes,
-    ),
-    ...(options.beforeOutputDirectorySyncForTest === undefined ? {}
-      : { beforeDirectorySyncForTest: options.beforeOutputDirectorySyncForTest }),
-  });
-  const verified = await observeProjection(root, prepared.target);
+  await leaves.writeOutput(prepared.target, prepared.bytes,
+    () => assertProjectionUnchanged(leaves, prepared.target, expectedOutput, markerBytes),
+    options.beforeOutputDirectorySyncForTest);
+  const verified = await observeProjectionFrom(leaves, prepared.target);
   if (verified.status !== "same") throw new Error(`projection verification failed: ${verified.status}`);
   if (initial.status === "absent") return "created";
   return initial.status === "same" ? "same" : "replaced";

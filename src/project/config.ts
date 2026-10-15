@@ -2,8 +2,9 @@
  * Shared project configuration reader. Missing configuration uses caller
  * defaults; consumers validate their own versioned settings after JSON loading.
  */
-import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
 import { LLMWIKI_DIR } from "../utils/constants.js";
 
 /** A present configuration cannot be interpreted safely. */
@@ -30,10 +31,15 @@ export function normalizeProjectConfig(raw: unknown): Record<string, unknown> {
 }
 
 /** Read the shared config; only an absent file permits default behavior. */
-export async function loadProjectConfig(root: string): Promise<Record<string, unknown> | null> {
+export function loadProjectConfig(root: string): Promise<Record<string, unknown> | null> {
+  return loadProjectConfigFrom(diskLocalReads(root));
+}
+
+/** The same configuration, read through `reads`; the absent-file rule is decided here, not by the binding. */
+export async function loadProjectConfigFrom(reads: LegacyLocalReads): Promise<Record<string, unknown> | null> {
   let body: string;
   try {
-    body = await readFile(path.join(root, LLMWIKI_DIR, "config.json"), "utf8");
+    body = await reads.readText(path.join(LLMWIKI_DIR, "config.json"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw new ProjectConfigError(`Invalid .llmwiki/config.json: ${String(error)}`);

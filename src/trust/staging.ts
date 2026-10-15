@@ -23,11 +23,20 @@
  * (lexical ranking + relation-edge expansion), and semantic search (under their
  * qualified EntityId). Per-entity-type viewer UI beyond basic node/edge distinction
  * and cross-type wikilink resolution remain deferred.
+ *
+ * ONE STAGING BODY. {@link stageEntityPageWith} keeps the order slug floor →
+ * on-disk count and volume bound → declared type → field contract → lifecycle →
+ * plan → blocked refusal → candidate write over {@link EntityPageStagingSteps};
+ * {@link stageEntityPage} keeps its signature and passes
+ * {@link localEntityPageStagingSteps}, whose members call the incumbent count,
+ * lifecycle read, planner and candidate writers when asked. Promotion stays the
+ * shared {@link promoteCandidateUnderLock} composition.
  */
 
 import {
   planPageMutation,
   type EntityRef,
+  type PlanPageInput,
   type PlanResult,
 } from "./planner.js";
 import {
@@ -48,7 +57,8 @@ import { loadNonDefaultProfile } from "../profile/block.js";
 import { acquireMutationLockBlocking } from "../operation-bundles/lock-gate.js";
 import { assertBodyFieldContract, assertBodyLifecycle } from "./typed-page-validate.js";
 import { releaseLock } from "../utils/lock.js";
-import type { ProfilePack } from "../profile/types.js";
+import type { EntityTypeDef, ProfilePack } from "../profile/types.js";
+import type { ReviewCandidate } from "../utils/types.js";
 import type { TrustDecision } from "./decision.js";
 import type { ConnectorProvenance } from "../connectors/types.js";
 import type { HeldReason, ReviewMode } from "../review/policy.js";
@@ -124,10 +134,32 @@ function buildPageTarget(plan: PlanResult): EntityRef {
   throw new Error("internal: staged plan has no live mutation target");
 }
 
+/** What staging asks of the project. No member takes a project root. */
+export interface EntityPageStagingSteps {
+  /** The real number of review candidates on disk (the per-session floor). */
+  countCandidates(): Promise<number>;
+  /** Refuse an illegal lifecycle transition against the live page's previous state. */
+  assertBodyLifecycle(entityType: string, slug: string, meta: Record<string, unknown>, def: EntityTypeDef): Promise<void>;
+  /** Plan the typed write against this project. */
+  planPage(request: Omit<PlanPageInput, "root">): Promise<PlanResult>;
+  /** Persist the candidate; a truthy `fresh` skips target-key canonicalization. */
+  writeCandidate(draft: CandidateDraft, fresh: boolean | undefined): Promise<ReviewCandidate>;
+}
+
+/** LOCAL DISK: the incumbent count, lifecycle read, planner and writers for one root, built per call. In no package index. */
+function localEntityPageStagingSteps(root: string): EntityPageStagingSteps {
+  return {
+    countCandidates: () => countCandidates(root),
+    assertBodyLifecycle: (entityType, slug, meta, def) => assertBodyLifecycle(root, entityType, slug, meta, def),
+    planPage: (request) => planPageMutation({ root, ...request }),
+    writeCandidate: (draft, fresh) => (fresh ? writeFreshCandidate(root, draft) : writeCandidate(root, draft)),
+  };
+}
+
 /** Enforce every staged-page input floor before planning or persistence. */
-async function assertStageInput(root: string, input: StageEntityPageInput): Promise<void> {
+async function assertStageInput(steps: EntityPageStagingSteps, input: StageEntityPageInput): Promise<void> {
   assertCandidateSlug(input.slug);
-  const onDisk = await countCandidates(root);
+  const onDisk = await steps.countCandidates();
   const sessionCount = Math.max(onDisk, input.existingStagedCount);
   assertStagedWriteBudget(sessionCount, 1, {
     perCall: DEFAULT_STAGED_WRITE_PER_CALL,
@@ -138,7 +170,7 @@ async function assertStageInput(root: string, input: StageEntityPageInput): Prom
   }
   const def = input.profile.entities[input.entityType]!;
   const meta = assertBodyFieldContract(input.profile, input.entityType, input.slug, input.body, def);
-  await assertBodyLifecycle(root, input.entityType, input.slug, meta, def);
+  await steps.assertBodyLifecycle(input.entityType, input.slug, meta, def);
 }
 
 /** Build the persisted candidate authority from the validated staged input. */
@@ -191,9 +223,16 @@ export async function stageEntityPage(
   root: string,
   input: StageEntityPageInput,
 ): Promise<StagedChange> {
-  await assertStageInput(root, input);
-  const plan = await planPageMutation({
-    root,
+  return stageEntityPageWith(localEntityPageStagingSteps(root), input);
+}
+
+/** {@link stageEntityPage} over {@link EntityPageStagingSteps}: THE ONE BODY. */
+export async function stageEntityPageWith(
+  steps: EntityPageStagingSteps,
+  input: StageEntityPageInput,
+): Promise<StagedChange> {
+  await assertStageInput(steps, input);
+  const plan = await steps.planPage({
     target: { kind: "entity", entityType: input.entityType, slug: input.slug },
     body: input.body,
     origin: "sdk",
@@ -207,9 +246,7 @@ export async function stageEntityPage(
   const target = buildPageTarget(plan);
   const operation = plan.planned[0]!.operation;
   const createdAt = (input.now ? input.now() : new Date()).toISOString();
-  const candidate = input.freshCandidateId
-    ? await writeFreshCandidate(root, candidateDraft)
-    : await writeCandidate(root, candidateDraft);
+  const candidate = await steps.writeCandidate(candidateDraft, input.freshCandidateId);
   return {
     id: candidate.id,
     kind: "page",

@@ -94,22 +94,31 @@ export async function confinedRegularFile(dir: string, name: string): Promise<st
 }
 
 /**
+ * Resolve `<realpath(root)>/<relDir>`, requiring it to be a REAL directory at
+ * that literal path. A symlinked directory (which would redirect every read and
+ * write outside the project) yields null, as does a missing root or directory.
+ */
+export async function resolveRealDir(root: string, relDir: string): Promise<string | null> {
+  const canonicalRoot = await safeRealpath(root);
+  if (canonicalRoot === null) return null;
+  const realDir = path.join(canonicalRoot, relDir);
+  try {
+    const st = await lstat(realDir);
+    if (!st.isDirectory()) return null; // symlink or non-dir → not trusted
+  } catch {
+    return null; // missing
+  }
+  return realDir;
+}
+
+/**
  * Resolve the trusted on-disk sources directory for `root`: `<realpath(root)>/sources`,
  * requiring `sources/` to be a REAL directory at that literal path. A symlinked
  * `sources/` (which would redirect every read/write outside the project) yields null.
  * Returns null when root is missing or `sources/` is absent / not a real directory.
  */
-export async function resolveSourcesDir(root: string): Promise<string | null> {
-  const canonicalRoot = await safeRealpath(root);
-  if (canonicalRoot === null) return null;
-  const sourcesDir = path.join(canonicalRoot, SOURCES_DIR);
-  try {
-    const st = await lstat(sourcesDir);
-    if (!st.isDirectory()) return null; // symlink or non-dir → not trusted
-  } catch {
-    return null; // missing
-  }
-  return sourcesDir;
+export function resolveSourcesDir(root: string): Promise<string | null> {
+  return resolveRealDir(root, SOURCES_DIR);
 }
 
 /**

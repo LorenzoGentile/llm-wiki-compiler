@@ -6,13 +6,31 @@
  * regular-file and race guards without sanitizing the archived bytes.
  * One custody capture feeds both the caller's pre-archive step and the move,
  * so the step sees exactly the bytes that are archived.
+ *
+ * Each consumer has ONE BODY over bound candidate-store mechanisms
+ * ({@link loadRejectableCandidateOrFailFrom}, {@link archiveRejectedCandidateFrom});
+ * the root forms are thin delegates over the local disk's mechanisms. The
+ * caller's `beforeArchive` step is invoked exactly as before and is not bound
+ * by this: whatever it reads or writes stays the caller's.
  */
-import { captureCandidateCustody, moveCandidateWithCustody } from "./candidate-custody.js";
+import {
+  captureCandidateCustodyFrom,
+  diskCandidateCustodyReads,
+  moveCandidateWithCustodyFrom,
+  type CandidateCustodyReads,
+  type CandidateStoreMoveReads,
+} from "./candidate-custody.js";
 import * as output from "../utils/output.js";
 
 /** Report absence while leaving unsafe ids and genuine store failures visible. */
 export async function loadRejectableCandidateOrFail(root: string, id: string): Promise<boolean> {
-  if (await captureCandidateCustody(root, id, undefined, "public") !== null) return true;
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return loadRejectableCandidateOrFailFrom(diskCandidateCustodyReads(root), id);
+}
+
+/** {@link loadRejectableCandidateOrFail} over the custody-read mechanisms: THE ONE BODY. */
+export async function loadRejectableCandidateOrFailFrom(reads: CandidateCustodyReads, id: string): Promise<boolean> {
+  if (await captureCandidateCustodyFrom(reads, id, undefined, "public") !== null) return true;
   return reportMissing(id);
 }
 
@@ -26,12 +44,30 @@ export async function archiveRejectedCandidate(
   id: string,
   beforeArchive?: (bytes: Buffer) => Promise<void>,
 ): Promise<boolean> {
-  const custody = await captureCandidateCustody(root, id, undefined, "public");
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return archiveRejectedCandidateFrom(diskCandidateCustodyReads(root), root, id, beforeArchive);
+}
+
+/**
+ * {@link archiveRejectedCandidate} over the move mechanisms: THE ONE BODY. The
+ * public-policy capture, absence as the shared refusal, the caller's step
+ * OUTSIDE the move's `try` (so its throw propagates and the record stays
+ * pending), the move bound to that capture's receipt, and any move fault or
+ * refusal as the fixed diagnostic with exit code 1. The supplied `reads` choose
+ * the project; `root` only fills the move request's validated legacy field.
+ */
+export async function archiveRejectedCandidateFrom(
+  reads: CandidateStoreMoveReads,
+  root: string,
+  id: string,
+  beforeArchive?: (bytes: Buffer) => Promise<void>,
+): Promise<boolean> {
+  const custody = await captureCandidateCustodyFrom(reads, id, undefined, "public");
   if (custody === null) return reportMissing(id);
   await beforeArchive?.(custody.bytes);
   let archived = false;
   try {
-    archived = await moveCandidateWithCustody({ root, fileId: id, direction: "archive", receipt: custody.receipt }, "public");
+    archived = await moveCandidateWithCustodyFrom(reads, { root, fileId: id, direction: "archive", receipt: custody.receipt }, "public");
   } catch {
     archived = false;
   }

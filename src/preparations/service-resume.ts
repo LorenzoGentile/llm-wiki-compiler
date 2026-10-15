@@ -33,6 +33,9 @@
  * pause REFUSES while an execution owner is recorded, so a paused run provably
  * has none, and `resumed` restores exactly the ownerless `running` the run was
  * held from. The record claims no attempt because no attempt field is written.
+ *
+ * ONE BODY, {@link resumePreparationOperationWith}, over the control verbs' shared steps
+ * (`ControlVerbSteps`); the root form passes the local disk steps.
  */
 
 import { REQUEST_CAPTURE_REFUSAL, capturedRequest } from "./service-request-capture.js";
@@ -40,8 +43,8 @@ import { preparationRunActor } from "./principals.js";
 import type { PreparationPrincipal } from "./principals.js";
 import type { PreparationRunBinding, PreparationRunState, PreparationRunV1 } from "./run-types.js";
 import { LEGAL_EDGES } from "./run-validation.js";
-import { appendControlTransitionLocked, withControlTarget } from "./service-control-transition.js";
-import type { ControlAppendV1 } from "./service-control-transition.js";
+import { appendControlTransitionWith, diskControlVerbSteps, withControlTargetFrom } from "./service-control-transition.js";
+import type { ControlAppendV1, ControlVerbSteps } from "./service-control-transition.js";
 
 /** Request for the `resume` operation. Carries no actor, surface or grant. */
 export interface ResumeRequestV1 {
@@ -121,10 +124,10 @@ function resumeRefusal(run: PreparationRunV1): string | null {
 
 /** Append the resume transition through the shared control-verb primitive. */
 async function appendResumed(
-  root: string, binding: PreparationRunBinding, run: PreparationRunV1,
+  steps: ControlVerbSteps, binding: PreparationRunBinding, run: PreparationRunV1,
   principal: PreparationPrincipal,
 ): Promise<ControlAppendV1> {
-  return appendControlTransitionLocked(root, binding, run, {
+  return appendControlTransitionWith(steps, binding, run, {
     type: "resumed", stateAfter: RESUME_TARGET_STATE,
     payload: { kind: "none" },
     actor: preparationRunActor(principal), at: new Date().toISOString(),
@@ -133,7 +136,7 @@ async function appendResumed(
 
 /** Apply the state preconditions, then append. */
 async function resumeResolved(
-  root: string, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
+  steps: ControlVerbSteps, runId: string, binding: PreparationRunBinding, run: PreparationRunV1,
   principal: PreparationPrincipal,
 ): Promise<ResumeResultV1> {
   // IDEMPOTENT BEFORE THE PRECONDITIONS, exactly as `pause` is. A retry after a
@@ -144,7 +147,7 @@ async function resumeResolved(
   }
   const refused = resumeRefusal(run);
   if (refused !== null) return { status: "refused", reason: refused };
-  const appended = await appendResumed(root, binding, run, principal);
+  const appended = await appendResumed(steps, binding, run, principal);
   return appended.ok
     ? { status: "resumed", runId, transition: "appended" }
     : { status: "refused", reason: appended.reason };
@@ -165,11 +168,19 @@ async function resumeResolved(
 export async function resumePreparationOperation(
   root: string, principal: PreparationPrincipal, request: ResumeRequestV1,
 ): Promise<ResumeResultV1> {
+  // Building the disk steps does no I/O and awaits nothing, so the body's capture still runs before the first await.
+  return resumePreparationOperationWith(diskControlVerbSteps(root), principal, request);
+}
+
+/** {@link resumePreparationOperation} over {@link ControlVerbSteps}: THE ONE BODY. */
+export async function resumePreparationOperationWith(
+  steps: ControlVerbSteps, principal: PreparationPrincipal, request: ResumeRequestV1,
+): Promise<ResumeResultV1> {
   // CAPTURED IN THE SYNCHRONOUS PROLOGUE AND BY DESCRIPTOR (D-10-9), for the same
   // reason `pause` is: this is a write path, and an own accessor here would
   // retarget the durable transition at a run the caller never named.
   const captured = capturedRequest<ResumeRequestV1>(request);
   if (captured === null) return { status: "refused", reason: REQUEST_CAPTURE_REFUSAL };
   const runId = captured.runId;
-  return withControlTarget(root, runId, (binding, run) => resumeResolved(root, runId, binding, run, principal));
+  return withControlTargetFrom(steps, runId, (binding, run) => resumeResolved(steps, runId, binding, run, principal));
 }

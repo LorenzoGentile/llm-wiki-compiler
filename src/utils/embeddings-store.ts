@@ -8,6 +8,13 @@
  * other embeddings-* module uses. Format selection and atomic persistence live
  * in embeddings-storage.ts; logical v1/v2/v3 migration remains unchanged.
  *
+ * The write-path read and the validated write each have ONE BODY over the raw
+ * storage bindings, {@link readStoreForUpdateFrom} and
+ * {@link writeEmbeddingStoreFrom}; their root forms hand them the local disk's.
+ * The search read decides ONCE, over whatever the stored reader answered:
+ * {@link readEmbeddingStore} asks the incumbent root reader and
+ * {@link readEmbeddingStoreFrom} asks the reader's own body over the bindings.
+ *
  * Confinement + resource-cap policy (B1):
  *  - READ: no mkdir on clean projects; no-follow, size-capped reads select an
  *    authoritative binary leaf before legacy JSON. Refusal never revives JSON.
@@ -24,8 +31,7 @@
  *    calling validateV3ForSearch on it, so migration can transform it safely.
  */
 
-import { NoFollowOpenError, openFileNoFollow } from "./no-follow-open.js";
-import { constants as fsConstants } from "node:fs";
+import { readPrivateLeafTextOrThrow } from "../storage/disk-private-leaves.js";
 import { createHash } from "node:crypto";
 import path from "path";
 import {
@@ -38,7 +44,17 @@ import { EMBEDDINGS_FILE, EMBEDDING_MODELS, MAX_EMBEDDING_STORE_BYTES } from "./
 import { assertEmbeddingStoreValid, filterMalformedIdentities, assertFieldCaps } from "./embeddings-validate.js";
 import { resolveExistingConfinedPrivateDir } from "./private-dir.js";
 import { parseQualifiedPageId, type PageId } from "./page-id.js";
-import { readStoredEmbeddings, persistEmbeddingStore, type ParsedStore } from "./embeddings-storage.js";
+import {
+  diskStoredEmbeddingReads,
+  diskStoredEmbeddingWrites,
+  persistEmbeddingStoreFrom,
+  readStoredEmbeddings,
+  readStoredEmbeddingsFrom,
+  type ParsedStore,
+  type StoredEmbeddingRead,
+  type StoredEmbeddingReads,
+  type StoredEmbeddingWrites,
+} from "./embeddings-storage.js";
 export { parseEmbeddingStore, type ParsedStore } from "./embeddings-storage.js";
 export { EmbeddingStoreFullError } from "./embeddings-errors.js";
 
@@ -141,22 +157,7 @@ export interface EmbeddingStoreV3 {
 export async function readConfinedRaw(root: string): Promise<string | null> {
   const dir = await resolveExistingConfinedPrivateDir(root);
   if (dir === null) return null;
-  const filePath = path.join(dir, path.basename(EMBEDDINGS_FILE));
-  let handle;
-  try {
-    handle = await openFileNoFollow(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (err instanceof NoFollowOpenError || code === "ENOENT" || code === "ELOOP") return null;
-    throw err;
-  }
-  try {
-    const size = (await handle.stat()).size;
-    if (size > MAX_EMBEDDING_STORE_BYTES) return null;
-    return await handle.readFile("utf-8");
-  } finally {
-    await handle.close();
-  }
+  return readPrivateLeafTextOrThrow(path.join(dir, path.basename(EMBEDDINGS_FILE)), MAX_EMBEDDING_STORE_BYTES);
 }
 
 /**
@@ -170,7 +171,16 @@ export async function readConfinedRaw(root: string): Promise<string | null> {
  * A symlinked .llmwiki dir throws (fail closed via private-dir confinement).
  */
 export async function readEmbeddingStore(root: string): Promise<EmbeddingStore | null> {
-  const result = await readStoredEmbeddings(root);
+  return searchableStoreOf(await readStoredEmbeddings(root));
+}
+
+/** {@link readEmbeddingStore} over {@link StoredEmbeddingReads}: the same decision over the stored reader's one body. A directory refusal still REJECTS. In no package index. */
+export async function readEmbeddingStoreFrom(reads: StoredEmbeddingReads): Promise<EmbeddingStore | null> {
+  return searchableStoreOf(await readStoredEmbeddingsFrom(reads));
+}
+
+/** The search view of one stored read: a parsed store whose malformed identities are dropped and whose vectors validate, else `null`. */
+function searchableStoreOf(result: StoredEmbeddingRead): EmbeddingStore | null {
   if (result.kind !== "parsed") return null;
   try {
     const parsed = result.parsed.store;
@@ -191,9 +201,24 @@ export async function writeEmbeddingStore(
   root: string,
   store: EmbeddingStore | EmbeddingStoreV3,
 ): Promise<void> {
+  return writeEmbeddingStoreFrom(diskStoredEmbeddingWrites(root), store);
+}
+
+/**
+ * {@link writeEmbeddingStore} over {@link StoredEmbeddingWrites}: THE ONE BODY.
+ * The store is validated BEFORE anything is looked at or written, then handed
+ * to the one persistence body. Exported for the embedding writer; in no package index.
+ *
+ * @param writes - The raw private-directory looks, its creation, and one leaf's replacement.
+ * @param store - The store to validate and persist.
+ */
+export async function writeEmbeddingStoreFrom(
+  writes: StoredEmbeddingWrites,
+  store: EmbeddingStore | EmbeddingStoreV3,
+): Promise<void> {
   assertEmbeddingStoreValid(store);
   assertFieldCaps(store as unknown as Record<string, unknown>);
-  await persistEmbeddingStore(root, store);
+  await persistEmbeddingStoreFrom(writes, store);
 }
 
 /** Result of {@link validateV3ForSearch}. */
@@ -254,7 +279,12 @@ function filterMalformedPageIds(store: Record<string, unknown>): string[] {
  * Returns null when the file is absent, oversized, unconfined, or unparseable.
  */
 export async function readStoreForUpdate(root: string): Promise<ParsedStore | null> {
-  const result = await readStoredEmbeddings(root);
+  return readStoreForUpdateFrom(diskStoredEmbeddingReads(root));
+}
+
+/** {@link readStoreForUpdate} over {@link StoredEmbeddingReads}: THE ONE BODY. Anything but a parsed store is `null`. Exported for the embedding writer; in no package index. */
+export async function readStoreForUpdateFrom(reads: StoredEmbeddingReads): Promise<ParsedStore | null> {
+  const result = await readStoredEmbeddingsFrom(reads);
   return result.kind === "parsed" ? result.parsed : null;
 }
 

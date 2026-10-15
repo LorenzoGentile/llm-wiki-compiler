@@ -10,6 +10,13 @@
  * settled from what the {@link EmbeddingAttemptRecorder} saw. Every marker write
  * is re-read, because the writer swallows write and unlink failures.
  * The caller must hold the project lock throughout this lifecycle.
+ *
+ * The whole lifecycle has ONE BODY over {@link EmbeddingMarkerStorage}, the
+ * marker reads and writes already bound beneath it; each root form is a thin
+ * delegate over the local disk's mechanisms. Admission, settlement, the
+ * verified re-reads, the scoped refusal and the full drain's fail-open read all
+ * stay here. The provider run, the caller's lock and the callers above stay
+ * as they were.
  */
 
 import { MAX_PENDING_EMBEDDING_ATTEMPTS, QUARANTINED_EMBEDDINGS_FILE } from "./constants.js";
@@ -17,17 +24,34 @@ import { EmbeddingAttemptRecorder } from "./embedding-attempts.js";
 import * as output from "./output.js";
 import type { PageId } from "./page-id.js";
 import {
-  loadPendingEmbeddings,
-  readPendingMarker,
+  diskEmbeddingMarkerReads,
+  diskEmbeddingMarkerWrites,
+  readPendingMarkerFrom,
   writePendingEmbeddings,
+  writePendingEmbeddingsFrom,
   mergeFreshAttempts,
   normalizeMarker,
   warnQuarantined,
+  type EmbeddingMarkerReads,
+  type EmbeddingMarkerWrites,
   type PendingEmbedding,
 } from "./pending-embeddings.js";
 import { decideRetry, dropShadowedPending, fitAdmissions, settleRetry } from "./retry-exclusions.js";
 
 type MarkerFile = Parameters<typeof writePendingEmbeddings>[2];
+
+/** The marker reads and writes the lifecycle runs over: the bound contracts, combined, with no new member. */
+export type EmbeddingMarkerStorage = EmbeddingMarkerReads & EmbeddingMarkerWrites;
+
+/** LOCAL DISK. The incumbent marker reads and writes for `root`. Building it does no I/O. Exported only so the refresh's root forms can compose it; in no package index. */
+export function diskEmbeddingMarkerStorage(root: string): EmbeddingMarkerStorage {
+  return { ...diskEmbeddingMarkerReads(root), ...diskEmbeddingMarkerWrites(root) };
+}
+
+/** A marker's entries, read fail-open: `loadPendingEmbeddings` over `reads`. */
+async function loadMarkerFrom(reads: EmbeddingMarkerReads, file?: MarkerFile): Promise<PendingEmbedding[]> {
+  return (await readPendingMarkerFrom(reads, file)).entries;
+}
 
 /** The core's report of a run that returned normally. */
 interface CoreResult {
@@ -47,7 +71,7 @@ class EmbeddingRetry {
 
   /** Keep mutable state private to a single locked refresh. */
   constructor(
-    private readonly root: string,
+    private readonly storage: EmbeddingMarkerStorage,
     private pending: PendingEmbedding[],
     private quarantined: PendingEmbedding[],
     private readonly changedIds: PageId[],
@@ -63,11 +87,11 @@ class EmbeddingRetry {
 
   /** Record explicit work before even store discovery can fail; never release an exclusion here. */
   async recordPending(): Promise<void> {
-    const prior = await readPendingMarker(this.root);
+    const prior = await readPendingMarkerFrom(this.storage);
     const merged = withFreshWork(this.pending, this.quarantined, this.changedIds, this.scope !== undefined);
-    if (merged.length > 0 || prior.status === "ok") await writePendingEmbeddings(this.root, merged);
+    if (merged.length > 0 || prior.status === "ok") await writePendingEmbeddingsFrom(this.storage, merged);
     // The writer applies both resource caps. Never attempt work it dropped.
-    this.pending = await loadPendingEmbeddings(this.root);
+    this.pending = await loadMarkerFrom(this.storage);
     if (this.scope) this.deferred = unrecorded([...this.scope], this.pending, this.quarantined);
   }
 
@@ -77,7 +101,7 @@ class EmbeddingRetry {
     const fit = fitAdmissions(this.pending, decisions.map(d => d.entry));
     this.deferred = [...new Set([...this.deferred, ...fit.deferred])];
     if (fit.admitted.length === 0) return [];
-    if (!(await writeVerified(this.root, fit.entries, undefined))) {
+    if (!(await writeVerified(this.storage, fit.entries, undefined))) {
       this.deferred = [...new Set([...this.deferred, ...fit.admitted.map(e => e.pageId)])];
       return [];
     }
@@ -105,7 +129,7 @@ class EmbeddingRetry {
     });
     const retired = await this.retire(quarantine);
     const held = quarantine.filter(e => !retired.has(e.pageId));
-    if (!(await writeVerified(this.root, [...pending, ...held], undefined))) {
+    if (!(await writeVerified(this.storage, [...pending, ...held], undefined))) {
       throw new Error("Embedding retry state could not be settled; attempt counts may be stale.");
     }
     warnQuarantined(quarantine.filter(e => retired.has(e.pageId)));
@@ -126,7 +150,7 @@ class EmbeddingRetry {
     if (released.length === 0) return;
     const ids = new Set(released.map(d => d.entry.pageId));
     const kept = this.quarantined.filter(e => !ids.has(e.pageId));
-    if (await writeVerified(this.root, kept, QUARANTINED_EMBEDDINGS_FILE)) this.quarantined = kept;
+    if (await writeVerified(this.storage, kept, QUARANTINED_EMBEDDINGS_FILE)) this.quarantined = kept;
     else output.status("!", output.warn("Could not remove released pages from the embedding quarantine; the next refresh completes it."));
   }
 
@@ -135,8 +159,8 @@ class EmbeddingRetry {
     if (entries.length === 0) return new Set();
     const ids = new Set(entries.map(e => e.pageId));
     const next = [...this.quarantined.filter(e => !ids.has(e.pageId)), ...entries];
-    await writePendingEmbeddings(this.root, next, QUARANTINED_EMBEDDINGS_FILE);
-    this.quarantined = await loadPendingEmbeddings(this.root, QUARANTINED_EMBEDDINGS_FILE);
+    await writePendingEmbeddingsFrom(this.storage, next, QUARANTINED_EMBEDDINGS_FILE);
+    this.quarantined = await loadMarkerFrom(this.storage, QUARANTINED_EMBEDDINGS_FILE);
     const durable = new Map(this.quarantined.map(e => [e.pageId, e]));
     // Retain overflow in pending with its exhausted count; never retire an unpersisted exclusion.
     return new Set(entries.filter(e => sameExclusion(durable.get(e.pageId), e)).map(e => e.pageId));
@@ -181,10 +205,10 @@ function sameExclusion(persisted: PendingEmbedding | undefined, intended: Pendin
 }
 
 /** Write a marker and confirm the persisted result is exactly what was intended. */
-async function writeVerified(root: string, entries: PendingEmbedding[], file: MarkerFile): Promise<boolean> {
+async function writeVerified(storage: EmbeddingMarkerStorage, entries: PendingEmbedding[], file: MarkerFile): Promise<boolean> {
   const intended = JSON.stringify(normalizeMarker(entries));
-  await writePendingEmbeddings(root, entries, file);
-  const read = await readPendingMarker(root, file);
+  await writePendingEmbeddingsFrom(storage, entries, file);
+  const read = await readPendingMarkerFrom(storage, file);
   return read.status !== "unavailable" && JSON.stringify(read.entries) === intended;
 }
 
@@ -199,8 +223,14 @@ function announceLegacyGrants(count: number): void {
 
 /** Load an affected-only retry set, retaining unrelated budgets and exclusions verbatim. */
 export async function loadScopedEmbeddingRetry(root: string, affectedIds: PageId[]): Promise<EmbeddingRetry> {
-  const { pending, quarantined } = await readScopedRetryState(root);
-  return new EmbeddingRetry(root, pending, quarantined, affectedIds, new Set(affectedIds));
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return loadScopedEmbeddingRetryFrom(diskEmbeddingMarkerStorage(root), affectedIds);
+}
+
+/** {@link loadScopedEmbeddingRetry} over `storage`: THE ONE BODY. */
+export async function loadScopedEmbeddingRetryFrom(storage: EmbeddingMarkerStorage, affectedIds: PageId[]): Promise<EmbeddingRetry> {
+  const { pending, quarantined } = await readScopedRetryState(storage);
+  return new EmbeddingRetry(storage, pending, quarantined, affectedIds, new Set(affectedIds));
 }
 
 /**
@@ -210,15 +240,21 @@ export async function loadScopedEmbeddingRetry(root: string, affectedIds: PageId
  * the batch up front instead of failing after pages are already live.
  */
 export async function unrecordableScopedIds(root: string, affectedIds: PageId[]): Promise<PageId[]> {
-  const { pending, quarantined } = await readScopedRetryState(root);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return unrecordableScopedIdsFrom(diskEmbeddingMarkerStorage(root), affectedIds);
+}
+
+/** {@link unrecordableScopedIds} over `storage`: THE ONE BODY. It writes nothing. */
+export async function unrecordableScopedIdsFrom(storage: EmbeddingMarkerStorage, affectedIds: PageId[]): Promise<PageId[]> {
+  const { pending, quarantined } = await readScopedRetryState(storage);
   const recorded = normalizeMarker(withFreshWork(pending, quarantined, affectedIds, true));
   return unrecorded(affectedIds, recorded, quarantined);
 }
 
 /** Both markers, refusing to guess when either cannot be read. */
-async function readScopedRetryState(root: string): Promise<{ pending: PendingEmbedding[]; quarantined: PendingEmbedding[] }> {
+async function readScopedRetryState(reads: EmbeddingMarkerReads): Promise<{ pending: PendingEmbedding[]; quarantined: PendingEmbedding[] }> {
   const [pendingRead, quarantineRead] = await Promise.all([
-    readPendingMarker(root), readPendingMarker(root, QUARANTINED_EMBEDDINGS_FILE),
+    readPendingMarkerFrom(reads), readPendingMarkerFrom(reads, QUARANTINED_EMBEDDINGS_FILE),
   ]);
   if (pendingRead.status === "unavailable" || quarantineRead.status === "unavailable") {
     throw new Error("Embedding retry state unavailable; scoped refresh cannot preserve unrelated entries.");
@@ -233,15 +269,27 @@ async function readScopedRetryState(root: string): Promise<{ pending: PendingEmb
  * can refuse rather than drop work.
  */
 export async function queueScopedEmbeddingRetry(root: string, affectedIds: PageId[]): Promise<PageId[]> {
-  const retry = await loadScopedEmbeddingRetry(root, affectedIds);
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return queueScopedEmbeddingRetryFrom(diskEmbeddingMarkerStorage(root), affectedIds);
+}
+
+/** {@link queueScopedEmbeddingRetry} over `storage`: THE ONE BODY. */
+export async function queueScopedEmbeddingRetryFrom(storage: EmbeddingMarkerStorage, affectedIds: PageId[]): Promise<PageId[]> {
+  const retry = await loadScopedEmbeddingRetryFrom(storage, affectedIds);
   await retry.recordPending();
   return retry.deferred;
 }
 
 /** Load retry state for a full drain; markers are read fail-open, as before. */
 export async function loadEmbeddingRetry(root: string, changedPageIds: PageId[]): Promise<EmbeddingRetry> {
+  // `async` so that a throw while the disk mechanisms are built REJECTS.
+  return loadEmbeddingRetryFrom(diskEmbeddingMarkerStorage(root), changedPageIds);
+}
+
+/** {@link loadEmbeddingRetry} over `storage`: THE ONE BODY. */
+export async function loadEmbeddingRetryFrom(storage: EmbeddingMarkerStorage, changedPageIds: PageId[]): Promise<EmbeddingRetry> {
   const [pending, quarantined] = await Promise.all([
-    loadPendingEmbeddings(root), loadPendingEmbeddings(root, QUARANTINED_EMBEDDINGS_FILE),
+    loadMarkerFrom(storage), loadMarkerFrom(storage, QUARANTINED_EMBEDDINGS_FILE),
   ]);
-  return new EmbeddingRetry(root, pending, quarantined, changedPageIds);
+  return new EmbeddingRetry(storage, pending, quarantined, changedPageIds);
 }

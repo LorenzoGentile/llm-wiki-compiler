@@ -51,7 +51,7 @@ async function arrangeReconciliation(): Promise<ReconciliationProbe> {
       ? "Old claim from deleted contributor. ^[a.md:1-2]\n\nShared claim. ^[b.md:1-2]"
       : "Rebuilt survivor claim. ^[b.md:1-2, a.md:1-2]";
   });
-  vi.spyOn(embeddings, "updateEmbeddingsLockedCore")
+  vi.spyOn(embeddings, "updateEmbeddingsLockedCoreFrom")
     .mockResolvedValue({ embedded: [], eligible: [], pruned: [] });
   vi.spyOn(console, "log").mockImplementation(() => {});
   return {

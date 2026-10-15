@@ -8,6 +8,13 @@
  * leg-K validation passes. On any park/drift/unsafe-effect the temporary custody
  * is discarded and nothing is published to the authoritative store, so a rejected
  * late result never leaves authoritative bytes behind.
+ *
+ * ONLY THE PUBLISH LEG IS PROJECT STORAGE. `publishCustodyWith` links the
+ * verified temporary objects through the streaming evidence writer body over
+ * {@link PreparationEvidenceWriteSteps}; `publishCustodyLocked` keeps its signature
+ * and passes the local-disk steps. Creating, copying, verifying and discarding the
+ * custody directory are HOST temporary-file work and stay exactly as they are:
+ * minted-directory provenance, no canonicalization, no generalized cleanup.
  */
 
 import { mkdtemp, open, rm } from "node:fs/promises";
@@ -16,7 +23,10 @@ import { constants as fsConstants } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { streamPreparationEvidenceCreateOnly, type PreparationEvidenceLocation } from "../evidence-store.js";
+import {
+  diskPreparationEvidenceWriteSteps, streamPreparationEvidenceCreateOnlyWith,
+  type PreparationEvidenceLocation, type PreparationEvidenceWriteSteps,
+} from "../evidence-store.js";
 import type { PendingEvidenceV1 } from "./types.js";
 
 const CUSTODY_CHUNK_BYTES = 1024 * 1024;
@@ -172,14 +182,16 @@ async function verifyTempObject(item: PendingEvidenceV1, cap: number): Promise<b
 }
 
 /** Link one verified temporary object into the create-only evidence CAS. */
-async function linkIntoCas(root: string, location: PreparationEvidenceLocation, item: PendingEvidenceV1, cap: number): Promise<boolean> {
+async function linkIntoCas(
+  steps: PreparationEvidenceWriteSteps, location: PreparationEvidenceLocation, item: PendingEvidenceV1, cap: number,
+): Promise<boolean> {
   const bare = item.ref.digest.slice(SHA256_PREFIX.length);
   let handle;
   try {
     handle = await openCustodyObject(item.tempPath);
   } catch { return false; }
   try {
-    const streamed = await streamPreparationEvidenceCreateOnly(root, location, handle, bare, cap);
+    const streamed = await streamPreparationEvidenceCreateOnlyWith(steps, location, handle, bare, cap);
     return streamed.status === "written" && streamed.byteCount === item.ref.byteCount;
   } finally {
     await handle.close().catch(() => {});
@@ -200,11 +212,18 @@ async function linkIntoCas(root: string, location: PreparationEvidenceLocation, 
 export async function publishCustodyLocked(
   root: string, location: PreparationEvidenceLocation, pending: readonly PendingEvidenceV1[], cap: number,
 ): Promise<boolean> {
+  return publishCustodyWith(diskPreparationEvidenceWriteSteps(root), location, pending, cap);
+}
+
+/** {@link publishCustodyLocked} over the evidence write steps: verify every host temp object, then link each. */
+export async function publishCustodyWith(
+  steps: PreparationEvidenceWriteSteps, location: PreparationEvidenceLocation, pending: readonly PendingEvidenceV1[], cap: number,
+): Promise<boolean> {
   for (const item of pending) {
     if (!(await verifyTempObject(item, cap))) return false;
   }
   try {
-    for (const item of pending) if (!(await linkIntoCas(root, location, item, cap))) return false;
+    for (const item of pending) if (!(await linkIntoCas(steps, location, item, cap))) return false;
   } catch {
     return false;
   }

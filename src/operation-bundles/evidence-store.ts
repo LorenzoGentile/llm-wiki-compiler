@@ -2,6 +2,14 @@
  * @file src/operation-bundles/evidence-store.ts
  * @description Run-owned immutable evidence blobs and the fixed-shape,
  * non-persisting reference used when evidence exceeds the launch blob cap.
+ *
+ * ONE BODY. {@link writeRunEvidenceWith} decides the metadata bounds, when
+ * evidence is over the blob cap (a hashed, excerpted reference and no write) and
+ * the content-addressed reference, over {@link RunEvidenceBlobs}: the run's
+ * evidence location (whose derivation validates the identities, before any size
+ * decision, exactly as before) and its create-only blob write.
+ * {@link writeRunEvidenceCreateOnly} keeps its signature and passes the local
+ * disk blobs (`operationPaths` and `writeContentAddressedBlob`).
  */
 
 import { createHash } from "node:crypto";
@@ -91,14 +99,50 @@ function observeOverLimitEvidence(bytes: Buffer): { digest: OperationDigest; exc
   return { digest: `sha256:${hash.digest("hex")}` as OperationDigest, excerpt };
 }
 
+/** One run's evidence location: where its content-addressed blobs are created. */
+interface RunEvidenceTarget {
+  /** Create the blob named by `digestHex`, create-only and capped at `maxBytes`; its result is not consulted. */
+  writeBlob(digestHex: string, bytes: Buffer, maxBytes: number): Promise<unknown>;
+}
+
+/** Where run evidence goes. No member takes a project root. */
+export interface RunEvidenceBlobs {
+  /** The run's evidence location; deriving it validates both identities and THROWS on an invalid one. */
+  target(workspaceId: string, runId: OperationRunId): RunEvidenceTarget;
+}
+
+/** LOCAL DISK. The run's evidence directory under `root` and the incumbent content-addressed blob writer. */
+function diskRunEvidenceBlobs(root: string): RunEvidenceBlobs {
+  return {
+    target: (workspaceId, runId) => {
+      const paths = operationPaths(root, workspaceId);
+      paths.evidenceRoot(runId);
+      return {
+        writeBlob: (digestHex, bytes, maxBytes) => writeContentAddressedBlob({
+          root, bytes, maxBytes, digest: digestHex,
+          file: paths.evidenceFile(runId, digestHex), ownedRoot: paths.evidenceRoot(runId),
+        }),
+      };
+    },
+  };
+}
+
 /** Durably create one bounded evidence blob or emit a non-persisting limit reference. */
 export async function writeRunEvidenceCreateOnly(
   root: string,
   location: RunEvidenceLocation,
   bytes: Buffer,
 ): Promise<RunEvidenceWriteResult> {
-  const metadata = evidenceMetadata(location), paths = operationPaths(root, location.workspaceId);
-  paths.evidenceRoot(location.runId);
+  return writeRunEvidenceWith(diskRunEvidenceBlobs(root), location, bytes);
+}
+
+/** {@link writeRunEvidenceCreateOnly} over {@link RunEvidenceBlobs}: THE ONE BODY. Metadata, then the location, then the size decision. */
+export async function writeRunEvidenceWith(
+  blobs: RunEvidenceBlobs,
+  location: RunEvidenceLocation,
+  bytes: Buffer,
+): Promise<RunEvidenceWriteResult> {
+  const metadata = evidenceMetadata(location), target = blobs.target(location.workspaceId, location.runId);
   if (bytes.byteLength > MAX_RUN_EVIDENCE_BLOB_BYTES) {
     const observed = observeOverLimitEvidence(bytes);
     const reference = { digest: observed.digest, byteCount: bytes.byteLength, ...metadata };
@@ -106,11 +150,6 @@ export async function writeRunEvidenceCreateOnly(
   }
   const preparedBytes = Buffer.from(bytes);
   const reference = evidenceReference(metadata, preparedBytes);
-  await writeContentAddressedBlob({
-    root, bytes: preparedBytes, maxBytes: MAX_RUN_EVIDENCE_BLOB_BYTES,
-    digest: reference.digest.slice("sha256:".length),
-    file: paths.evidenceFile(location.runId, reference.digest.slice("sha256:".length)),
-    ownedRoot: paths.evidenceRoot(location.runId),
-  });
+  await target.writeBlob(reference.digest.slice("sha256:".length), preparedBytes, MAX_RUN_EVIDENCE_BLOB_BYTES);
   return reference;
 }

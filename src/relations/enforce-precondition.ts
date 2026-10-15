@@ -29,13 +29,18 @@
  * release the held lock early (the `releaseLock` PID residual) or deadlock. Both
  * the relation read and the endpoint resolver are bare confined reads. Never add
  * locking here.
+ *
+ * ONE BODY: {@link enforceRelationPreconditionsFrom} decides over
+ * {@link RelationPreconditionReads} — the relation store's own graph read and the
+ * entity-page look the endpoint resolver already takes. The root form keeps its
+ * signature and builds both local reads per call; building them does no I/O.
  */
 
 import { parseEntityId, EntityIdError } from "../profile/identity.js";
-import { readConfinedEntityFrontmatter } from "../profile/lifecycle-read.js";
+import { diskEntityPageReads, readConfinedEntityFrontmatterFrom, type EntityPageReads } from "../profile/lifecycle-read.js";
 import { validateEntityFields } from "../profile/field-contract.js";
 import { lifecycleStates } from "../profile/validate-helpers.js";
-import { GraphDirConfinementError } from "../utils/jsonl-store.js";
+import { diskGraphStoreReads, GraphDirConfinementError, type GraphStoreReads } from "../utils/jsonl-store.js";
 import type { EntityId, EntityTypeDef, LifecycleDef, ProfilePack } from "../profile/types.js";
 import {
   checkRelationPreconditions,
@@ -45,7 +50,7 @@ import {
   type RejectedCandidate,
   type UnmetRelationRequirement,
 } from "./precondition.js";
-import { readLiveValidRelations } from "./live-valid.js";
+import { readLiveValidRelationsFrom } from "./live-valid.js";
 import {
   RelationStoreCorruptError,
   RelationStoreTooNewError,
@@ -145,29 +150,25 @@ export function isStoreUnavailable(err: unknown): boolean {
 }
 
 /**
- * Build the LOCK-FREE endpoint FACTS resolver: does an endpoint id resolve to a
- * real, PROFILE-VALID on-disk page under `root`, and what lifecycle state does it
- * carry? Parses the id to its entity type + slug, looks up the type in `profile`,
- * reads the confined page's frontmatter via the handle-bound
- * {@link readConfinedEntityFrontmatter}, and validates it against the type's
+ * Build the LOCK-FREE endpoint FACTS resolver over {@link EntityPageReads}: does an
+ * endpoint id resolve to a real, PROFILE-VALID page, and what lifecycle state does
+ * it carry? Parses the id to its entity type + slug, looks up the type in
+ * `profile`, reads the confined page's frontmatter via
+ * {@link readConfinedEntityFrontmatterFrom}, and validates it against the type's
  * field contract with the SHARED {@link validateEntityFields} (the same
- * implementation the collector and typed write gates enforce). NO lock acquire
- * (the enforcer runs inside the caller's held lock; a lock here would release it
- * early). An unparseable id, an undeclared entity type, an absent/escaping page,
- * or a page with ANY field-contract violation all resolve to `null` — mere
- * on-disk existence is NOT evidence, so a dangling, fabricated, or
- * contract-violating relation edge is dropped by the checker. But a page that
- * FAULTS on read (a raw I/O errno — `EACCES`/`EMFILE`/`EIO`) is NOT `null`: it
- * THROWS {@link EndpointUnreadableError}, which the checker propagates so the
- * enforcer maps it to {@link RelationPreconditionUnverifiableError} (park), never
- * miscounting a transient read fault as an unmet precondition.
- *
- * Exported so the read-side STANDING check ({@link ../profile/relation-standing.js})
- * resolves endpoint facts through the SAME confined resolver the write-side
- * enforcer uses — read and write agree on what "a qualifying endpoint" means,
- * rather than the read path hand-rolling a second, divergent check.
+ * implementation the collector and typed write gates enforce). NO lock acquire.
+ * An unparseable id, an undeclared entity type, an absent/escaping page, or a page
+ * with ANY field-contract violation all resolve to `null` — mere on-disk existence
+ * is NOT evidence. But a page that FAULTS on read (a raw I/O errno) THROWS
+ * {@link EndpointUnreadableError}, which the enforcer maps to
+ * {@link RelationPreconditionUnverifiableError} (park), never miscounting a
+ * transient read fault as an unmet precondition. THE ONE BODY: the memo, the id
+ * parsing, the field-contract check and what an unreadable or absent page means
+ * are all here; the page read only looks. The read-side STANDING check
+ * ({@link ../profile/relation-standing.js}) takes it too, so read and write agree
+ * on what "a qualifying endpoint" means.
  */
-export function makeEndpointFactsResolver(root: string, profile: ProfilePack): EndpointResolver {
+export function makeEndpointFactsResolverFrom(pages: EntityPageReads, profile: ProfilePack): EndpointResolver {
   // MEMOIZE per resolver instance (each is call-scoped: one standing check or one
   // write enforce over an unchanging snapshot). A hub endpoint referenced by
   // hundreds of gated pages is then read + validated ONCE, not once per referencing
@@ -177,7 +178,7 @@ export function makeEndpointFactsResolver(root: string, profile: ProfilePack): E
   return (id) => {
     let cached = cache.get(id);
     if (cached === undefined) {
-      cached = resolveEndpointFacts(root, profile, id);
+      cached = resolveEndpointFacts(pages, profile, id);
       cache.set(id, cached);
     }
     return cached;
@@ -185,7 +186,7 @@ export function makeEndpointFactsResolver(root: string, profile: ProfilePack): E
 }
 
 /** Resolve one endpoint id to its facts (or `null`), throwing on an unreadable page. */
-async function resolveEndpointFacts(root: string, profile: ProfilePack, id: EntityId): Promise<EndpointFacts | null> {
+async function resolveEndpointFacts(pages: EntityPageReads, profile: ProfilePack, id: EntityId): Promise<EndpointFacts | null> {
   let parsed: { entityType: string; slug: string };
   try {
     parsed = parseEntityId(id);
@@ -195,7 +196,7 @@ async function resolveEndpointFacts(root: string, profile: ProfilePack, id: Enti
   }
   const def = profile.entities[parsed.entityType];
   if (!def) return null;
-  const read = await readConfinedEntityFrontmatter(root, def, parsed.slug);
+  const read = await readConfinedEntityFrontmatterFrom(pages, def, parsed.slug);
   if (read.kind === "unreadable") throw new EndpointUnreadableError(read.cause);
   if (read.kind === "absent") return null;
   if (validateEntityFields(read.meta, def).length > 0) return null;
@@ -216,6 +217,17 @@ function endpointLifecycleFacts(frontmatter: Record<string, unknown>, def: Entit
   if (lc === undefined) return {};
   const value = frontmatter[lc.field];
   return typeof value === "string" && lifecycleStates(lc).has(value) ? { state: value } : {};
+}
+
+/**
+ * The two reads the relation enforcer asks for. No member takes a project root.
+ * Local: `diskGraphStoreReads(root)` and `diskEntityPageReads(root)`.
+ */
+export interface RelationPreconditionReads {
+  /** The relation store's graph read (the live+profile-valid filter runs over it). */
+  graph: GraphStoreReads;
+  /** The entity-page look the endpoint FACTS resolver takes. */
+  pages: EntityPageReads;
 }
 
 /** Inputs to {@link enforceRelationPreconditions}; grouped to keep the arg list small. */
@@ -254,12 +266,24 @@ export interface EnforceRelationPreconditionsArgs {
  * @throws {RelationPreconditionUnverifiableError} When the relation store is unreadable.
  */
 export async function enforceRelationPreconditions(args: EnforceRelationPreconditionsArgs): Promise<void> {
+  return enforceRelationPreconditionsFrom({ graph: diskGraphStoreReads(args.root), pages: diskEntityPageReads(args.root) }, args);
+}
+
+/**
+ * {@link enforceRelationPreconditions} over {@link RelationPreconditionReads}: THE ONE
+ * BODY. The early-out reads nothing; the store read maps only a store-unavailable
+ * throw to Unverifiable; the endpoint resolver is scoped (and memoized) to this one
+ * call; an unreadable endpoint is Unverifiable; a shortfall is Unmet.
+ */
+export async function enforceRelationPreconditionsFrom(
+  reads: RelationPreconditionReads, args: Omit<EnforceRelationPreconditionsArgs, "root">,
+): Promise<void> {
   const reqs = args.lifecycle.transitionRelationRequirements?.[args.enteredState];
   if (reqs === undefined || reqs.length === 0) return; // early-out: read NOTHING
   let liveValidRelations: RelationRef[];
   try {
     // Lock-free read (see the file overview): the caller already holds the lock.
-    liveValidRelations = await readLiveValidRelations(args.root, args.profile);
+    liveValidRelations = await readLiveValidRelationsFrom(reads.graph, args.profile);
   } catch (err) {
     if (isStoreUnavailable(err)) throw new RelationPreconditionUnverifiableError(err as Error);
     throw err; // a genuinely-unexpected error propagates
@@ -272,7 +296,7 @@ export async function enforceRelationPreconditions(args: EnforceRelationPrecondi
       enteredState: args.enteredState,
       lifecycle: args.lifecycle,
       liveValidRelations,
-      resolveEndpoint: makeEndpointFactsResolver(args.root, args.profile),
+      resolveEndpoint: makeEndpointFactsResolverFrom(reads.pages, args.profile),
     });
   } catch (err) {
     // An endpoint page that could not be READ (transient I/O fault) is "cannot

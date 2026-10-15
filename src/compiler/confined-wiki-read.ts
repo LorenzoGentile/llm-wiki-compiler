@@ -9,7 +9,7 @@
  *
  * Both exports resolve the canonical root, derive the EXACT expected directory,
  * confine the exact file under it (`safeRealpath` + `isInsideDir`), then read
- * the bytes through {@link readConfinedPage} — which binds the returned bytes to
+ * the bytes through `readConfinedPage` — which binds the returned bytes to
  * the OPENED HANDLE's `{dev,ino}` (TOCTOU-safe, never re-opens the path). This
  * mirrors the resolve pattern in `../utils/page-registry.ts`.
  *
@@ -27,13 +27,13 @@
  */
 
 import path from "path";
-import { lstat } from "fs/promises";
-import { safeRealpath, isInsideDir } from "../utils/path-confine.js";
-import { readConfinedPage } from "../utils/confined-read.js";
+import { leafPresent } from "../storage/disk-guarded-leaves.js";
+import { diskLocalReads, readConfinedExactFile } from "../storage/disk-local-reads.js";
+import type { ConfinedReadResult, LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import { safeRealpath } from "../utils/path-confine.js";
 import * as output from "../utils/output.js";
 
-/** A confined read outcome: either the file's bytes, or a drop reason. */
-export type ConfinedReadResult = { content: string } | { dropped: string };
+export type { ConfinedReadResult };
 
 /**
  * Emit a PROMINENT, tamper-grade warning that a wiki read was dropped, NAMING
@@ -46,7 +46,7 @@ export type ConfinedReadResult = { content: string } | { dropped: string };
  *   the message so an operator can locate and remove the offending symlink).
  * @param reason - The machine-readable drop reason from {@link ConfinedReadResult}.
  */
-function warnDroppedWikiRead(relPath: string, reason: string): void {
+export function warnDroppedWikiRead(relPath: string, reason: string): void {
   output.status(
     "!",
     output.warn(
@@ -63,7 +63,10 @@ function warnDroppedWikiRead(relPath: string, reason: string): void {
  * MUST surface prominently. The `lstat` is no-follow, so an escaping SYMLINK is
  * detected as present (it is the symlink that exists, not its target).
  *
- * @param absPath - Absolute path of the wiki file that was dropped.
+ * @param absPath - Absolute path of the wiki file that was dropped. It must be a
+ *   `path.join` result that ENDS IN A FILE NAME, as every caller passes: the
+ *   presence test splits it into parent and name, which is the identity only
+ *   for such a path (not for a trailing separator or an empty string).
  * @param relPath - Project-relative path to name in the warning.
  * @param reason - The machine-readable drop reason.
  */
@@ -72,7 +75,7 @@ export async function warnDroppedWikiReadIfPresent(
   relPath: string,
   reason: string,
 ): Promise<void> {
-  const exists = await lstat(absPath).then(() => true, () => false);
+  const exists = await leafPresent(path.dirname(absPath), path.basename(absPath)).catch(() => false);
   if (exists) warnDroppedWikiRead(relPath, reason);
 }
 
@@ -93,14 +96,39 @@ export async function warnDroppedWikiReadIfPresent(
  * @param warnAlways - See {@link readWikiPageOrWarn}.
  * @returns The page bytes, or `""` when dropped.
  */
-export async function readWikiPageContentOrWarn(
+export function readWikiPageContentOrWarn(
   root: string,
   relDir: string,
   slug: string,
   warnAlways = true,
 ): Promise<string> {
-  const result = await readWikiPageOrWarn(root, relDir, slug, warnAlways);
+  return readWikiPageContentOrWarnFrom(diskLocalReads(root), relDir, slug, warnAlways);
+}
+
+/** {@link readWikiPageContentOrWarn}, with the page read through `reads`. */
+export async function readWikiPageContentOrWarnFrom(
+  reads: LegacyLocalReads,
+  relDir: string,
+  slug: string,
+  warnAlways = true,
+): Promise<string> {
+  const result = await readWikiPageOrWarn(reads, relDir, slug, warnAlways);
   return "content" in result ? result.content : "";
+}
+
+/**
+ * {@link warnDroppedWikiReadIfPresent} for a project-relative path, with the
+ * no-follow presence check made through `reads`. Any failure to stat means
+ * "not present", exactly as the absolute-path form decides it.
+ */
+export async function warnDroppedReadIfPresentFrom(
+  reads: LegacyLocalReads,
+  statPath: string,
+  relPath: string,
+  reason: string,
+): Promise<void> {
+  const exists = await reads.statNoFollow(statPath).then(() => true, () => false);
+  if (exists) warnDroppedWikiRead(relPath, reason);
 }
 
 /**
@@ -118,97 +146,60 @@ export async function readWikiPageContentOrWarn(
  *    file PHYSICALLY exists — an escaping symlink or a fail-closed read — via
  *    {@link warnDroppedWikiReadIfPresent}.
  *
- * @param root - Project root the page must resolve under.
+ * @param reads - The project's read binding; the page must resolve under it.
  * @param relDir - Project-relative directory the page must stay inside.
  * @param slug - Page slug (`<slug>.md` is read under `relDir`).
  * @param warnAlways - Warn on every drop (scan sites), else only when present.
  * @returns The confined read result, after emitting any drop warning.
  */
 async function readWikiPageOrWarn(
-  root: string,
+  reads: LegacyLocalReads,
   relDir: string,
   slug: string,
   warnAlways = true,
 ): Promise<ConfinedReadResult> {
-  const result = await readConfinedWikiPage(root, relDir, slug);
-  return emitDropWarning(result, path.join(root, relDir), path.join(relDir, `${slug}.md`), warnAlways);
-}
-
-/**
- * Read one wiki page confined to the EXACT absolute directory `absScanDir`
- * (the directory itself is the confinement boundary). Used by directory-SCAN
- * sites — `indexgen.scanWikiPages` and `obsidian.loadConceptPages` — which hold
- * an absolute scan dir, not a project-root + relative-dir pair. This avoids the
- * fragile `dirname`/`basename` back-derivation those sites used to repeat, and
- * confines `<absScanDir>/<slug>.md` directly via the shared
- * realpath + isInsideDir + handle-bound read flow.
- *
- * Returns the discriminated result so callers keep the EMPTY-vs-DROPPED
- * distinction; a drop warning is emitted here per `warnAlways` (defaulting to
- * `true`, since scan callers iterate `readdir` entries that provably exist).
- *
- * @param absScanDir - Absolute directory the page must stay inside.
- * @param slug - Page slug; the file read is `<slug>.md` under `absScanDir`.
- * @param warnAlways - Warn on every drop (the scan default), else only when present.
- * @returns The confined read result, after emitting any drop warning.
- */
-export async function readWikiPageInDirOrWarn(
-  absScanDir: string,
-  slug: string,
-  warnAlways = true,
-): Promise<ConfinedReadResult> {
-  const canonicalDir = await safeRealpath(absScanDir);
-  const result: ConfinedReadResult = canonicalDir
-    ? await readConfinedExactFile(canonicalDir, path.join(canonicalDir, `${slug}.md`))
-    : { dropped: "no-root" };
-  return emitDropWarning(result, absScanDir, `${slug}.md`, warnAlways);
-}
-
-/**
- * Emit the drop warning for a confined read result and return it unchanged.
- * Centralizes the `warnAlways` branch so every "…OrWarn" wrapper shares one
- * policy: warn on every drop, or only when the file physically exists.
- *
- * @param result - The confined read outcome to inspect.
- * @param absDir - Absolute directory the page lives in (for the no-follow lstat).
- * @param relPath - Path named in the warning message.
- * @param warnAlways - Warn on every drop, else only when the file is present.
- * @returns `result`, unchanged.
- */
-async function emitDropWarning(
-  result: ConfinedReadResult,
-  absDir: string,
-  relPath: string,
-  warnAlways: boolean,
-): Promise<ConfinedReadResult> {
+  const result = await reads.readConfinedPage(relDir, slug);
   if ("content" in result) return result;
+  const relPath = path.join(relDir, `${slug}.md`);
   if (warnAlways) warnDroppedWikiRead(relPath, result.dropped);
-  else await warnDroppedWikiReadIfPresent(path.join(absDir, path.basename(relPath)), relPath, result.dropped);
+  else await warnDroppedReadIfPresentFrom(reads, path.join(relDir, path.basename(relPath)), relPath, result.dropped);
   return result;
 }
 
 /**
- * Read the exact `filePath` confined to `expectedDir` through the handle-bound,
- * no-follow {@link readConfinedPage}. Returns `{dropped:"escapes-dir"}` if the
- * realpath is missing or escapes the dir (never reads the target), or
- * `{dropped:"unreadable"}` if the confined read itself fails closed.
+ * LOCAL DISK. Read one wiki page confined to the EXACT absolute directory
+ * `absScanDir` (the directory itself is the confinement boundary): the
+ * real-path look at `absScanDir`, then the confined exact-file read of
+ * `<slug>.md` under it, through the shared realpath + isInsideDir +
+ * handle-bound read flow. A directory that does not resolve is
+ * `{dropped: "no-root"}`.
+ *
+ * Used by the directory-SCAN sites, the page scan in `indexgen` and the
+ * concept load in `obsidian`, which hold an absolute scan dir, not a
+ * project-root + relative-dir pair.
+ *
+ * NO WARNING IS EMITTED HERE. The discriminated result keeps the
+ * EMPTY-vs-DROPPED distinction, and the CALLER owns what a drop means and
+ * reports it: both scan sites warn on every drop through
+ * {@link warnDroppedWikiRead}, naming `<slug>.md`, since they iterate listed
+ * entries that provably exist.
+ *
+ * @param absScanDir - Absolute directory the page must stay inside.
+ * @param slug - Page slug; the file read is `<slug>.md` under `absScanDir`.
+ * @returns The confined read result, with no warning emitted.
  */
-async function readConfinedExactFile(
-  expectedDir: string,
-  filePath: string,
-): Promise<ConfinedReadResult> {
-  const real = await safeRealpath(filePath);
-  if (!real || !isInsideDir(real, expectedDir)) return { dropped: "escapes-dir" };
-  const content = await readConfinedPage(real, expectedDir);
-  if (content === null) return { dropped: "unreadable" };
-  return { content };
+export async function readWikiPageInDir(absScanDir: string, slug: string): Promise<ConfinedReadResult> {
+  const canonicalDir = await safeRealpath(absScanDir);
+  return canonicalDir
+    ? readConfinedExactFile(canonicalDir, path.join(canonicalDir, `${slug}.md`))
+    : { dropped: "no-root" };
 }
 
 /**
  * Read a wiki page confined to its EXACT expected directory. The file
  * `<root>/<relDir>/<slug>.md` is resolved, and a symlink whose realpath escapes
  * `<root>/<relDir>` is DROPPED — its target is never read or emitted. The body
- * is read through {@link readConfinedPage}, so the no-follow handle-bound read
+ * is read through the binding's handle-bound reader, so the no-follow handle-bound read
  * also defeats a TOCTOU parent-directory swap.
  *
  * @param root - Project root path (raw; canonicalized internally via realpath).
@@ -218,16 +209,12 @@ async function readConfinedExactFile(
  * @returns `{content}` with the real bytes, or `{dropped}` (`"no-root"`,
  *   `"escapes-dir"`, or `"unreadable"`) — never the escaping target's bytes.
  */
-export async function readConfinedWikiPage(
+export function readConfinedWikiPage(
   root: string,
   relDir: string,
   slug: string,
 ): Promise<ConfinedReadResult> {
-  const canonicalRoot = await safeRealpath(root);
-  if (!canonicalRoot) return { dropped: "no-root" };
-  const expectedDir = path.join(canonicalRoot, relDir);
-  const filePath = path.join(expectedDir, `${slug}.md`);
-  return readConfinedExactFile(expectedDir, filePath);
+  return diskLocalReads(root).readConfinedPage(relDir, slug);
 }
 
 /**
@@ -235,7 +222,7 @@ export async function readConfinedWikiPage(
  * directory. Unlike {@link readConfinedWikiPage} this takes a full project-
  * relative path and performs no mkdir and no symlink-leaf alias handling: the
  * exact file is confined under `<root>/<dirname(relPath)>` and read through the
- * handle-bound {@link readConfinedPage}. A symlinked file whose realpath escapes
+ * handle-bound reader. A symlinked file whose realpath escapes
  * that directory is DROPPED — its target bytes are never returned.
  *
  * @param root - Project root path (raw; canonicalized internally via realpath).
@@ -243,13 +230,9 @@ export async function readConfinedWikiPage(
  * @returns `{content}` with the real bytes, or `{dropped}` (`"no-root"`,
  *   `"escapes-dir"`, or `"unreadable"`) — never the escaping target's bytes.
  */
-export async function readConfinedWikiFile(
+export function readConfinedWikiFile(
   root: string,
   relPath: string,
 ): Promise<ConfinedReadResult> {
-  const canonicalRoot = await safeRealpath(root);
-  if (!canonicalRoot) return { dropped: "no-root" };
-  const expectedDir = path.join(canonicalRoot, path.dirname(relPath));
-  const filePath = path.join(canonicalRoot, relPath);
-  return readConfinedExactFile(expectedDir, filePath);
+  return diskLocalReads(root).readConfinedFile(relPath);
 }

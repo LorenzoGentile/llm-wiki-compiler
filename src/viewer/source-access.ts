@@ -5,23 +5,27 @@
  */
 import path from "path";
 import { assertSafeSourceId, toRecord } from "../sources/source-record.js";
-import { readConfinedLeaf } from "../utils/confined-read.js";
+import { diskLocalCappedReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalCappedReads } from "../storage/legacy-local-reads.js";
 import { PathSafetyError } from "./path-safety.js";
 
 /** A preview is deliberately bounded, not a streaming arbitrary-file interface. */
 const SOURCE_PREVIEW_BYTES = 1024 * 1024;
 
 /** Preserve physical source line numbers, including frontmatter, in the local preview. */
-export async function readViewerSource(root: string, filenames: readonly string[], id: string, isLoopback: boolean): Promise<Record<string, unknown>> {
+export function readViewerSource(root: string, filenames: readonly string[], id: string, isLoopback: boolean): Promise<Record<string, unknown>> {
+  return readViewerSourceFrom(diskLocalCappedReads(root), filenames, id, isLoopback);
+}
+
+/** {@link readViewerSource} with the one bounded read made through `reads`; every check stays here. */
+export async function readViewerSourceFrom(reads: LegacyLocalCappedReads, filenames: readonly string[], id: string, isLoopback: boolean): Promise<Record<string, unknown>> {
   if (!id) throw new PathSafetyError("Invalid source identifier.");
   // Reuse the relative-ID contract without pretending other formats are Markdown.
   assertSafeSourceId(id.endsWith(".md") ? id : `${id}.md`);
   const base = { kind: "raw-source", id, contentAccess: isLoopback ? "available" : "loopback-only" };
   if (!filenames.includes(id)) return { ...base, health: "missing" };
   if (!id.endsWith(".md")) return { ...base, health: "unsupported" };
-  const dir = path.join(root, "sources");
-  const file = path.join(dir, id);
-  const read = await readConfinedLeaf(root, file, path.dirname(file), SOURCE_PREVIEW_BYTES);
+  const read = await reads.readCappedText(path.join("sources", id), SOURCE_PREVIEW_BYTES);
   if (read.kind !== "ok") return { ...base, health: read.kind === "absent" ? "missing" : "unavailable" };
   const { source, ...record } = toRecord(id, read.body, false);
   const locator = webLocator(source);

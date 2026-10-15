@@ -15,8 +15,8 @@
  * this detector only REPORTS it.
  */
 
-import { classifyJournalDir } from "./journal.js";
-import { classifyJournalFile, listBatchIds } from "./journal-classify.js";
+import { classifyJournalFileFrom, diskJournalReadSources, listBatchIdsFrom } from "./journal-classify.js";
+import type { JournalBatches, JournalReadSources } from "./journal-classify.js";
 
 /**
  * The read-only health verdict for a project's intent journal:
@@ -48,21 +48,33 @@ export type JournalHealthStatus = "ok" | "pending" | "unavailable";
 export async function journalHealth(
   root: string,
 ): Promise<{ status: JournalHealthStatus }> {
-  const dirState = await classifyJournalDir(root);
-  if (dirState.kind === "absent") return { status: "ok" };
-  if (dirState.kind === "escape") return { status: "unavailable" };
-  return { status: await classifyBatches(root, dirState.dir) };
+  return journalHealthFrom(diskJournalReadSources(root));
 }
 
 /**
- * Classify every batch file in the confined journal dir and reduce to a single
+ * {@link journalHealth} over {@link JournalReadSources}: THE ONE BODY. The
+ * journal is opened once. No directory is `ok`; a directory that leaves the
+ * project is `unavailable`; otherwise its batches decide. Nothing is caught: a
+ * listing that rejects rejects the read.
+ */
+export async function journalHealthFrom(
+  sources: JournalReadSources,
+): Promise<{ status: JournalHealthStatus }> {
+  const opening = await sources.openJournal();
+  if (opening.kind === "absent") return { status: "ok" };
+  if (opening.kind === "escape") return { status: "unavailable" };
+  return { status: await classifyBatches(opening.journal) };
+}
+
+/**
+ * Classify every batch file of the opened journal, in listing order, and reduce to a single
  * health status. Any `unsafe` file short-circuits to `unavailable` (fail closed);
  * else any `pending-revertable` batch yields `pending`; else `ok`.
  */
-async function classifyBatches(root: string, confinedDir: string): Promise<JournalHealthStatus> {
+async function classifyBatches(journal: JournalBatches): Promise<JournalHealthStatus> {
   let sawPending = false;
-  for (const batchId of await listBatchIds(confinedDir)) {
-    const verdict = await classifyJournalFile(root, batchId);
+  for (const batchId of await listBatchIdsFrom(journal)) {
+    const verdict = await classifyJournalFileFrom(journal, batchId);
     if (verdict === "unsafe") return "unavailable";
     if (verdict === "pending-revertable") sawPending = true;
   }

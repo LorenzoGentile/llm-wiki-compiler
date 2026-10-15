@@ -7,13 +7,22 @@
  * the action filter); a degraded inventory PARKS, never denies (mutant: treat
  * problems as clean); an unreadable candidate PARKS (mutant: count it as
  * no-match); a non-provider producer or an initial-input ref does not vouch
- * (mutant: drop the producer/kind conjuncts). The packaged journey witnesses
- * the same verifier over the real store; this file isolates the guard.
+ * (mutant: drop the producer/kind conjuncts).
+ *
+ * This file runs the verifier's ONE BODY, `verifyExecutionProvenanceFrom`,
+ * over a synthetic double of its three reads. The second block shows which
+ * reads are made and that a read's rejection is not caught.
+ *
+ * NOT SHOWN HERE: anything about the disk. NO TEST runs this verifier over a
+ * real preparation store with a candidate run: no test profile on disk declares
+ * an execution-provenance requirement. `execution-provenance-scan-binding.test.ts`
+ * runs the real SCAN binding on an empty root and nothing more; the
+ * sealed-input and run bindings are executed by no test.
  */
 
 import { describe, expect, it } from "vitest";
 import {
-  verifyExecutionProvenanceWith, type ExecutionProvenanceStoreV1,
+  verifyExecutionProvenanceFrom, type ExecutionProvenanceReads,
 } from "../../src/artifacts/execution-provenance.js";
 import type { PreparationManifestV1 } from "../../src/preparations/manifest-parse.js";
 import type { PreparationRunV1 } from "../../src/preparations/run-types.js";
@@ -21,7 +30,6 @@ import type { ExecutionProvenanceReq } from "../../src/profile/types.js";
 
 const REQ: ExecutionProvenanceReq = { actionId: "demo.execute", slugInputField: "slug", resultOutputId: "result" };
 const DIGEST = `sha256:${"a".repeat(64)}`;
-const ROOT = "/synthetic";
 
 /** A candidate: its manifest's action id + run id, the frozen input, and the run's state + evidence. */
 interface Candidate {
@@ -32,18 +40,18 @@ interface Candidate {
 }
 
 /** Build a synthetic store over `candidates`; `problems` marks the scan degraded. */
-function storeOf(candidates: readonly Candidate[], problems: readonly unknown[] = []): ExecutionProvenanceStoreV1 {
+function storeOf(candidates: readonly Candidate[], problems: readonly unknown[] = []): ExecutionProvenanceReads {
   const manifests = candidates.map((candidate, index) => ({
     runId: `prr_${index}`, plan: { actionAuthority: { actionId: candidate.actionId ?? REQ.actionId } },
   })) as unknown as PreparationManifestV1[];
   return {
     scanInventory: async () => ({ manifests, problems }),
-    readInitialInput: async (_root, manifest) => {
+    readInitialInput: async (manifest) => {
       const candidate = candidates[Number(manifest.runId.slice(4))]!;
       const input = candidate.input ?? { slug: "probe" };
       return input === "unreadable" ? { ok: false, reason: "sealed input is unavailable" } : { ok: true, record: input };
     },
-    resolveRun: async (_root, runId) => {
+    resolveRun: async (runId) => {
       const candidate = candidates[Number(runId.slice(4))]!;
       const run = {
         state: candidate.state ?? "succeeded",
@@ -54,7 +62,7 @@ function storeOf(candidates: readonly Candidate[], problems: readonly unknown[] 
   };
 }
 
-const verdictOf = (store: ExecutionProvenanceStoreV1) => verifyExecutionProvenanceWith(store, ROOT, REQ, "probe", DIGEST);
+const verdictOf = (store: ExecutionProvenanceReads) => verifyExecutionProvenanceFrom(store, REQ, "probe", DIGEST);
 
 describe("execution-provenance conjuncts", () => {
   it("PASSES only the fully matching succeeded run (the positive control)", async () => {
@@ -91,15 +99,47 @@ describe("execution-provenance conjuncts", () => {
   });
 
   it("PARKS when a candidate run itself is unavailable, but DENIES a run the store settles as absent", async () => {
-    const unavailable: ExecutionProvenanceStoreV1 = { ...storeOf([{}]), resolveRun: async () => ({ ok: false, failure: "unavailable", reason: "torn" }) };
-    const absent: ExecutionProvenanceStoreV1 = { ...storeOf([{}]), resolveRun: async () => ({ ok: false, failure: "denied", reason: "no such run" }) };
+    const unavailable: ExecutionProvenanceReads = { ...storeOf([{}]), resolveRun: async () => ({ ok: false, failure: "unavailable", reason: "torn" }) };
+    const absent: ExecutionProvenanceReads = { ...storeOf([{}]), resolveRun: async () => ({ ok: false, failure: "denied", reason: "no such run" }) };
     expect((await verdictOf(unavailable)).verdict).toBe("park");
     expect((await verdictOf(absent)).verdict).toBe("deny");
   });
 
   it("PARKS when the scan itself throws, and DENIES a clean scan with no candidate at all", async () => {
-    const throwing: ExecutionProvenanceStoreV1 = { ...storeOf([]), scanInventory: async () => { throw new Error("EIO"); } };
+    const throwing: ExecutionProvenanceReads = { ...storeOf([]), scanInventory: async () => { throw new Error("EIO"); } };
     expect((await verdictOf(throwing)).verdict).toBe("park");
     expect((await verdictOf(storeOf([]))).verdict).toBe("deny");
+  });
+});
+
+/** `reads` with every call logged BEFORE it is made, into one ordered log. */
+function logged(reads: ExecutionProvenanceReads, calls: string[]): ExecutionProvenanceReads {
+  return {
+    scanInventory: () => { calls.push("scan"); return reads.scanInventory(); },
+    readInitialInput: (manifest) => { calls.push(`input ${manifest.runId}`); return reads.readInitialInput(manifest); },
+    resolveRun: (runId) => { calls.push(`run ${runId}`); return reads.resolveRun(runId); },
+  };
+}
+
+describe("execution-provenance reads: which are made, and what a rejection does", () => {
+  it("P9 reads no input for another action and no run for another slug", async () => {
+    const calls: string[] = [];
+    const verdict = await verdictOf(logged(storeOf([{ actionId: "other.action" }, { input: { slug: "other" } }, {}]), calls));
+    expect(calls).toEqual(["scan", "input prr_1", "input prr_2", "run prr_2"]);
+    expect(verdict).toEqual({ verdict: "pass", detail: "run prr_2 admitted the pinned bytes under output 'result'" });
+  });
+
+  it("P10 reads nothing after the first candidate that vouches", async () => {
+    const calls: string[] = [];
+    expect((await verdictOf(logged(storeOf([{}, {}]), calls))).verdict).toBe("pass");
+    expect(calls).toEqual(["scan", "input prr_0", "run prr_0"]);
+  });
+
+  it("P11 rejects with the same error when the sealed-input read or the run read rejects: only the scan is caught", async () => {
+    const refused = new Error("EIO: read refused");
+    const input: ExecutionProvenanceReads = { ...storeOf([{}]), readInitialInput: async () => { throw refused; } };
+    const run: ExecutionProvenanceReads = { ...storeOf([{}]), resolveRun: async () => { throw refused; } };
+    await expect(verdictOf(input)).rejects.toBe(refused);
+    await expect(verdictOf(run)).rejects.toBe(refused);
   });
 });

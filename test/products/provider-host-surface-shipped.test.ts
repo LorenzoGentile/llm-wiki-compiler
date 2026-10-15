@@ -207,4 +207,17 @@ describe("the distributed artifact's public surface", () => {
     const backendish = Object.keys(PUBLIC_RUNTIME_EXPORTS).filter((n) => /backend/i.test(n));
     expect(backendish).toEqual([]);
   });
+
+  it("ships NO portable-project prototype entry point from any built entry", async () => {
+    // The registered-project gate ships; registering, opening, hosting and paging a
+    // portable project do not. The pinned table refuses additions to `llmwiki`; this
+    // also covers the core package's root and compiler-cli entries, which the table
+    // does not read.
+    const entries = ["dist/index.js", "packages/llmwiki-core/dist/index.js", "packages/llmwiki-core/dist/compiler-cli.js"];
+    const withheld = /^(openProject|registerProject|startSimulatedHost|openPagedProject|openCommandSession|startPortableViewer|portableSurface|pagedSurface|project[A-Z]\w*Command)$/u;
+    for (const entry of entries) {
+      const shipped = await import(path.resolve(entry)) as Record<string, unknown>;
+      expect([entry, Object.keys(shipped).filter((name) => withheld.test(name))]).toEqual([entry, []]);
+    }
+  });
 });

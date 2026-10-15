@@ -11,7 +11,7 @@
 import path from "path";
 import { readdir, stat } from "fs/promises";
 import { buildFrontmatter } from "../utils/markdown.js";
-import { saveSource } from "../utils/source-writer.js";
+import { saveSourceUnderProjectGate } from "../operation-bundles/registered-project-lock.js";
 import * as output from "../utils/output.js";
 import { parseSessionFile, formatSessionAsMarkdown } from "../adapters/registry.js";
 import type { NormalizedSession } from "../adapters/types.js";
@@ -54,7 +54,7 @@ async function saveSessionSource(
   const frontmatter = buildSessionFrontmatter(session, sourcePath);
   const body = formatSessionAsMarkdown(session);
   const document = `${frontmatter}\n\n${body}\n`;
-  return (await saveSource(root, session.title, document, sourcePath)).path;
+  return (await saveSourceUnderProjectGate(root, session.title, document, sourcePath)).path;
 }
 
 /**

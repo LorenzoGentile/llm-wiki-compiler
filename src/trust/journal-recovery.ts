@@ -17,17 +17,27 @@
  * batch, whole-batch confinement gate, per-entry re-confined revert) so the
  * strict path and the best-effort path agree on what a valid, confined,
  * revertable batch is — only the response to a NON-revertable batch differs.
+ *
+ * STORAGE. {@link recoverJournalBeforeCompileFrom} is THE ONE BODY, over the raw
+ * I/O it is handed; the root form passes the incumbent local disk
+ * (`./journal-io.ts`). The body keeps every decision: the classify-then-load-
+ * again gap (the second load re-checks neither status nor confinement), the
+ * legacy prune, the typed refusal, and revert-before-remove. The CALLER holds
+ * the project lock.
  */
 
-import { unlink } from "fs/promises";
 import {
-  classifyJournalDir,
-  loadBatch,
-  revertEntry,
+  classifyJournalDirFrom,
+  loadBatchFrom,
+  revertEntryFrom,
   journalPath,
   type JournalBatch,
 } from "./journal.js";
-import { classifyJournalFile, listBatchIds } from "./journal-classify.js";
+import { classifyJournalFileFrom, journalBatchReadsFrom, listBatchIdsFrom } from "./journal-classify.js";
+import { diskJournalReplayIo, type JournalReplayIo } from "./journal-io.js";
+
+/** What strict recovery asks: restoration's members plus a listing — never the quarantine moves. */
+type RecoveryIo = Omit<JournalReplayIo, "makeDirectoryTree" | "renameLeafUnguarded">;
 
 /** The outcome of a strict pre-compile recovery pass. */
 export type RecoveryStatus = "clean" | "replayed" | "unsafe";
@@ -61,11 +71,19 @@ export class JournalUnsafeError extends Error {
 export async function recoverJournalBeforeCompile(
   root: string,
 ): Promise<{ status: RecoveryStatus }> {
-  const dirState = await classifyJournalDir(root);
+  return recoverJournalBeforeCompileFrom(diskJournalReplayIo, root);
+}
+
+/** THE ONE BODY of {@link recoverJournalBeforeCompile}: only {@link JournalUnsafeError} becomes `unsafe`; every other failure propagates. */
+export async function recoverJournalBeforeCompileFrom(
+  io: RecoveryIo,
+  root: string,
+): Promise<{ status: RecoveryStatus }> {
+  const dirState = await classifyJournalDirFrom(io, root);
   if (dirState.kind === "absent") return { status: "clean" };
   if (dirState.kind === "escape") return { status: "unsafe" };
   try {
-    return { status: await recoverPendingBatches(root, dirState.dir) };
+    return { status: await recoverPendingBatches(io, root, dirState.dir) };
   } catch (err) {
     if (err instanceof JournalUnsafeError) return { status: "unsafe" };
     throw err;
@@ -77,10 +95,10 @@ export async function recoverJournalBeforeCompile(
  * committed files. Returns `replayed` if any pending batch was reverted, else
  * `clean`. Throws {@link JournalUnsafeError} on the first non-revertable batch.
  */
-async function recoverPendingBatches(root: string, confinedDir: string): Promise<RecoveryStatus> {
+async function recoverPendingBatches(io: RecoveryIo, root: string, confinedDir: string): Promise<RecoveryStatus> {
   let replayedAny = false;
-  for (const batchId of await listBatchIds(confinedDir)) {
-    if (await recoverOneBatch(root, batchId)) replayedAny = true;
+  for (const batchId of await listBatchIdsFrom({ listNames: () => io.listDirectoryNames(confinedDir) })) {
+    if (await recoverOneBatch(io, root, batchId)) replayedAny = true;
   }
   return replayedAny ? "replayed" : "clean";
 }
@@ -93,16 +111,16 @@ async function recoverPendingBatches(root: string, confinedDir: string): Promise
  * {@link JournalUnsafeError} when the file is malformed/unreadable or names an
  * escaping target.
  */
-async function recoverOneBatch(root: string, batchId: string): Promise<boolean> {
-  const verdict = await classifyJournalFile(root, batchId);
+async function recoverOneBatch(io: RecoveryIo, root: string, batchId: string): Promise<boolean> {
+  const verdict = await classifyJournalFileFrom(journalBatchReadsFrom(io, root), batchId);
   if (verdict === "unsafe") {
     throw new JournalUnsafeError(`non-revertable journal ${batchId}.json`);
   }
   if (verdict === "legacy-committed") {
-    await unlink(journalPath(root, batchId)); // prune a legacy committed file
+    await io.removeLeaf(journalPath(root, batchId)); // prune a legacy committed file
     return false;
   }
-  await revertPendingBatch(root, await loadConfinedPending(root, batchId));
+  await revertPendingBatch(io, root, await loadConfinedPending(io, root, batchId));
   return true;
 }
 
@@ -111,16 +129,16 @@ async function recoverOneBatch(root: string, batchId: string): Promise<boolean> 
  * guarding the (vanishingly unlikely) concurrent-tamper window where the file
  * changed between classify and revert by failing closed as unsafe.
  */
-async function loadConfinedPending(root: string, batchId: string): Promise<JournalBatch> {
-  const batch = await loadBatch(root, batchId);
+async function loadConfinedPending(io: RecoveryIo, root: string, batchId: string): Promise<JournalBatch> {
+  const batch = await loadBatchFrom(io, root, batchId);
   if (batch === null) throw new JournalUnsafeError(`journal vanished ${batchId}.json`);
   return batch;
 }
 
 /** Revert every entry of a confined pending batch, then delete its journal file. */
-async function revertPendingBatch(root: string, batch: JournalBatch): Promise<void> {
+async function revertPendingBatch(io: RecoveryIo, root: string, batch: JournalBatch): Promise<void> {
   for (const entry of batch.entries) {
-    await revertEntry(entry, root);
+    await revertEntryFrom(io, entry, root);
   }
-  await unlink(journalPath(root, batch.batchId));
+  await io.removeLeaf(journalPath(root, batch.batchId));
 }

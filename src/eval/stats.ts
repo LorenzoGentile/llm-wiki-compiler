@@ -4,15 +4,24 @@
  * Snapshots source count, page count, total wiki character count, and
  * embedding counts. Each run appends one JSON line to .llmwiki/eval/history.jsonl
  * for trend analysis over time.
+ *
+ * The three history READERS each have one body over {@link EvalFileReads}
+ * (`loadHistoryFrom`, `loadPreviousReportFrom`, `loadLastFullReportFrom`); the
+ * root-taking forms hand them the local disk's reads. The history WRITER has
+ * one body too, `appendHistoryFrom`, over the raw writes. The SNAPSHOT has one
+ * body, `collectStatsFrom`, over {@link StatsSources}: the three existing seams
+ * its three reads already go through.
  */
 
-import { appendFile, mkdir, readFile } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
-import { collectAllPages } from "../linter/rules.js";
+import { collectAllPagesFrom, diskLintPageSources, type LintPageSources } from "../linter/rules-shared.js";
 import { parseFrontmatter } from "../utils/markdown.js";
-import { readStoredEmbeddings } from "../utils/embeddings-storage.js";
-import { listSelectedSourceFiles } from "../sources/scan.js";
+import { diskStoredEmbeddingReads, readStoredEmbeddingsFrom, type StoredEmbeddingReads } from "../utils/embeddings-storage.js";
+import { listSelectedSourceFilesFrom } from "../sources/scan.js";
+import { diskLocalReads } from "../storage/disk-local-reads.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import { diskEvalFileReads, type EvalFileReads } from "./file-reads.js";
+import { diskEvalFileWrites, type EvalFileWrites } from "./file-writes.js";
 import type { StatsResult, EvalReport } from "./types.js";
 
 /** A v3-aware embedding snapshot for stats: counts plus an availability signal. */
@@ -20,6 +29,20 @@ interface EmbeddingSnapshot {
   available: boolean;
   entries: number;
   chunks: number;
+}
+
+/**
+ * What the snapshot asks of the project: three existing seams, one per read.
+ * It holds no count, page list, parsed store or availability verdict; each is
+ * worked out in {@link collectStatsFrom} from what these return.
+ */
+export interface StatsSources {
+  /** The source scan's reads: the source selection's configuration, then the sources directory's listings. */
+  sourceReads: LegacyLocalReads;
+  /** The page collection's sources, walked under the generic scope. */
+  pages: LintPageSources;
+  /** The stored-embedding reader's three raw facts of the private directory. */
+  embeddings: StoredEmbeddingReads;
 }
 
 const HISTORY_DIR = path.join(".llmwiki", "eval");
@@ -30,10 +53,10 @@ const HISTORY_FILE = path.join(HISTORY_DIR, "history.jsonl");
  * (outdated) store reports `available: false` — a DISTINCT degrade signal, never
  * silently `0`. A corpus-size snapshot must degrade, not crash.
  */
-async function readEmbeddingSnapshot(root: string): Promise<EmbeddingSnapshot> {
-  let result: Awaited<ReturnType<typeof readStoredEmbeddings>>;
+async function readEmbeddingSnapshot(reads: StoredEmbeddingReads): Promise<EmbeddingSnapshot> {
+  let result: Awaited<ReturnType<typeof readStoredEmbeddingsFrom>>;
   try {
-    result = await readStoredEmbeddings(root);
+    result = await readStoredEmbeddingsFrom(reads);
   } catch {
     return { available: false, entries: 0, chunks: 0 };
   }
@@ -49,10 +72,25 @@ async function readEmbeddingSnapshot(root: string): Promise<EmbeddingSnapshot> {
  * @param root - Absolute path to the project root.
  */
 export async function collectStats(root: string): Promise<StatsResult> {
+  return collectStatsFrom({
+    sourceReads: diskLocalReads(root), pages: diskLintPageSources(root), embeddings: diskStoredEmbeddingReads(root),
+  });
+}
+
+/**
+ * {@link collectStats} over {@link StatsSources}: THE ONE BODY. The three reads
+ * are started together, in this order: the selected markdown sources, the
+ * generic pages, the stored embeddings. A source or page failure rejects the
+ * snapshot; an embedding failure of any kind degrades it and is never thrown.
+ *
+ * @param from - The source scan's reads, the page collection's sources and the stored-embedding reads.
+ * @returns The counts, the page length figures, and the time the snapshot was put together.
+ */
+export async function collectStatsFrom(from: StatsSources): Promise<StatsResult> {
   const [sources, pages, embeddings] = await Promise.all([
-    listSelectedSourceFiles(root),
-    collectAllPages(root),
-    readEmbeddingSnapshot(root),
+    listSelectedSourceFilesFrom(from.sourceReads),
+    collectAllPagesFrom(from.pages),
+    readEmbeddingSnapshot(from.embeddings),
   ]);
 
   let totalWikiChars = 0;
@@ -84,9 +122,20 @@ export async function collectStats(root: string): Promise<StatsResult> {
  * @param report - The completed EvalReport to persist.
  */
 export async function appendHistory(root: string, report: EvalReport): Promise<void> {
-  const historyDir = path.join(root, HISTORY_DIR);
-  await mkdir(historyDir, { recursive: true });
-  await appendFile(path.join(root, HISTORY_FILE), JSON.stringify(report) + "\n");
+  return appendHistoryFrom(diskEvalFileWrites(root), report);
+}
+
+/**
+ * {@link appendHistory} over the raw writes: THE ONE BODY. The directory is
+ * made first; the report is serialized only after that succeeds; then one line
+ * is appended. Any failure of the three rejects raw.
+ *
+ * @param writes - The directory make and the append.
+ * @param report - The completed EvalReport to persist.
+ */
+export async function appendHistoryFrom(writes: EvalFileWrites, report: EvalReport): Promise<void> {
+  await writes.makeDirectoryTree(HISTORY_DIR);
+  await writes.appendText(HISTORY_FILE, JSON.stringify(report) + "\n");
 }
 
 /**
@@ -96,10 +145,21 @@ export async function appendHistory(root: string, report: EvalReport): Promise<v
  * @param n - Maximum number of reports to return (default 10).
  */
 export async function loadHistory(root: string, n = 10): Promise<EvalReport[]> {
-  const historyPath = path.join(root, HISTORY_FILE);
-  if (!existsSync(historyPath)) return [];
+  return loadHistoryFrom(diskEvalFileReads(root), n);
+}
 
-  const content = await readFile(historyPath, "utf-8");
+/**
+ * {@link loadHistory} over {@link EvalFileReads}: THE ONE BODY. `n` counts
+ * LINES from the end, before malformed ones are skipped, and is handed to
+ * `slice(-n)` as it is.
+ *
+ * @param reads - Whether the history file is there, and its whole text.
+ * @param n - Maximum number of trailing lines to parse (default 10).
+ */
+export async function loadHistoryFrom(reads: EvalFileReads, n = 10): Promise<EvalReport[]> {
+  if (!reads.existsSync(HISTORY_FILE)) return [];
+
+  const content = await reads.readText(HISTORY_FILE);
   const lines = content.trim().split("\n").filter(Boolean);
   const reports: EvalReport[] = [];
   for (const line of lines.slice(-n)) {
@@ -113,10 +173,9 @@ export async function loadHistory(root: string, n = 10): Promise<EvalReport[]> {
 }
 
 /** Read the history file and return its non-empty lines, or null if it doesn't exist. */
-async function readHistoryLines(root: string): Promise<string[] | null> {
-  const historyPath = path.join(root, HISTORY_FILE);
-  if (!existsSync(historyPath)) return null;
-  const content = await readFile(historyPath, "utf-8");
+async function readHistoryLines(reads: EvalFileReads): Promise<string[] | null> {
+  if (!reads.existsSync(HISTORY_FILE)) return null;
+  const content = await reads.readText(HISTORY_FILE);
   return content.trim().split("\n").filter(Boolean);
 }
 
@@ -125,7 +184,12 @@ async function readHistoryLines(root: string): Promise<string[] | null> {
  * @param root - Absolute path to the project root.
  */
 export async function loadPreviousReport(root: string): Promise<EvalReport | null> {
-  const lines = await readHistoryLines(root);
+  return loadPreviousReportFrom(diskEvalFileReads(root));
+}
+
+/** {@link loadPreviousReport} over {@link EvalFileReads}: THE ONE BODY. A last line that does not parse answers null. */
+export async function loadPreviousReportFrom(reads: EvalFileReads): Promise<EvalReport | null> {
+  const lines = await readHistoryLines(reads);
   if (!lines || lines.length === 0) return null;
   try {
     return JSON.parse(lines[lines.length - 1]) as EvalReport;
@@ -141,7 +205,12 @@ export async function loadPreviousReport(root: string): Promise<EvalReport | nul
  * @param root - Absolute path to the project root.
  */
 export async function loadLastFullReport(root: string): Promise<EvalReport | null> {
-  const lines = await readHistoryLines(root);
+  return loadLastFullReportFrom(diskEvalFileReads(root));
+}
+
+/** {@link loadLastFullReport} over {@link EvalFileReads}: THE ONE BODY. Searched from the last line back; a line that does not parse is passed over. */
+export async function loadLastFullReportFrom(reads: EvalFileReads): Promise<EvalReport | null> {
+  const lines = await readHistoryLines(reads);
   if (!lines) return null;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {

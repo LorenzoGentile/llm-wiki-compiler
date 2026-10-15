@@ -45,12 +45,18 @@
  * `O_NONBLOCK` stops a planted FIFO from blocking the open forever, a local DoS),
  * `fstat`ed requiring a REGULAR file, and size-capped at {@link MAX_LOCAL_CONFIG_BYTES}
  * BEFORE the read — the exact discipline the run store uses for its run leaves.
+ * That physical read is the shared project config leaf
+ * (`utils/project-config-leaf.ts`), which reports each outcome distinctly.
+ *
+ * ## One body
+ * {@link loadLocalGrantFrom} owns every decision above (absence means the surface
+ * cap, each read problem's fail-closed floor, the tighten-only grant) over that
+ * {@link ProjectConfigLeaf}. {@link loadLocalGrant} keeps its signature and passes
+ * the local leaf, built per call, which calls the incumbent confined directory
+ * resolution and capped no-follow read when asked.
  */
 
-import path from "node:path";
-import { MAX_LOCAL_CONFIG_BYTES } from "../utils/constants.js";
-import { resolveExistingConfinedPrivateDir } from "../utils/private-dir.js";
-import { readCappedNoFollow } from "../utils/confined-read.js";
+import { diskProjectConfigLeaf, type ProjectConfigLeaf } from "../utils/project-config-leaf.js";
 import { CAPABILITY_ORDER, SURFACE_HARD_CAP } from "./authority.js";
 import type { CapabilityClass, ActionSurface } from "../profile/types.js";
 
@@ -89,11 +95,6 @@ type LocalConfigRead =
   | { status: "absent" }
   | { status: "unavailable"; detail: string };
 
-/** The `config.json` leaf inside an already-confined private dir. */
-function configLeafIn(privateDir: string): string {
-  return path.join(privateDir, "config.json");
-}
-
 /** True for a value that is a recognized {@link CapabilityClass}. */
 function isCapabilityClass(value: unknown): value is CapabilityClass {
   return typeof value === "string" && (CAPABILITY_ORDER as readonly string[]).includes(value);
@@ -121,18 +122,12 @@ function parseLocalConfig(raw: string): LocalConfigRead {
  * corrupt/non-object JSON; `ok` with the parsed config otherwise. Module-internal:
  * the public readers expose a collapsed capability/boolean, not this discriminant.
  *
- * @param root - Absolute project root.
+ * @param leaf - The project config leaf.
  */
-async function readLocalConfig(root: string): Promise<LocalConfigRead> {
-  let privateDir: string | null;
-  try {
-    privateDir = await resolveExistingConfinedPrivateDir(root);
-  } catch {
-    return { status: "unavailable", detail: "escape" };
-  }
-  if (privateDir === null) return { status: "absent" };
-  const read = await readCappedNoFollow(configLeafIn(privateDir), MAX_LOCAL_CONFIG_BYTES);
-  if (read.kind === "absent") return { status: "absent" };
+async function readLocalConfig(leaf: ProjectConfigLeaf): Promise<LocalConfigRead> {
+  const read = await leaf.readConfig();
+  if (read.kind === "dir-unavailable") return { status: "unavailable", detail: "escape" };
+  if (read.kind === "dir-absent" || read.kind === "absent") return { status: "absent" };
   if (read.kind === "unavailable") return { status: "unavailable", detail: "leaf" };
   return parseLocalConfig(read.body);
 }
@@ -149,7 +144,12 @@ async function readLocalConfig(root: string): Promise<LocalConfigRead> {
  * @returns The local grant capability for the surface.
  */
 export async function loadLocalGrant(root: string, surface: ActionSurface): Promise<CapabilityClass> {
-  const read = await readLocalConfig(root);
+  return loadLocalGrantFrom(diskProjectConfigLeaf(root), surface);
+}
+
+/** {@link loadLocalGrant} over the project config leaf: THE ONE BODY. */
+export async function loadLocalGrantFrom(leaf: ProjectConfigLeaf, surface: ActionSurface): Promise<CapabilityClass> {
+  const read = await readLocalConfig(leaf);
   if (read.status === "absent") return SURFACE_HARD_CAP[surface];
   if (read.status === "unavailable") return FAIL_CLOSED_GRANT;
   const grant = read.config.workflowGrants?.[surface];

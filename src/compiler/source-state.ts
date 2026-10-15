@@ -14,10 +14,8 @@
  * be flushed to `.llmwiki/state.json` at approval time.
  */
 
-import path from "path";
-import { hashFile } from "./hasher.js";
+import type { CompileAccess } from "./compile-access.js";
 import { slugify } from "../utils/markdown.js";
-import { SOURCES_DIR } from "../utils/constants.js";
 import type { ExtractionResult } from "./deps.js";
 import type { SourceState } from "../utils/types.js";
 
@@ -30,12 +28,12 @@ import type { SourceState } from "../utils/types.js";
  * sources compiled when extraction succeeded, mirroring the live path's
  * behaviour.
  *
- * @param root - Project root directory.
+ * @param access - The project's access seam.
  * @param extractions - Extraction results from the compile pipeline.
  * @returns Map of source filename → SourceState ready for state.json.
  */
 export async function buildExtractionSourceStates(
-  root: string,
+  access: CompileAccess,
   extractions: ExtractionResult[],
 ): Promise<Record<string, SourceState>> {
   const snapshot: Record<string, SourceState> = {};
@@ -43,7 +41,7 @@ export async function buildExtractionSourceStates(
 
   for (const result of extractions) {
     if (result.concepts.length === 0) continue;
-    snapshot[result.sourceFile] = await buildEntry(root, result, compiledAt);
+    snapshot[result.sourceFile] = await buildEntry(access, result, compiledAt);
   }
 
   return snapshot;
@@ -51,12 +49,11 @@ export async function buildExtractionSourceStates(
 
 /** Build a single SourceState entry for one extraction result. */
 async function buildEntry(
-  root: string,
+  access: CompileAccess,
   result: ExtractionResult,
   compiledAt: string,
 ): Promise<SourceState> {
-  const filePath = path.join(root, SOURCES_DIR, result.sourceFile);
-  const hash = await hashFile(filePath);
+  const hash = await access.hashSource(result.sourceFile);
   return {
     hash,
     concepts: result.concepts.map((concept) => slugify(concept.concept)),

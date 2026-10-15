@@ -11,11 +11,21 @@
  * and the rule-prompt version so each recommendation is auditable even though
  * the extraction itself is nondeterministic. The createdAt timestamp is the
  * only nondeterministic field by design (RFC3339 wall-clock).
+ *
+ * ONE BODY OVER SIX STEPS. {@link extractRuleCandidatesWith} decides over
+ * {@link RuleExtractionSteps}: the cursor, change detection, each source's text,
+ * the existing-candidate looks, the candidate write and the cursor advance. The
+ * provider call, the provenance stamp and the output language stay in the body.
+ * {@link extractRuleCandidates} keeps its signature and passes the local steps,
+ * built per call, which call the incumbent root readers and writers when asked,
+ * so module spies and mocks still intercept. {@link ruleExtractionStepsOver}
+ * composes the same steps from each one's existing body over its own seam. None
+ * is a hosted store, and none is in a package index.
  */
 
-import { readFile } from "fs/promises";
 import path from "path";
-import { detectChanges } from "./hasher.js";
+import { readLocationText } from "../storage/disk-locations.js";
+import { detectChanges, detectChangesFrom } from "./hasher.js";
 import { parseFrontmatter, slugify } from "../utils/markdown.js";
 import { callClaude } from "../utils/llm.js";
 import { resolveActiveModelId } from "../utils/provider.js";
@@ -24,7 +34,10 @@ import { budgetAndNumberSource } from "./prompt-budget.js";
 import { SOURCES_DIR } from "../utils/constants.js";
 import {
   readRuleState,
+  readRuleStateFrom,
   updateRuleSourceState,
+  updateRuleSourceStateFrom,
+  type RuleStateLeaf,
 } from "./rule-state.js";
 import {
   RULE_EXTRACTION_TOOL,
@@ -37,13 +50,18 @@ import {
   buildRuleCandidate,
   buildRuleSlug,
   readRuleCandidate,
+  readRuleCandidateFrom,
   sanitizeRuleCategory,
   validateRuleCandidate,
   writeRuleCandidate,
+  writeRuleCandidateFrom,
+  type RuleCandidateLeaves,
 } from "./rule-candidates.js";
 import { candidateFileId } from "../utils/candidate-store.js";
 import { createHash } from "node:crypto";
 import type { EvidenceRef, RuleCandidate, RuleProvenance } from "../utils/rule-types.js";
+import type { LegacyLocalReads } from "../storage/legacy-local-reads.js";
+import type { SourceChange } from "../utils/types.js";
 
 /** Producer tag stamped on every candidate's provenance. */
 const PROVENANCE_SOURCE = "llm-wiki-compiler";
@@ -56,6 +74,51 @@ export interface RuleExtractionResult {
   candidates: RuleCandidate[];
   /** Non-fatal problems (e.g. a source that yielded no rules). */
   notes: string[];
+}
+
+/** The rule cursor as the steps read it. */
+type RuleCursor = Awaited<ReturnType<typeof readRuleState>>;
+
+/** The six project steps one extraction run takes. No member takes a project root. */
+export interface RuleExtractionSteps {
+  /** The rule cursor (`.llmwiki/rule-state.json`); an empty cursor when absent or unreadable. */
+  readCursor(): Promise<RuleCursor>;
+  /** The selected sources' changes against `cursor`. */
+  detectChanges(cursor: RuleCursor): Promise<SourceChange[]>;
+  /** One source's whole text; rejects when it cannot be read. */
+  readSource(sourceFile: string): Promise<string>;
+  /** One existing candidate in `location`, or null. */
+  readCandidate(fileId: string, location: "active" | "archive"): Promise<RuleCandidate | null>;
+  /** Write one candidate to the active store. */
+  writeCandidate(candidate: RuleCandidate): Promise<unknown>;
+  /** Advance the cursor for one processed source, reading it afresh. */
+  advanceCursor(sourceFile: string, entry: Parameters<typeof updateRuleSourceState>[2]): Promise<void>;
+}
+
+/** LOCAL DISK. The incumbent root readers and writers for `root`, each called when asked. */
+function diskRuleExtractionSteps(root: string): RuleExtractionSteps {
+  return {
+    readCursor: () => readRuleState(root),
+    detectChanges: (cursor) => detectChanges(root, cursor),
+    readSource: (sourceFile) => readLocationText(path.join(root, SOURCES_DIR, sourceFile)),
+    readCandidate: (fileId, location) => readRuleCandidate(root, fileId, location),
+    writeCandidate: (candidate) => writeRuleCandidate(root, candidate),
+    advanceCursor: (sourceFile, entry) => updateRuleSourceState(root, sourceFile, entry),
+  };
+}
+
+/** The steps over their own seams: the cursor leaf, the ordinary local reads (selection, listing, source text), and the candidate store's leaves. */
+export function ruleExtractionStepsOver(seams: {
+  cursor: RuleStateLeaf; reads: LegacyLocalReads; candidates: RuleCandidateLeaves;
+}): RuleExtractionSteps {
+  return {
+    readCursor: () => readRuleStateFrom(seams.cursor),
+    detectChanges: (cursor) => detectChangesFrom(seams.reads, cursor),
+    readSource: (sourceFile) => seams.reads.readText(path.join(SOURCES_DIR, sourceFile)),
+    readCandidate: (fileId, location) => readRuleCandidateFrom(seams.candidates, fileId, location),
+    writeCandidate: (candidate) => writeRuleCandidateFrom(seams.candidates, candidate),
+    advanceCursor: (sourceFile, entry) => updateRuleSourceStateFrom(seams.cursor, sourceFile, entry),
+  };
 }
 
 /** Determine whether a source's `source` frontmatter field is a URL. */
@@ -157,13 +220,12 @@ function candidateForRule(
 
 /** Process one source file end-to-end: read, number, extract, build candidates. */
 async function extractForSource(
-  root: string,
+  steps: RuleExtractionSteps,
   sourceFile: string,
   provenance: RuleProvenance,
   createdAt: string,
 ): Promise<{ candidates: RuleCandidate[]; note?: string; hash: string }> {
-  const sourcePath = path.join(root, SOURCES_DIR, sourceFile);
-  const raw = await readFile(sourcePath, "utf-8");
+  const raw = await steps.readSource(sourceFile);
   const hash = createHash("sha256").update(raw).digest("hex");
   const { meta } = parseFrontmatter(raw);
   const numbered = budgetAndNumberSource(sourceFile, raw);
@@ -183,9 +245,9 @@ async function extractForSource(
  * Compares against `.llmwiki/rule-state.json` — NOT the concept compiler's
  * state — so extraction has an independent change-detection cursor.
  */
-async function changedSources(root: string, outputLanguage: string): Promise<string[]> {
-  const state = await readRuleState(root);
-  const changes = await detectChanges(root, state);
+async function changedSources(steps: RuleExtractionSteps, outputLanguage: string): Promise<string[]> {
+  const state = await steps.readCursor();
+  const changes = await steps.detectChanges(state);
   return changes
     .filter((c) => c.status === "new" || c.status === "changed" ||
       (c.status === "unchanged" && (state.sources[c.file]?.outputLanguage ?? "") !== outputLanguage))
@@ -204,22 +266,34 @@ export async function extractRuleCandidates(
   root: string,
   createdAt: string = new Date().toISOString(),
 ): Promise<RuleExtractionResult> {
+  return extractRuleCandidatesWith(diskRuleExtractionSteps(root), createdAt);
+}
+
+/**
+ * {@link extractRuleCandidates} over {@link RuleExtractionSteps}: THE ONE BODY.
+ * Provenance and language first, then the changed sources; per source, extract,
+ * persist each candidate (never over a human decision), then advance the cursor.
+ */
+export async function extractRuleCandidatesWith(
+  steps: RuleExtractionSteps,
+  createdAt: string = new Date().toISOString(),
+): Promise<RuleExtractionResult> {
   const provenance = buildProvenance();
   const outputLanguage = getOutputLanguage() ?? "";
-  const sources = await changedSources(root, outputLanguage);
+  const sources = await changedSources(steps, outputLanguage);
 
   const candidates: RuleCandidate[] = [];
   const notes: string[] = [];
   for (const sourceFile of sources) {
-    const outcome = await extractForSource(root, sourceFile, provenance, createdAt);
+    const outcome = await extractForSource(steps, sourceFile, provenance, createdAt);
     if (outcome.note) notes.push(outcome.note);
     for (const candidate of outcome.candidates) {
-      if (await persistCandidate(root, candidate, notes)) candidates.push(candidate);
+      if (await persistCandidate(steps, candidate, notes)) candidates.push(candidate);
     }
     // Advance the rule cursor whether or not this source yielded candidates, so
     // an unchanged source is not re-extracted (and approvals are never re-fired)
     // on the next run.
-    await updateRuleSourceState(root, sourceFile, {
+    await steps.advanceCursor(sourceFile, {
       hash: outcome.hash,
       concepts: [],
       compiledAt: createdAt,
@@ -237,12 +311,12 @@ export async function extractRuleCandidates(
  * fail the rule importer's import gate is dropped with a note instead of being emitted.
  */
 async function persistCandidate(
-  root: string,
+  steps: RuleExtractionSteps,
   candidate: RuleCandidate,
   notes: string[],
 ): Promise<boolean> {
   const fileId = candidateFileId(candidate.id);
-  const existing = await readRuleCandidate(root, fileId) ?? await readRuleCandidate(root, fileId, "archive");
+  const existing = await steps.readCandidate(fileId, "active") ?? await steps.readCandidate(fileId, "archive");
   if (existing && existing.status !== "proposed") {
     notes.push(`Kept ${existing.status} candidate ${candidate.id} (re-extraction did not overwrite it).`);
     return false;
@@ -252,6 +326,6 @@ async function persistCandidate(
     notes.push(`Dropped candidate ${candidate.id}: ${invalid}`);
     return false;
   }
-  await writeRuleCandidate(root, candidate);
+  await steps.writeCandidate(candidate);
   return true;
 }
