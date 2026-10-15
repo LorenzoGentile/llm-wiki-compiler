@@ -8,7 +8,9 @@ orchestration platform.
 
 ## Compiler and query flow
 
-This document describes the released `1.4.0` architecture. The CLI, MCP server,
+This document describes the architecture of the `1.5.0-rc.1` release
+candidate. The stable `1.4.2` release shares it except for the storage
+separation described below. The CLI, MCP server,
 and standard SDK share compiler services rather than maintaining separate
 knowledge stores. Sources live under `sources/`, generated Markdown under
 `wiki/`, and compiler state, review candidates, and recovery metadata under
@@ -57,6 +59,57 @@ project coding settings out of wiki generation while allowing existing Claude
 login. This is a settings boundary, not a sandbox. Explicit writing guidance
 comes through llmwiki configuration and compile instructions. Claude embeddings
 use Voyage credentials separately from the Claude login.
+
+## Storage separation
+
+Starting with `1.5.0-rc.1`, wiki behavior is separated from the filesystem
+operations that persist it.
+
+**Why.** The code that decides what a wiki does (which sources changed, what a
+page links to, whether a review candidate can still be approved, what a run
+record means) used to open, list, lock and rename files at the same place it
+made those decisions. Testing such a rule generally meant setting up a real
+project directory, and each feature was coupled to one physical layout.
+
+**How it is layered.**
+
+- *Domain operations* express what a feature needs: read this source, list
+  these pages, stage this candidate, record this state.
+- *Storage interfaces* name the reads and writes an operation requires and
+  nothing more. They are focused per feature (for example the compile's
+  project-access seam in `src/compiler/compile-access.ts`, the legacy-local
+  read and record bindings in `src/storage/legacy-local-*.ts`, and narrow
+  `*Reads` interfaces next to artifacts, citations and context packs).
+- *Local-disk implementations* (`src/storage/disk-*.ts` and the disk bindings
+  next to each interface) carry out those reads and writes with the existing
+  `sources/`, `wiki/` and `.llmwiki/` layout. They are the first and, in this
+  release, the only shipped implementation.
+
+File handles, filesystem identity checks, locking, atomic writes, path
+confinement, symlink handling and crash recovery deliberately stay in the local
+implementation. An interface does not promise POSIX semantics that a different
+backend might be unable to provide. Interpretation also stays with the feature:
+what a missing or corrupt record means, and which errors, warnings and review
+decisions follow, is decided above the storage boundary, not inside it.
+
+The separation is not uniform yet. Some paths, such as live page writes, index
+and map-of-content generation, and embeddings, still take a project root
+directly. Moving more of them behind an interface is incremental work, not a
+precondition for the current behavior.
+
+**User effect.** None is required. An existing local wiki keeps its directory
+layout, file formats, defaults, and CLI, SDK and MCP entry points, with no
+migration, registration step or storage mode to opt into. Shared behavior is
+exercised against both the disk implementation and non-disk test bindings, and
+existing wikis are compared across reads, writes, review and reopening by an
+earlier version. That supports a drop-in upgrade; it is not a guarantee of
+byte-identical files, unchanged performance or identical behavior on every
+platform.
+
+**Scope.** This is a foundation for alternative storage and for testing wiki
+logic independently of the disk. It does not ship hosted storage, a remote
+backend, role-based permissions or a public storage-plugin API. The storage
+interfaces are internal composition contracts, not supported extension points.
 
 ## Ownership
 

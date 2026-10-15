@@ -18,19 +18,19 @@ llmwiki is a Node.js CLI that you install once globally with npm. After installa
 
 ## Install llmwiki
 
-Version **1.2.0** includes profile-aware browsing, source and artifact drill-down, and compile/provider improvements. Windows path fixes are included, but release CI is Linux-only and full Windows filesystem-confinement guarantees remain unverified. Use Linux for untrusted projects until [the Windows safety work](https://github.com/atomicstrata/llm-wiki-compiler/issues/175) is complete.
+### Platform limitations
 
-### Platform limitations in the next release
+Release CI runs on Linux only, and full Windows filesystem-confinement guarantees remain unverified. Use Linux for untrusted projects until [the Windows validation work](https://github.com/atomicstrata/llm-wiki-compiler/issues/217) is complete.
 
-The next release adds checks for private-file reads and append-only stores when
-the operating system lacks native no-follow flags. A file must be regular and
-retain the same filesystem identity before and after opening; missing stores
+Where the operating system lacks native no-follow flags, private-file reads and
+append-only stores fall back to a portable check: a file must be regular and
+retain the same filesystem identity before and after opening, and missing stores
 are created exclusively. Filesystems that cannot supply a nonzero file identity
 are refused rather than read without that check.
 
 This fallback has been tested through capability simulations, **not on a native
-Windows runner**. It does not establish full Windows support. Native POSIX
-no-follow and nonblocking behavior is unchanged. Directory-handle verification,
+Windows runner**. It does not establish full Windows support. On POSIX systems,
+native no-follow and nonblocking opens are used. Directory-handle verification,
 including offline template verification and anchored tap-key reads, refuses
 operation where the required directory flags are unavailable. Continue using
 Linux for untrusted projects; the Windows CI work remains open.
@@ -40,6 +40,16 @@ Install the `llm-wiki-compiler` package globally. The package registers the `llm
 ```bash
 npm install -g llm-wiki-compiler
 ```
+
+### Try the 1.5.0 release candidate
+
+`1.5.0-rc.1` is a preview of the next minor release, published to the npm `next` dist-tag. The stable release, `1.4.2`, stays on `latest`, and the command above continues to install it. Install the candidate by exact version:
+
+```bash
+npm install -g llm-wiki-compiler@1.5.0-rc.1
+```
+
+The candidate separates wiki behavior from local file I/O, adds the [Converse gateway provider](/configuration/providers), the [`--no-pages-limit`](/cli/compile) extraction mode, and viewer refresh with `LLMWIKI_VIEW_PORT`, and fixes several compile, MCP and freshness issues. Existing projects open without a migration or new setting: the directory layout, file formats and defaults are unchanged. Back up a wiki you care about before trying any preview. See the [upgrade notes](/guides/sdk-upgrade) for details.
 
 Verify the installation:
 

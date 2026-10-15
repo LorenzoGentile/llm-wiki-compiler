@@ -5,13 +5,20 @@
 [![docs](https://img.shields.io/badge/docs-llmwiki.atomicstrata.ai-blue)](https://llmwiki.atomicstrata.ai)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-## New in 1.4.0 — Review answers before publishing.
+## Preview: 1.5.0-rc.1 — Wiki behavior separated from storage.
 
-- **Choose what becomes part of your wiki.** Review generated answers and check their citations before saving them as published pages.
-- **Approve pages together.** Review a batch of generated pages and publish the ones you choose in one operation.
-- **See the pages behind an answer.** Follow citations back to your wiki and see which pages were used to answer your question.
+A release candidate for `1.5.0` is available on the npm `next` dist-tag; `1.4.2` remains the stable release. Install it by exact version with `npm install --global llm-wiki-compiler@1.5.0-rc.1`.
 
-[Release notes](https://github.com/atomicstrata/llm-wiki-compiler/releases/tag/v1.4.0) · [Upgrade guide](docs/guides/sdk-upgrade.mdx) · [Install llmwiki](#quick-start)
+- **Same wiki, cleaner foundation.** Compilation, retrieval and review now describe what they need from storage instead of touching files directly. Your existing wiki keeps its layout and works as before, with no migration.
+- **Converse gateways.** Use a bearer-authenticated Converse endpoint as your provider.
+- **Pages that fit the source.** `llmwiki compile --no-pages-limit` drops the fixed concept count.
+- **A viewer that keeps up.** `llmwiki view` refreshes after a compile without a restart and reads its port from `LLMWIKI_VIEW_PORT`.
+
+[What's in the candidate](#current-release) · [Changelog](CHANGELOG.md)
+
+## New in 1.4 — Review answers before publishing.
+
+Review generated answers and their citations before they become pages, approve a batch of pages in one operation, and trace an answer back to the pages that informed it. [Release notes](https://github.com/atomicstrata/llm-wiki-compiler/releases/tag/v1.4.0) · [Upgrade guide](docs/guides/sdk-upgrade.mdx)
 
 ## New in 1.3 — A fresh look for your wiki.
 
@@ -79,7 +86,7 @@ Do not use llmwiki as a general static-site generator, a heavy ontology database
 - **SDK.** `createWiki({ root })` drives ingest, compile, query, context, status, export, eval, and OKF import/export from TypeScript without shelling out.
 - **Open Knowledge Format exchange.** Export and import OKF bundles for portable, markdown-native knowledge exchange. External OKF imports are staged through the review queue by default; trusted bundles can be written live explicitly.
 - **Other portable exports.** Export JSON, JSON-LD, GraphML, Marp slides, and `llms.txt` for downstream systems.
-- **Provider portable.** Anthropic, Claude Agent SDK local login, OpenAI Codex CLI local login, OpenAI-compatible servers, Ollama, GitHub Copilot, Atlas Cloud, OrcaRouter, and local OpenAI-compatible runtimes.
+- **Provider portable.** Anthropic, Claude Agent SDK local login, OpenAI Codex CLI local login, OpenAI-compatible servers, Ollama, GitHub Copilot, Atlas Cloud, OrcaRouter, Converse-compatible gateways (in `1.5.0-rc.1`), and local OpenAI-compatible runtimes.
 
 ## Configurable Lifecycle Profiles (CLP)
 
@@ -401,38 +408,28 @@ volta run --node 24 npx mint dev --port 3001
 
 ## Current release
 
-**Release `1.4.2`:** Fixes `llmwiki compile` with the `codex-agent` provider, which Codex rejected with `invalid_json_schema` in `1.4.1`. The `1.4.0` features below are unchanged.
+**Release candidate `1.5.0-rc.1` (preview):** A preview of `1.5.0` for early testing, published to the npm `next` dist-tag. It is not the stable release: a plain `npm install llm-wiki-compiler` still installs `1.4.2`.
 
-- Keep personal Claude coding instructions out of generated pages and answers.
-- Clarify wiki-link alias targets; newly generated pages record prompt version `v6`.
+- **Wiki behavior is separated from local file I/O.** The code that decides what a wiki does, such as which sources changed, what a page links to, or whether a review candidate can be approved, used to open, lock and rename files inline. Those rules now work through focused storage boundaries, and the current local-disk layout is their first implementation. Locking, atomic writes, path confinement, symlink handling and recovery stay in the local implementation. For you, nothing changes: the same directory layout, file formats, defaults, and CLI, SDK and MCP entry points, with no migration or storage setting. This is groundwork for alternative storage and for testing wiki logic independently of the disk; it does not add hosted storage, a remote backend, role-based permissions, or a public storage-plugin API. See [`ARCHITECTURE.md`](ARCHITECTURE.md#storage-separation).
+- **Converse gateway provider.** `LLMWIKI_PROVIDER=converse` connects to a bearer-authenticated endpoint speaking the Converse protocols, with streaming and structured extraction. Its AWS protocol packages are optional and load only when you select it. See [provider setup](docs/configuration/providers.mdx).
+- **`--no-pages-limit` extraction.** `llmwiki compile --no-pages-limit` removes the requested 3–8 concepts per source, so a source yields the pages it supports.
+- **Viewer refresh and port.** `llmwiki view` rebuilds its snapshot in the background after a compile, stops refreshing cleanly on close, and reads `LLMWIKI_VIEW_PORT` when `--port` is not given.
+- **Correctness fixes.** Wikilink markup in an extracted concept name no longer creates a duplicate page, and GPT-6 Luna models work with the OpenAI provider. MCP wiki tools keep progress output off the stdio protocol stream, and a named pipe in `sources/` no longer hangs freshness checks.
+- **Prompt version `v7`.** Every newly generated page records prompt version `v7`, including pages from default runs. Unchanged sources are not recompiled by upgrading alone.
 
-- Review answers before publication with `query --save --review`, and approve
-  candidate batches with one finalization.
-- Reuse extraction for unchanged sources, share compile and query prompt
-  prefixes, and inspect stage timing with an absolute `LLMWIKI_STAGE_TIMING_FILE`.
-- Report only pages supplied to the answer model; embedding failures fall back
-  to page selection with a warning by default.
-- Keep embedding retry budgets tied to page content, with an opt-out that leaves
-  embedding and retry stores untouched.
-- Add generic domain records, preparations, retained artifacts and local workflow
-  composition through the standard SDK. The engine-free core and local engine
-  ship as exact matching supporting dependencies.
-- Compare source excerpts and pending proposals in the experimental, read-only
-  source-review cockpit, explicitly enabled through the SDK on loopback.
+```bash
+npm install --global llm-wiki-compiler@1.5.0-rc.1
+```
 
-The compiler and its supporting packages ship together at `1.4.2` through the
-npm `latest` dist-tag. Install the standard entry point:
+The supporting packages are pinned to the same version and install with it. The MCP Registry entry is not updated for the candidate. Read the [upgrade notes and contributor credits](CHANGELOG.md#150-rc1---2026-10-15) before trying it on a wiki you care about.
+
+**Stable release `1.4.2`:** The current release on the npm `latest` dist-tag. It fixes `llmwiki compile` with the `codex-agent` provider and carries the `1.4.0` features: answer review before publishing, batch approval, extraction reuse, page-level answer citations, and the split-package SDK with matching supporting dependencies.
 
 ```bash
 npm install --global llm-wiki-compiler@1.4.2
 ```
 
-Existing CLI and standard `createWiki` entry points remain available. Experimental
-artifact types and workflow statuses can require source updates; read the
-[SDK upgrade notes](docs/guides/sdk-upgrade.mdx) before upgrading. Standalone
-AutoSci/Newsroom process packages are separate; their builtin ontology templates
-remain supported. See the [changelog](CHANGELOG.md) for the release's changes
-and limits.
+Experimental artifact types and workflow statuses can require source updates; read the [SDK upgrade notes](docs/guides/sdk-upgrade.mdx) before upgrading from `1.3`. See the [1.4.0 release summary](https://github.com/atomicstrata/llm-wiki-compiler/releases/tag/v1.4.0) and [changelog](CHANGELOG.md) for migration details, contributor credits, and limits.
 
 **Released `1.3.0`:**
 

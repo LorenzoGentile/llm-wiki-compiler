@@ -7,8 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0-rc.1] - 2026-10-15
+
+**Release candidate.** This is a preview of `1.5.0`, published to the npm `next`
+dist-tag for early testing. `1.4.2` remains the stable release on `latest`, and a
+plain `npm install llm-wiki-compiler` continues to install it. Install the
+candidate only by its exact version, and report problems before `1.5.0` is final.
+
+Separate what a wiki does from how it is stored on disk, add a provider for
+bearer-authenticated Converse gateways, give compile an extraction mode without a
+fixed concept count, and fix several viewer, MCP and compile correctness issues.
+
+### Highlights
+
+- **Wiki behavior is separated from local file I/O.** Compilation, retrieval,
+  review, artifacts and project state now describe what they need through
+  focused storage boundaries, and today's local-disk layout is their first
+  implementation. Existing wikis keep working as they are.
+- **Converse gateways as a provider.** `LLMWIKI_PROVIDER=converse` talks to a
+  bearer-authenticated endpoint that speaks the Converse protocols.
+- **`compile --no-pages-limit`.** Let a source yield as many or as few pages as
+  it supports instead of asking for a fixed range.
+- **A viewer that follows your compiles.** `llmwiki view` refreshes its snapshot
+  without a restart, and its port can come from `LLMWIKI_VIEW_PORT`.
+
+### Changed
+
+- **Wiki behavior is separated from the filesystem operations that persist it.**
+  Until now, the code that decides what a wiki does (which sources changed, what a
+  page links to, whether a review candidate can be approved) also opened, listed,
+  locked and renamed files inline. That made the rules hard to test on their own
+  and tied every feature to one physical layout. This release separates the two
+  in three layers: domain operations express what a feature needs, storage
+  interfaces name the reads and writes those operations require, and local-disk
+  implementations carry out those reads and writes with the existing layout and
+  mechanics. File handles, filesystem identity checks, locking, atomic writes,
+  path confinement, symlink handling and crash recovery stay in the local
+  implementation, rather than being promised by an abstraction that a different
+  backend might not honor. Decisions about what a missing or corrupt record means,
+  and which errors, warnings and review outcomes follow, stay with the feature
+  that owns them.
+
+  **What this means for you:** nothing to do. Your wiki keeps the same directory
+  layout, file formats, defaults, and CLI, SDK and MCP entry points. There is no
+  migration, registration step or storage setting to opt into. Shared behavior is
+  exercised against both the disk implementation and non-disk test bindings, and
+  existing wikis were compared across reads, writes, review, and reopening by an
+  earlier version. That evidence supports a drop-in upgrade; it is not a guarantee
+  that every file is byte-identical, that performance is unchanged, or that every
+  platform behaves identically.
+
+  This is groundwork for alternative storage and for testing wiki logic
+  independently of the disk. It does not ship hosted storage, a remote backend,
+  role-based permissions, or a public storage-plugin API.
+
 ### Added
 
+- **Converse gateways as a provider.** `LLMWIKI_PROVIDER=converse` connects to a
+  gateway exposing the Amazon Bedrock Converse and ConverseStream protocols with
+  bearer authentication. Set the model, endpoint (`LLMWIKI_CONVERSE_BASE_URL`) and
+  token (`LLMWIKI_CONVERSE_API_KEY`) explicitly; the provider streams responses,
+  extracts structured results through tool calls (`any` by default, `auto` via
+  `LLMWIKI_CONVERSE_TOOL_CHOICE`), bounds each request with a timeout, and reports
+  failures by HTTP status without echoing the service message or credentials. It does not discover AWS credentials, sign with SigV4 or
+  serve embeddings; configure an embedding provider separately or set
+  `LLMWIKI_EMBEDDINGS=off`. The AWS protocol packages are optional peer
+  dependencies, loaded only when Converse is selected, so other providers and
+  defaults are unchanged. Contributed by @LorenzoGentile in #282.
 - **`llmwiki view` picks up wiki changes without a restart.** The viewer now rebuilds its snapshot in the background when a request arrives, at most once every five seconds, so reloading the tab after a compile shows the new pages. A request never waits for a rebuild, and a failed rebuild keeps the last good snapshot. Contributed by @Erick0412-dev in #275 (#272). Closing the viewer also stops refreshing: a rebuild still running at that point is discarded, and shutdown waits at most two seconds for it. A named pipe at `wiki/index.md` is now treated as an unavailable index instead of a read that never returns.
 - **`LLMWIKI_VIEW_PORT` sets the viewer's port.** `llmwiki view` reads its listening port from this variable when `--port` is not given; `--port` still wins, and an invalid value fails at startup with an error naming the variable. Contributed by @Erick0412-dev in #274 (#271).
 - **`--no-pages-limit` drops the requested concept count.** By default, extraction asks for 3–8 concepts per source, which can push the model to turn passing mentions into pages of their own. `llmwiki compile --no-pages-limit` (also on scoped `refresh`, and `noPagesLimit: true` in the SDK) removes that range and instructs the model to keep extraction and pages to what the source supports. These are instructions rather than a check on accuracy, so generated pages still need review. A source may yield no pages at all, and that counts as success. The mode applies only to the run that passes the flag. Default prompts are unchanged, but the prompt version moves to `v7`, so extractions cached under the old version are not reused: a source that needs extraction again is extracted afresh. Contributed by @LorenzoGentile in #277, merged as #285.
@@ -20,6 +85,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A named pipe in `sources/` no longer hangs freshness checks.** If a compiled source was replaced by a named pipe or a directory, anything that checks page freshness, such as `llmwiki view`, would wait forever on the pipe or fail on the directory. Source hashing now opens files without blocking and accepts only regular files; the freshness check treats anything else as a missing source.
 - **MCP wiki tools no longer write progress lines to stdout.** Over stdio, stdout is the JSON-RPC stream, and `ingest_source` printed its progress lines there, which a strict MCP client can treat as a broken stream. Contributed by @vishalhabib99 in #270: every wiki tool handler now runs quietly, as the OKF tools already did, and a test keeps their stdout clean. The stdio server as a whole now runs in quiet mode too, so resources, workflow tools and any future handler are covered, and a test reads the raw stream from the built CLI to check that every line is a JSON-RPC message.
+
+### Contributors
+
+Thank you to the contributors whose work shaped this candidate:
+
+- [@LorenzoGentile](https://github.com/LorenzoGentile): Converse gateway provider
+  ([#282](https://github.com/atomicstrata/llm-wiki-compiler/pull/282)),
+  `--no-pages-limit` extraction
+  ([#277](https://github.com/atomicstrata/llm-wiki-compiler/pull/277), merged as
+  [#285](https://github.com/atomicstrata/llm-wiki-compiler/pull/285)), wikilink
+  concept-title normalization
+  ([#278](https://github.com/atomicstrata/llm-wiki-compiler/pull/278)) and GPT-6
+  Luna request parameters
+  ([#279](https://github.com/atomicstrata/llm-wiki-compiler/pull/279)).
+- [@Erick0412-dev](https://github.com/Erick0412-dev): viewer snapshot refresh
+  ([#275](https://github.com/atomicstrata/llm-wiki-compiler/pull/275)) and
+  `LLMWIKI_VIEW_PORT`
+  ([#274](https://github.com/atomicstrata/llm-wiki-compiler/pull/274)).
+- [@vishalhabib99](https://github.com/vishalhabib99): quiet MCP wiki tools over
+  stdio ([#270](https://github.com/atomicstrata/llm-wiki-compiler/pull/270)).
+
+Credit includes original implementations completed or extended during maintainer review.
+
+### Upgrade notes
+
+- This is a release candidate on the `next` dist-tag; `1.4.2` stays on `latest`.
+  Install it by exact version: `npm install --global llm-wiki-compiler@1.5.0-rc.1`.
+  The two supporting packages are pinned to the same version and install with it.
+- Existing projects need no migration or configuration change for the storage
+  separation. Back up a wiki you care about before trying any preview release,
+  as you would for any upgrade.
+- The prompt version moves from `v6` to `v7`, and every newly generated page
+  records `v7`, including pages from default runs without `--no-pages-limit`.
+  Upgrading alone does not recompile unchanged sources, but a source that needs
+  extraction again is extracted afresh rather than reusing a snapshot cached
+  under `v6`.
+- Converse is opt-in. Its protocol packages are optional peer dependencies;
+  install them only if you select `LLMWIKI_PROVIDER=converse`.
+- The MCP Registry entry `io.github.atomicstrata/llmwiki` is not updated for
+  this candidate. MCP clients that install through the registry keep a stable
+  release; to try the candidate over MCP, point your client at an installed
+  `llmwiki serve` from `1.5.0-rc.1`.
 
 ## [1.4.2] - 2026-10-02
 
@@ -873,7 +980,8 @@ Initial release.
 - Atomic writes, lock-protected compilation, orphan marking for deleted sources.
 - `[[wikilink]]` resolution and auto-generated `wiki/index.md`.
 
-[Unreleased]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.5.0-rc.1...HEAD
+[1.5.0-rc.1]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.4.2...v1.5.0-rc.1
 [1.4.2]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/atomicstrata/llm-wiki-compiler/compare/v1.3.0...v1.4.0
