@@ -474,7 +474,11 @@ Version 1 receipts contain `version`, `eventId`, `executionId`, `occurredAt`,
 known, `cacheReadTokens` and `cacheWriteTokens`. Input tokens **include** cache
 reads and writes: cache counters are subsets, not additional tokens. Missing
 counters are null, not fabricated zero usage; independently observed counters are
-preserved even when the other counter is missing.
+preserved even when the other counter is missing. Cache counters also stay null
+when the provider omits them, including OpenAI-compatible responses without
+`prompt_tokens_details`; an explicitly reported zero stays zero. Hosts must
+inspect cache coverage before applying cache-specific prices, even when
+`usageComplete` is true for the input/output counters.
 Operations are `complete`, `stream`, `toolCall`, `embed`, and `embedBatch`.
 
 `usageComplete` is true only when both input and output counts are known and

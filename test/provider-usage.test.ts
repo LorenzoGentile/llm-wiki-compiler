@@ -57,9 +57,19 @@ it("records actual OpenAI model and inclusive cache usage for each call", async 
   const events = await receipts();
   expect(events).toHaveLength(2);
   expect(events[0]).toMatchObject({ provider: "openai", model: "actual-model", operation: "complete", responseId: "response", requestId: "request-1",
-    inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, cacheWriteTokens: 0, usageComplete: true });
+    inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, cacheWriteTokens: null, usageComplete: true });
   expect(events[0].eventId).not.toBe(events[1].eventId);
   expect(JSON.stringify(events)).not.toMatch(/private|secret/);
+});
+
+it.each([undefined, null, {}, { cached_tokens: 0 }])("preserves missing versus zero OpenAI cache usage (%j)", async (details) => {
+  payload = { model: "model", choices: [{ message: { content: "text" } }],
+    usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: details } };
+  await new OpenAIProvider("model", { baseURL, apiKey: "secret" }).complete("prompt", [], 100);
+  const events = await receipts();
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ inputTokens: 100, outputTokens: 20,
+    cacheReadTokens: details?.cached_tokens === 0 ? 0 : null, cacheWriteTokens: null });
 });
 
 it("records embedding usage even when returned vectors are invalid", async () => {
@@ -102,6 +112,19 @@ it("records the final OpenAI stream usage once", async () => {
     + 'data: [DONE]\n\n';
   expect(await new OpenAIProvider("requested", { baseURL, apiKey: "secret" }).stream("prompt", [], 100)).toBe("text");
   expect(await receipts()).toMatchObject([{ operation: "stream", model: "actual", requestId: "request-1", inputTokens: 100, outputTokens: 20 }]);
+});
+
+it.each([true, false])("retains one incomplete OpenAI receipt on stream failure (usage=%s)", async (withUsage) => {
+  contentType = "text/event-stream";
+  wireBody = 'data: {"id":"r","model":"actual","choices":[{"delta":{"content":"text"}}]}\n\n'
+    + (withUsage ? 'data: {"id":"r","model":"actual","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60}}}\n\n' : "")
+    + 'data: {"error":{"message":"stream interrupted","type":"server_error"}}\n\n';
+  await expect(new OpenAIProvider("requested", { baseURL, apiKey: "secret" }).stream("prompt", [], 100)).rejects.toThrow("stream interrupted");
+  const events = await receipts();
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ provider: "openai", operation: "stream", model: "actual", responseId: "r",
+    inputTokens: withUsage ? 100 : null, outputTokens: withUsage ? 20 : null, usageComplete: false });
+  if (withUsage) expect(events[0]).toMatchObject({ cacheReadTokens: 60, cacheWriteTokens: null });
 });
 
 it.each([true, false])("retains Anthropic stream usage (failed=%s)", async (failed) => {
@@ -165,6 +188,20 @@ it("records Converse stream metadata before rejecting unfinished output", async 
   const provider = new ConverseProvider({ model: "model", baseURL, apiKey: "secret", requestTimeoutMs: 1000, toolChoice: "any" });
   await expect(provider.stream("prompt", [], 100)).rejects.toThrow();
   expect(await receipts()).toMatchObject([{ operation: "stream", inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, usageComplete: true }]);
+});
+
+it("retains one incomplete Converse receipt when iteration fails after usage", async () => {
+  contentType = "application/vnd.amazon.eventstream";
+  wireBody = Buffer.concat([
+    converseEvent("metadata", { usage: { inputTokens: 40, outputTokens: 20, cacheReadInputTokens: 60 } }),
+    converseEvent("internalServerException", { message: "stream interrupted" }),
+  ]);
+  const provider = new ConverseProvider({ model: "model", baseURL, apiKey: "secret", requestTimeoutMs: 1000, toolChoice: "any" });
+  await expect(provider.stream("prompt", [], 100)).rejects.toThrow();
+  const events = await receipts();
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ provider: "converse", operation: "stream", inputTokens: 100,
+    outputTokens: 20, cacheReadTokens: 60, cacheWriteTokens: null, usageComplete: false });
 });
 
 it("records Voyage embedding tokens before validating vectors", async () => {

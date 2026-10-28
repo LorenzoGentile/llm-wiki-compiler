@@ -11,8 +11,8 @@ import path from "node:path";
 interface ObservedUsage {
   inputTokens: number | null;
   outputTokens: number | null;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
 }
 
 /** Provider metadata contains no endpoint, credential, prompt or generated text. */
@@ -54,15 +54,15 @@ export function recordUsage(observe: () => UsageReceipt): void {
   }
 }
 
-/** Validate raw provider counters before adding cache tokens or filling defaults. */
+/** Validate raw counters and add observed cache tokens without inventing usage. */
 export function normalizeUsage(raw: {
   inputTokens?: unknown; outputTokens?: unknown; cacheReadTokens?: unknown; cacheWriteTokens?: unknown;
 } | null | undefined, cacheIsSeparate = false): ObservedUsage | null {
   if (raw == null) return null;
   const input = tokenCount(raw.inputTokens);
-  const cacheReadTokens = tokenCount(raw.cacheReadTokens) ?? 0;
-  const cacheWriteTokens = tokenCount(raw.cacheWriteTokens) ?? 0;
-  return { inputTokens: input === null ? null : input + (cacheIsSeparate ? cacheReadTokens + cacheWriteTokens : 0),
+  const cacheReadTokens = tokenCount(raw.cacheReadTokens);
+  const cacheWriteTokens = tokenCount(raw.cacheWriteTokens);
+  return { inputTokens: input === null ? null : input + (cacheIsSeparate ? (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) : 0),
     outputTokens: tokenCount(raw.outputTokens), cacheReadTokens, cacheWriteTokens };
 }
 
@@ -92,9 +92,9 @@ function publishReceipt(directory: string, eventId: string, data: string): void 
 /** Reject malformed provider counters instead of recording fabricated zero use. */
 function checkedUsage(usage: ObservedUsage | null): ObservedUsage | { inputTokens: null; outputTokens: null } {
   if (usage === null) return { inputTokens: null, outputTokens: null };
-  const counters = { ...usage, cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0 };
+  const counters = { ...usage, cacheReadTokens: usage.cacheReadTokens ?? null, cacheWriteTokens: usage.cacheWriteTokens ?? null };
   if (Object.values(counters).some(value => value !== null && (!Number.isSafeInteger(value) || value < 0))
-      || (counters.inputTokens !== null && counters.cacheReadTokens + counters.cacheWriteTokens > counters.inputTokens)) {
+      || (counters.inputTokens !== null && (counters.cacheReadTokens ?? 0) + (counters.cacheWriteTokens ?? 0) > counters.inputTokens)) {
     throw new Error("Invalid provider usage counters");
   }
   return counters;
