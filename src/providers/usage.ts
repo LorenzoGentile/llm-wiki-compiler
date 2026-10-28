@@ -23,6 +23,7 @@ interface UsageReceipt {
   responseId?: string;
   operation: "complete" | "stream" | "toolCall" | "embed" | "embedBatch";
   usage: ObservedUsage | null;
+  usageComplete?: boolean;
 }
 
 /** True when the caller explicitly opted into durable usage receipts. */
@@ -41,10 +42,11 @@ export function recordUsage(observe: () => UsageReceipt): void {
   try {
     const receipt = observe();
     const eventId = randomUUID();
+    const usage = checkedUsage(receipt.usage);
     const event = { version: 1, eventId, executionId: process.env.LLMWIKI_USAGE_EXECUTION_ID,
       occurredAt: new Date().toISOString(), provider: receipt.provider, model: receipt.model,
       operation: receipt.operation, requestId: receipt.requestId, responseId: receipt.responseId,
-      ...checkedUsage(receipt.usage) };
+      ...usage, usageComplete: receipt.usageComplete !== false && usage.inputTokens !== null && usage.outputTokens !== null };
     publishReceipt(process.env.LLMWIKI_USAGE_DIRECTORY!, eventId, JSON.stringify(event) + "\n");
   } catch (cause) {
     // Retrying inference cannot repair accounting storage and would consume more tokens.

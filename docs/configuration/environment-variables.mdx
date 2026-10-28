@@ -469,13 +469,29 @@ retention, import checkpoints, tenant attribution and pricing. Never rerun model
 work just to recover accounting.
 
 Version 1 receipts contain `version`, `eventId`, `executionId`, `occurredAt`,
-`provider`, `model`, `operation`, `inputTokens`, `outputTokens`, optional provider
+`provider`, `model`, `operation`, `inputTokens`, `outputTokens`, `usageComplete`, optional provider
 `requestId` / `responseId` correlation fields, and, when usage is
 known, `cacheReadTokens` and `cacheWriteTokens`. Input tokens **include** cache
 reads and writes: cache counters are subsets, not additional tokens. Missing
 counters are null, not fabricated zero usage; independently observed counters are
 preserved even when the other counter is missing.
 Operations are `complete`, `stream`, `toolCall`, `embed`, and `embedBatch`.
+
+`usageComplete` is true only when both input and output counts are known and
+stream iteration completed normally. Interrupted streams retain their last
+observed counters with `usageComplete: false`, even when both counts are present.
+Embeddings have zero output tokens when input usage is observed; absent input
+usage remains unknown. Explicit zero input and output is complete observed usage.
+Output validation failure does not make otherwise complete usage partial.
+
+For a host-wide usage ledger, map `eventId` to the external event key, namespaced
+by producer and trusted tenant; keep `executionId` as invocation correlation,
+not the deduplication key. Map timestamps, model/response identity, operation,
+token/cache counts and `usageComplete` to the corresponding ledger fields.
+No conversation or message record is required. Resolve tenant identity using the
+host's invocation record, not receipt-supplied authorization claims, and apply
+prices in the host. Keep known partial spend separate from unpriced or missing
+usage; complete counters do not imply that the model has a known price.
 
 Generation collection supports OpenAI-compatible, Anthropic and Converse
 providers. Embedding collection supports OpenAI-compatible and Voyage calls.

@@ -259,6 +259,7 @@ export class OpenAIProvider implements LLMProvider {
     let usage: OpenAI.CompletionUsage | null = null;
     let model = this.model;
     let responseId: string | undefined;
+    let streamCompleted = false;
     try {
       for await (const chunk of stream) {
         model = chunk.model || model;
@@ -270,8 +271,9 @@ export class OpenAIProvider implements LLMProvider {
           onToken(delta);
         }
       }
+      streamCompleted = true;
     } finally {
-      recordUsage(() => ({ provider: "openai", model, requestId, responseId, operation: "stream", usage: openaiUsage(usage) }));
+      recordUsage(() => ({ provider: "openai", model, requestId, responseId, operation: "stream", usageComplete: streamCompleted, usage: openaiUsage(usage) }));
     }
 
     return fullText;
@@ -342,5 +344,5 @@ function openaiUsage(usage: OpenAI.CompletionUsage | null | undefined) {
 
 /** Embeddings consume input tokens only; absent usage stays unknown. */
 function embeddingUsage(usage: { prompt_tokens: number } | undefined) {
-  return normalizeUsage(usage && { inputTokens: usage.prompt_tokens, outputTokens: 0 });
+  return normalizeUsage(usage && { inputTokens: usage.prompt_tokens, outputTokens: usage.prompt_tokens == null ? null : 0 });
 }

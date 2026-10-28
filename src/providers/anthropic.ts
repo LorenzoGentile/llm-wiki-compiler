@@ -93,6 +93,7 @@ export class AnthropicProvider extends VoyageEmbeddingProvider implements LLMPro
     });
 
     let fullText = "";
+    let streamCompleted = false;
     try {
       for await (const event of stream) {
         if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
@@ -100,10 +101,11 @@ export class AnthropicProvider extends VoyageEmbeddingProvider implements LLMPro
           onToken?.(event.delta.text);
         }
       }
+      streamCompleted = true;
     } finally {
       const message = stream.currentMessage ?? stream.receivedMessages.at(-1);
       recordUsage(() => ({ provider: "anthropic", model: message?.model || this.model,
-        operation: "stream", requestId: stream.request_id ?? undefined, responseId: message?.id, usage: anthropicUsage(message?.usage) }));
+        operation: "stream", usageComplete: streamCompleted, requestId: stream.request_id ?? undefined, responseId: message?.id, usage: anthropicUsage(message?.usage) }));
     }
 
     return fullText;

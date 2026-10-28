@@ -63,6 +63,7 @@ export class ConverseProvider implements LLMProvider {
     let text = "";
     let stopReason: string | undefined;
     let usage: TokenUsage | undefined;
+    let streamCompleted = false;
     try {
       for await (const event of response.stream ?? []) {
         requireKnownStreamEvent(event);
@@ -74,10 +75,11 @@ export class ConverseProvider implements LLMProvider {
           onToken(delta);
         }
       }
+      streamCompleted = true;
     } catch (error) {
       failRequest(error);
     } finally {
-      recordUsage(() => ({ provider: "converse", model: this.settings.model, requestId: response.$metadata.requestId, operation: "stream", usage: converseUsage(usage) }));
+      recordUsage(() => ({ provider: "converse", model: this.settings.model, requestId: response.$metadata.requestId, operation: "stream", usageComplete: streamCompleted, usage: converseUsage(usage) }));
     }
     requireFinished(stopReason);
     return requireText(text);

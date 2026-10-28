@@ -126,5 +126,5 @@ interface VoyageResponse {
 /** Voyage embeddings have no output token charge. */
 function recordVoyageUsage(response: VoyageResponse, model: string, operation: "embed" | "embedBatch", headers: Headers): void {
   recordUsage(() => ({ provider: "voyage", model: response.model || model, operation, requestId: headers.get("x-request-id") ?? undefined,
-    usage: normalizeUsage(response.usage && { inputTokens: response.usage.total_tokens, outputTokens: 0 }) }));
+    usage: normalizeUsage(response.usage && { inputTokens: response.usage.total_tokens, outputTokens: response.usage.total_tokens == null ? null : 0 }) }));
 }

@@ -57,7 +57,7 @@ it("records actual OpenAI model and inclusive cache usage for each call", async 
   const events = await receipts();
   expect(events).toHaveLength(2);
   expect(events[0]).toMatchObject({ provider: "openai", model: "actual-model", operation: "complete", responseId: "response", requestId: "request-1",
-    inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, cacheWriteTokens: 0 });
+    inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, cacheWriteTokens: 0, usageComplete: true });
   expect(events[0].eventId).not.toBe(events[1].eventId);
   expect(JSON.stringify(events)).not.toMatch(/private|secret/);
 });
@@ -67,7 +67,16 @@ it("records embedding usage even when returned vectors are invalid", async () =>
   const provider = new OpenAIProvider("chat", { baseURL, apiKey: "secret", embeddingModel: "requested-embedding" });
   await expect(provider.embed("private source")).rejects.toThrow();
   expect(await receipts()).toMatchObject([{ provider: "openai", model: "actual-embedding", operation: "embed",
-    inputTokens: 12, outputTokens: 0 }]);
+    inputTokens: 12, outputTokens: 0, usageComplete: true }]);
+});
+
+it.each([undefined, {}, { prompt_tokens: 0 }])("distinguishes missing embedding usage from observed zero (%j)", async (usage) => {
+  payload = { model: "embedding", data: [{ index: 0, embedding: [0.1, 0.2] }], usage };
+  const provider = new OpenAIProvider("chat", { baseURL, apiKey: "secret", embeddingModel: "embedding" });
+  expect(await provider.embed("source")).toEqual([0.1, 0.2]);
+  const known = usage?.prompt_tokens === 0;
+  expect(await receipts()).toMatchObject([{ inputTokens: known ? 0 : null,
+    outputTokens: known ? 0 : null, usageComplete: known }]);
 });
 
 it("normalizes Anthropic cached input without losing consumed tokens", async () => {
@@ -83,7 +92,7 @@ it("normalizes Anthropic cached input without losing consumed tokens", async () 
 it("keeps absent usage distinct from zero", async () => {
   payload = { model: "model", choices: [{ message: { content: "text" } }] };
   await new OpenAIProvider("model", { baseURL, apiKey: "secret" }).complete("prompt", [], 100);
-  expect(await receipts()).toMatchObject([{ inputTokens: null, outputTokens: null }]);
+  expect(await receipts()).toMatchObject([{ inputTokens: null, outputTokens: null, usageComplete: false }]);
 });
 
 it("records the final OpenAI stream usage once", async () => {
@@ -104,7 +113,7 @@ it.each([true, false])("retains Anthropic stream usage (failed=%s)", async (fail
   const result = new AnthropicProvider("requested", { baseURL, apiKey: "secret" }).stream("prompt", [], 100);
   if (failed) await expect(result).rejects.toThrow();
   else await expect(result).resolves.toBe("");
-  expect(await receipts()).toMatchObject([{ operation: "stream", model: "actual", requestId: "request-1", inputTokens: 100, outputTokens: 20 }]);
+  expect(await receipts()).toMatchObject([{ operation: "stream", model: "actual", requestId: "request-1", inputTokens: 100, outputTokens: 20, usageComplete: !failed }]);
 });
 
 it("does not record usage unless the host opts in", async () => {
@@ -137,7 +146,7 @@ it.each([null, undefined])("preserves available Converse output when input is %s
     usage: { inputTokens, outputTokens: 2 } };
   const provider = new ConverseProvider({ model: "model", baseURL, apiKey: "secret", requestTimeoutMs: 1000, toolChoice: "any" });
   await provider.complete("prompt", [], 100);
-  expect(await receipts()).toMatchObject([{ inputTokens: null, outputTokens: 2 }]);
+  expect(await receipts()).toMatchObject([{ inputTokens: null, outputTokens: 2, usageComplete: false }]);
 });
 
 it.each([-1, "15", 1.5])("rejects malformed Converse input (%s) even without output usage", async (inputTokens) => {
@@ -155,7 +164,7 @@ it("records Converse stream metadata before rejecting unfinished output", async 
   ]);
   const provider = new ConverseProvider({ model: "model", baseURL, apiKey: "secret", requestTimeoutMs: 1000, toolChoice: "any" });
   await expect(provider.stream("prompt", [], 100)).rejects.toThrow();
-  expect(await receipts()).toMatchObject([{ operation: "stream", inputTokens: 100, outputTokens: 20, cacheReadTokens: 60 }]);
+  expect(await receipts()).toMatchObject([{ operation: "stream", inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, usageComplete: true }]);
 });
 
 it("records Voyage embedding tokens before validating vectors", async () => {
