@@ -336,10 +336,16 @@ export class OpenAIProvider implements LLMProvider {
   }
 }
 
-/** OpenAI prompt tokens already include cache reads. */
-function openaiUsage(usage: OpenAI.CompletionUsage | null | undefined) {
+/** Include the documented wire field even with older OpenAI SDK typings. */
+type OpenAIUsageWithCacheWrites = OpenAI.CompletionUsage & {
+  prompt_tokens_details?: { cache_write_tokens?: number | null };
+};
+
+/** OpenAI prompt tokens already include both cache reads and writes. */
+function openaiUsage(usage: OpenAIUsageWithCacheWrites | null | undefined) {
   return normalizeUsage(usage && { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens,
-    cacheReadTokens: usage.prompt_tokens_details?.cached_tokens });
+    cacheReadTokens: usage.prompt_tokens_details?.cached_tokens,
+    cacheWriteTokens: usage.prompt_tokens_details?.cache_write_tokens });
 }
 
 /** Embeddings consume input tokens only; absent usage stays unknown. */
