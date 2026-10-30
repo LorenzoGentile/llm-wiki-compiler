@@ -4,7 +4,7 @@
  * receipts survive failed compilation and can be replayed without charging twice.
  */
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /** Counters use inclusive input tokens; cache counters are subsets of input. */
@@ -81,12 +81,26 @@ function publishReceipt(directory: string, eventId: string, data: string): void 
   const pending = path.join(directory, `${eventId}.pending`);
   const fd = openSync(pending, "wx", 0o600);
   try {
+    writeAndCloseReceipt(fd, data);
+    renameSync(pending, path.join(directory, `${eventId}.json`));
+  } catch (error) {
+    try { rmSync(pending, { force: true }); }
+    catch { /* Preserve the publication error if cleanup is unavailable. */ }
+    throw error;
+  }
+}
+
+/** Flush and close the file without hiding a write failure behind a close failure. */
+function writeAndCloseReceipt(fd: number, data: string): void {
+  try {
     writeFileSync(fd, data);
     fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+  } catch (error) {
+    try { closeSync(fd); }
+    catch { /* Preserve the original write or flush error. */ }
+    throw error;
   }
-  renameSync(pending, path.join(directory, `${eventId}.json`));
+  closeSync(fd);
 }
 
 /** Reject malformed provider counters instead of recording fabricated zero use. */
