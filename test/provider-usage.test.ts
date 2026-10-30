@@ -72,6 +72,23 @@ it.each([undefined, null, {}, { cached_tokens: 0 }])("preserves missing versus z
     cacheReadTokens: details?.cached_tokens === 0 ? 0 : null, cacheWriteTokens: null });
 });
 
+it.each([undefined, null, 0, 30])("retains OpenAI cache writes across completion paths (%s)", async (writes) => {
+  const usage = { prompt_tokens: 100, completion_tokens: 20,
+    prompt_tokens_details: { cached_tokens: 60, cache_write_tokens: writes } };
+  payload = { model: "gpt-6-luna", choices: [{ message: { content: "text" } }], usage };
+  const provider = new OpenAIProvider("gpt-6-luna", { baseURL, apiKey: "secret" });
+  await provider.complete("prompt", [], 100);
+  await provider.toolCall("prompt", [], [], 100);
+  contentType = "text/event-stream";
+  wireBody = `data: ${JSON.stringify({ model: "gpt-6-luna", choices: [], usage })}\n\n` + 'data: [DONE]\n\n';
+  await provider.stream("prompt", [], 100);
+  const events = await receipts();
+  expect(events).toHaveLength(3);
+  expect(events.map(event => event.operation).sort()).toEqual(["complete", "stream", "toolCall"]);
+  for (const event of events) expect(event).toMatchObject({ inputTokens: 100, outputTokens: 20,
+    cacheReadTokens: 60, cacheWriteTokens: writes ?? null, usageComplete: true });
+});
+
 it("records embedding usage even when returned vectors are invalid", async () => {
   payload = { model: "actual-embedding", data: [], usage: { prompt_tokens: 12, total_tokens: 12 } };
   const provider = new OpenAIProvider("chat", { baseURL, apiKey: "secret", embeddingModel: "requested-embedding" });
@@ -117,14 +134,14 @@ it("records the final OpenAI stream usage once", async () => {
 it.each([true, false])("retains one incomplete OpenAI receipt on stream failure (usage=%s)", async (withUsage) => {
   contentType = "text/event-stream";
   wireBody = 'data: {"id":"r","model":"actual","choices":[{"delta":{"content":"text"}}]}\n\n'
-    + (withUsage ? 'data: {"id":"r","model":"actual","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60}}}\n\n' : "")
+    + (withUsage ? 'data: {"id":"r","model":"actual","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60,"cache_write_tokens":30}}}\n\n' : "")
     + 'data: {"error":{"message":"stream interrupted","type":"server_error"}}\n\n';
   await expect(new OpenAIProvider("requested", { baseURL, apiKey: "secret" }).stream("prompt", [], 100)).rejects.toThrow("stream interrupted");
   const events = await receipts();
   expect(events).toHaveLength(1);
   expect(events[0]).toMatchObject({ provider: "openai", operation: "stream", model: "actual", responseId: "r",
     inputTokens: withUsage ? 100 : null, outputTokens: withUsage ? 20 : null, usageComplete: false });
-  if (withUsage) expect(events[0]).toMatchObject({ cacheReadTokens: 60, cacheWriteTokens: null });
+  if (withUsage) expect(events[0]).toMatchObject({ cacheReadTokens: 60, cacheWriteTokens: 30 });
 });
 
 it.each([true, false])("retains Anthropic stream usage (failed=%s)", async (failed) => {
